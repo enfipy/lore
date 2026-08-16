@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 //! PostgreSQL fragment catalog for Lore object-backed immutable storage.
 

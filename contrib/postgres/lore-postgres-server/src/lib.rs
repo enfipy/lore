@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 //! Derived Lore server with a PostgreSQL catalog and S3-compatible payload storage.
 
@@ -125,6 +125,9 @@ impl ImmutableStorePluginFactory for PostgresS3ImmutableStorePluginFactory {
             "Creating PostgreSQL catalog with S3-compatible payload storage"
         );
 
+        // Plugin construction is synchronous and runs once at startup; this mirrors the built-in
+        // AWS factory because the plugin interface has no asynchronous construction hook.
+        #[allow(clippy::disallowed_methods)]
         let (s3_client, catalog) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 let s3_client = AwsClientBuilder::builder()

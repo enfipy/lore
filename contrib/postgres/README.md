@@ -1,10 +1,17 @@
+<!-- Copyright 2026 David; SPDX-License-Identifier: MIT -->
+
 # Lore with PostgreSQL, R2, and Consul
 
 This derived server keeps each system on the job it is designed for:
 
-- PostgreSQL stores immutable-fragment metadata and repository associations.
+- PostgreSQL stores fragment lifecycle state and repository associations.
 - Cloudflare R2 stores fragment payload bytes through its S3-compatible API.
 - Consul discovers Lore peers. Consul KV does not store Lore data.
+
+The catalog interface and its obliteration state contract live in the backend-neutral
+`lore-storage` crate. `lore-postgres` depends on that interface directly and has no dependency on
+`lore-aws`. The derived `lore-postgres-server` binary is the composition point that pairs the
+PostgreSQL catalog adapter with Lore's S3-compatible payload adapter.
 
 The example installs the PostgreSQL catalog and S3-compatible payload store as the durable tier
 behind Lore's local cache. This also gives the Consul topology a live subscriber, so peer discovery
@@ -36,6 +43,7 @@ dedicated configuration directory and keep credentials outside the file:
 export AWS_ACCESS_KEY_ID='<R2 access key>'
 export AWS_SECRET_ACCESS_KEY='<R2 secret key>'
 export LORE__PLUGINS__POSTGRES_S3__IMMUTABLE_STORE__POSTGRES__CONNECTION_STRING='host=postgres.internal dbname=lore user=lore sslmode=require password=<secret>'
+export CONSUL_HTTP_ADDR='http://consul.internal:8500'
 export CONSUL_HTTP_TOKEN='<Consul ACL token>'
 
 install -m 0600 config-r2-consul.toml /etc/lore/local.toml
@@ -76,6 +84,7 @@ export LORE_POSTGRES_TEST_URL='host=127.0.0.1 dbname=lore_test user=lore_test ss
 cargo test -p lore-postgres --features integration-tests --test catalog_contract -- --nocapture
 ```
 
-The contract covers idempotent registration, collisions, all query strengths, batch lookup,
-association, resumable obliteration, retained references, and terminal finalization. Concurrency
-tests race 32 associations against obliteration and race 32 simultaneous obliteration starts.
+The contract covers idempotent publication, ordered batch lookup, association, payload repair,
+resumable obliteration, retained references, tombstone revival, and terminal finalization.
+Concurrency tests race 32 associations against obliteration and 32 simultaneous obliteration
+starts.
