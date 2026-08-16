@@ -763,11 +763,13 @@ impl CompositeStore {
                 }
                 Err(err) => {
                     let is_internal_error = err.is_internal();
-                    // durable is the source of truth - if it error'd bubble its error up and forget
-                    // about the replicas
-                    if is_durable && !is_internal_error {
+                    // Durable is the source of truth. Keep an internal failure while replicas
+                    // finish, but never turn it into the default `AddressNotFound` result.
+                    if is_durable {
                         error_to_return = err;
-                        break;
+                        if !is_internal_error {
+                            break;
+                        }
                     }
                 }
             }
