@@ -23,6 +23,9 @@ pub enum FragmentState {
     Obliterated,
 }
 
+/// Opaque publication generation used to reject stale cross-store observations.
+pub type CatalogGeneration = i64;
+
 /// Catalog facts needed to resolve one address.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CatalogResolution {
@@ -30,6 +33,8 @@ pub struct CatalogResolution {
     pub associated: bool,
     /// Current lifecycle state, or `None` when the hash was never published.
     pub state: Option<FragmentState>,
+    /// Generation of the current publication, present exactly when `state` is present.
+    pub generation: Option<CatalogGeneration>,
 }
 
 /// Result of releasing one association and claiming obliteration when possible.
@@ -49,9 +54,10 @@ pub enum BeginObliteration {
 
 /// Mutable catalog used by an object-backed immutable store.
 ///
-/// Implementations own concurrency control. In particular, `associate` must not make an
-/// obliterating hash active, and `begin_obliteration` must serialize against associations so a
-/// `PayloadUnreferenced` result is safe to act on.
+/// Implementations own concurrency control. In particular, `publish` must atomically advance the
+/// payload generation and add its association without reviving an active deletion, and
+/// `begin_obliteration` must serialize against publication so a `PayloadUnreferenced` result is
+/// safe to act on.
 #[async_trait]
 pub trait FragmentCatalog: Send + Sync {
     /// Resolve lifecycle and association facts for one address.
@@ -68,28 +74,22 @@ pub trait FragmentCatalog: Send + Sync {
         addresses: &[Address],
     ) -> Result<Vec<CatalogResolution>, StoreError>;
 
-    /// Check only the exact association, for a payload read already validated by object storage.
-    async fn association_exists(
-        &self,
-        partition: Partition,
-        address: Address,
-    ) -> Result<bool, StoreError>;
+    /// Atomically publish or confirm a payload and add its exact association.
+    async fn publish(&self, partition: Partition, address: Address) -> Result<(), StoreError>;
 
-    /// Check whether a partition has any association for a payload, regardless of context.
-    async fn partition_association_exists(
+    /// Clear a missing payload only if its publication has not changed since it was observed.
+    async fn repair_missing_payload(
+        &self,
+        hash: Hash,
+        generation: CatalogGeneration,
+    ) -> Result<(), StoreError>;
+
+    /// Resolve lifecycle state and whether a partition has any association for a payload.
+    async fn resolve_partition(
         &self,
         partition: Partition,
         hash: Hash,
-    ) -> Result<bool, StoreError>;
-
-    /// Publish an uploaded payload, reviving a terminal tombstone but rejecting active deletion.
-    async fn publish(&self, hash: Hash) -> Result<(), StoreError>;
-
-    /// Clear a stored state whose payload was lost, allowing the next put to repair it.
-    async fn repair_missing_payload(&self, hash: Hash) -> Result<(), StoreError>;
-
-    /// Add an exact association idempotently, rejecting non-stored states.
-    async fn associate(&self, partition: Partition, address: Address) -> Result<(), StoreError>;
+    ) -> Result<CatalogResolution, StoreError>;
 
     /// Remove one association and claim the hash when no references remain.
     async fn begin_obliteration(
@@ -127,32 +127,44 @@ pub mod contract {
             .expect("resolve absent");
         assert_eq!(miss, CatalogResolution::default());
 
-        catalog.publish(address.hash).await.expect("publish");
         catalog
-            .associate(first_partition, address)
+            .publish(first_partition, address)
             .await
-            .expect("associate");
+            .expect("publish");
+        let first = catalog
+            .resolve(first_partition, address)
+            .await
+            .expect("resolve stored");
+        assert!(first.associated);
+        assert_eq!(first.state, Some(FragmentState::Stored));
+        let first_generation = first.generation.expect("stored generation");
         catalog
-            .associate(first_partition, address)
+            .publish(first_partition, address)
             .await
-            .expect("idempotent associate");
-        assert!(catalog
-            .partition_association_exists(first_partition, address.hash)
+            .expect("idempotent publish");
+        catalog
+            .repair_missing_payload(address.hash, first_generation)
             .await
-            .expect("partition association exists"));
-        assert!(!catalog
-            .partition_association_exists(second_partition, address.hash)
+            .expect("stale repair");
+        let current = catalog
+            .resolve(first_partition, address)
             .await
-            .expect("partition association absent"));
-        assert_eq!(
-            catalog
-                .resolve(first_partition, address)
+            .expect("resolve after stale repair");
+        assert_eq!(current.state, Some(FragmentState::Stored));
+        assert_ne!(current.generation, Some(first_generation));
+        let partition = catalog
+            .resolve_partition(first_partition, address.hash)
+            .await
+            .expect("resolve partition association");
+        assert!(partition.associated);
+        assert_eq!(partition.state, current.state);
+        assert_eq!(partition.generation, current.generation);
+        assert!(
+            !catalog
+                .resolve_partition(second_partition, address.hash)
                 .await
-                .expect("resolve stored"),
-            CatalogResolution {
-                associated: true,
-                state: Some(FragmentState::Stored),
-            }
+                .expect("resolve absent partition association")
+                .associated
         );
 
         let absent = Address {
@@ -169,9 +181,9 @@ pub mod contract {
         assert_eq!(batch[2], batch[0]);
 
         catalog
-            .associate(second_partition, address)
+            .publish(second_partition, address)
             .await
-            .expect("second association");
+            .expect("second publication");
         assert_eq!(
             catalog
                 .begin_obliteration(first_partition, address)
@@ -193,7 +205,7 @@ pub mod contract {
                 .expect("resume interrupted deletion"),
             BeginObliteration::ResumePayloadDeletion
         );
-        assert!(catalog.associate(first_partition, address).await.is_err());
+        assert!(catalog.publish(first_partition, address).await.is_err());
         catalog
             .finalize_obliteration(address.hash)
             .await
@@ -206,15 +218,17 @@ pub mod contract {
             BeginObliteration::AlreadyObliterated
         );
         catalog
-            .publish(address.hash)
+            .publish(first_partition, address)
             .await
             .expect("revive tombstone");
-        catalog
-            .associate(first_partition, address)
+        let generation = catalog
+            .resolve(first_partition, address)
             .await
-            .expect("associate revived");
+            .expect("resolve revived")
+            .generation
+            .expect("revived generation");
         catalog
-            .repair_missing_payload(address.hash)
+            .repair_missing_payload(address.hash, generation)
             .await
             .expect("repair");
         let repaired = catalog
@@ -223,5 +237,6 @@ pub mod contract {
             .expect("resolve repaired");
         assert!(repaired.associated);
         assert_eq!(repaired.state, None);
+        assert_eq!(repaired.generation, None);
     }
 }

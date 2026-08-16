@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -10,9 +11,13 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_postgres::PostgresFragmentCatalog;
+use lore_postgres::PostgresFragmentCatalogConfig;
 use lore_storage::fragment_catalog::BeginObliteration;
 use lore_storage::fragment_catalog::FragmentCatalog;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Barrier;
+use tokio_postgres::NoTls;
 
 async fn in_test_context(future: impl Future<Output = ()>) {
     let context: Arc<dyn Any + Send + Sync> = Arc::new(());
@@ -30,6 +35,113 @@ async fn postgres_catalog_satisfies_fragment_catalog_contract() {
     .await;
 }
 
+#[tokio::test]
+async fn migration_upgrades_a_populated_v1_catalog() {
+    in_test_context(async {
+        let connection_string = std::env::var("LORE_POSTGRES_TEST_URL")
+            .expect("LORE_POSTGRES_TEST_URL is required");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let schema = format!("lore_v1_{}_{nonce}", std::process::id());
+        let config = tokio_postgres::Config::from_str(&connection_string)
+            .expect("invalid PostgreSQL test connection");
+        let (client, connection) = config.connect(NoTls).await.expect("connect to PostgreSQL");
+        let connection_task = lore_base::lore_spawn!(async move {
+            connection.await.expect("PostgreSQL connection failed");
+        });
+        let v1 = include_str!("../migrations/0001_fragment_catalog.sql");
+        let checksum: String = Sha256::digest(v1.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\";
+                 SET search_path TO \"{schema}\";
+                 CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     checksum TEXT NOT NULL,
+                     applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 {v1}
+                 INSERT INTO schema_migrations (version, checksum) VALUES (1, '{checksum}');
+                 INSERT INTO fragment_state (hash, state) VALUES (decode(repeat('42', 32), 'hex'), 0);"
+            ))
+            .await
+            .expect("create populated v1 catalog");
+
+        let mut catalog_config = PostgresFragmentCatalogConfig::new(connection_string);
+        catalog_config.schema = schema.clone();
+        PostgresFragmentCatalog::connect(catalog_config)
+            .await
+            .expect("upgrade v1 catalog");
+
+        let row = client
+            .query_one(
+                &format!(
+                    "SELECT generation > 0,
+                            (SELECT count(*) FROM \"{schema}\".schema_migrations)
+                     FROM \"{schema}\".fragment_state
+                     WHERE hash = decode(repeat('42', 32), 'hex')"
+                ),
+                &[],
+            )
+            .await
+            .expect("inspect upgraded catalog");
+        assert!(row.try_get::<_, bool>(0).expect("read generation"));
+        assert_eq!(row.try_get::<_, i64>(1).expect("read migration count"), 2);
+        connection_task.abort();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stale_missing_report_cannot_erase_a_later_publication() {
+    in_test_context(async {
+        let catalog = PostgresFragmentCatalog::connect_for_test()
+            .await
+            .expect("failed to create isolated PostgreSQL catalog");
+        let partition = Context::from([0x31; 16]).into();
+        let address = Address {
+            hash: Hash::from([0x32; 32]),
+            context: Context::from([0x33; 16]),
+        };
+
+        catalog
+            .publish(partition, address)
+            .await
+            .expect("first publish");
+        let observed = catalog
+            .resolve(partition, address)
+            .await
+            .expect("observe stored payload");
+        assert!(observed.associated);
+        let observed_generation = observed.generation.expect("observed generation");
+
+        catalog
+            .publish(partition, address)
+            .await
+            .expect("later payload confirmation");
+        catalog
+            .repair_missing_payload(address.hash, observed_generation)
+            .await
+            .expect("stale missing report");
+
+        assert_eq!(
+            catalog
+                .resolve(partition, address)
+                .await
+                .expect("resolve after stale report")
+                .state,
+            observed.state,
+            "a report based on an older observation erased a later publication"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn obliteration_marker_rejects_concurrent_associations() {
     in_test_context(async {
@@ -43,11 +155,7 @@ async fn obliteration_marker_rejects_concurrent_associations() {
             hash: Hash::from([0x62; 32]),
             context: Context::from([0x63; 16]),
         };
-        catalog.publish(address.hash).await.expect("publish");
-        catalog
-            .associate(partition, address)
-            .await
-            .expect("associate");
+        catalog.publish(partition, address).await.expect("publish");
         assert_eq!(
             catalog
                 .begin_obliteration(partition, address)
@@ -69,7 +177,7 @@ async fn obliteration_marker_rejects_concurrent_associations() {
                 context_bytes[0] = index as u8;
                 barrier.wait().await;
                 catalog
-                    .associate(
+                    .publish(
                         Context::from(partition_bytes).into(),
                         Address {
                             hash: address.hash,
@@ -100,11 +208,7 @@ async fn one_concurrent_begin_call_claims_the_payload() {
             hash: Hash::from([0x82; 32]),
             context: Context::from([0x83; 16]),
         };
-        catalog.publish(address.hash).await.expect("publish");
-        catalog
-            .associate(partition, address)
-            .await
-            .expect("associate");
+        catalog.publish(partition, address).await.expect("publish");
 
         let task_count = 32;
         let barrier = Arc::new(Barrier::new(task_count + 1));

@@ -18,6 +18,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_storage::StoreError;
 use lore_storage::fragment_catalog::BeginObliteration;
+use lore_storage::fragment_catalog::CatalogGeneration;
 use lore_storage::fragment_catalog::CatalogResolution;
 use lore_storage::fragment_catalog::FragmentCatalog;
 use lore_storage::fragment_catalog::FragmentState;
@@ -34,8 +35,13 @@ const DEFAULT_SCHEMA: &str = "lore";
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
 const DEFAULT_CONNECT_TIMEOUT_MILLIS: u64 = 5_000;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
-const MIGRATION_VERSION: i32 = 1;
-const MIGRATION_SQL: &str = include_str!("../migrations/0001_fragment_catalog.sql");
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/0001_fragment_catalog.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_fragment_generation.sql"),
+    ),
+];
 
 fn default_schema() -> String {
     DEFAULT_SCHEMA.to_string()
@@ -240,7 +246,6 @@ impl PostgresFragmentCatalog {
     }
 
     async fn migrate(&self) -> Result<(), StoreError> {
-        let migration_checksum = migration_checksum();
         let mut client = self.connection().await?;
         let transaction = client.transaction().await.map_err(|error| {
             database_error(error, "Failed to begin PostgreSQL catalog migration")
@@ -266,45 +271,48 @@ impl PostgresFragmentCatalog {
             .await
             .map_err(|error| database_error(error, "Failed to create migration catalog"))?;
 
-        let existing = transaction
-            .query_opt(
-                &format!(
-                    "SELECT checksum FROM \"{}\".schema_migrations WHERE version = $1",
-                    self.schema
-                ),
-                &[&MIGRATION_VERSION],
-            )
+        transaction
+            .batch_execute(&format!("SET LOCAL search_path TO \"{}\"", self.schema))
             .await
-            .map_err(|error| database_error(error, "Failed to inspect catalog migrations"))?;
+            .map_err(|error| database_error(error, "Failed to select catalog schema"))?;
+        for &(version, sql) in MIGRATIONS {
+            let checksum = migration_checksum(sql);
+            let existing = transaction
+                .query_opt(
+                    &format!(
+                        "SELECT checksum FROM \"{}\".schema_migrations WHERE version = $1",
+                        self.schema
+                    ),
+                    &[&version],
+                )
+                .await
+                .map_err(|error| database_error(error, "Failed to inspect catalog migrations"))?;
 
-        if let Some(row) = existing {
-            let checksum: String = row.try_get(0).map_err(|error| {
-                database_error(error, "Failed to read catalog migration checksum")
-            })?;
-            if checksum != migration_checksum {
-                return Err(StoreError::internal(format!(
-                    "PostgreSQL catalog migration {MIGRATION_VERSION} checksum mismatch"
-                )));
+            if let Some(row) = existing {
+                let recorded: String = row.try_get(0).map_err(|error| {
+                    database_error(error, "Failed to read catalog migration checksum")
+                })?;
+                if recorded != checksum {
+                    return Err(StoreError::internal(format!(
+                        "PostgreSQL catalog migration {version} checksum mismatch"
+                    )));
+                }
+                continue;
             }
-        } else {
             transaction
-                .batch_execute(&format!("SET LOCAL search_path TO \"{}\"", self.schema))
+                .batch_execute(sql)
                 .await
-                .map_err(|error| database_error(error, "Failed to select catalog schema"))?;
-            transaction
-                .batch_execute(MIGRATION_SQL)
-                .await
-                .map_err(|error| database_error(error, "Failed to apply catalog migration 1"))?;
+                .map_err(|error| database_error(error, "Failed to apply catalog migration"))?;
             transaction
                 .execute(
                     &format!(
                         "INSERT INTO \"{}\".schema_migrations (version, checksum) VALUES ($1, $2)",
                         self.schema
                     ),
-                    &[&MIGRATION_VERSION, &migration_checksum],
+                    &[&version, &checksum],
                 )
                 .await
-                .map_err(|error| database_error(error, "Failed to record catalog migration 1"))?;
+                .map_err(|error| database_error(error, "Failed to record catalog migration"))?;
         }
 
         transaction
@@ -317,10 +325,10 @@ impl PostgresFragmentCatalog {
         transaction: &deadpool_postgres::Transaction<'_>,
         table: &str,
         hash: Hash,
-    ) -> Result<Option<FragmentState>, StoreError> {
+    ) -> Result<Option<(FragmentState, CatalogGeneration)>, StoreError> {
         let row = transaction
             .query_opt(
-                &format!("SELECT state FROM {table} WHERE hash = $1 FOR UPDATE"),
+                &format!("SELECT state, generation FROM {table} WHERE hash = $1 FOR UPDATE"),
                 &[&hash.as_ref()],
             )
             .await
@@ -331,7 +339,10 @@ impl PostgresFragmentCatalog {
         let state = row
             .try_get(0)
             .map_err(|error| database_error(error, "Failed to read locked fragment state"))?;
-        Ok(Some(state_from_i16(state)?))
+        let generation = row
+            .try_get(1)
+            .map_err(|error| database_error(error, "Failed to read publication generation"))?;
+        Ok(Some((state_from_i16(state)?, generation)))
     }
 }
 
@@ -351,7 +362,8 @@ impl FragmentCatalog for PostgresFragmentCatalog {
                             SELECT 1 FROM {association}
                             WHERE hash = $1 AND partition = $2 AND context = $3
                         ),
-                        (SELECT state FROM {state} WHERE hash = $1)",
+                        (SELECT state FROM {state} WHERE hash = $1),
+                        (SELECT generation FROM {state} WHERE hash = $1)",
                     association = self.association_table(),
                     state = self.state_table(),
                 ),
@@ -363,6 +375,32 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             )
             .await
             .map_err(|error| database_error(error, "Failed to resolve fragment catalog"))?;
+        resolution_from_row(&row)
+    }
+
+    async fn resolve_partition(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<CatalogResolution, StoreError> {
+        let client = self.connection().await?;
+        let row = client
+            .query_one(
+                &format!(
+                    "SELECT
+                        EXISTS (
+                            SELECT 1 FROM {association}
+                            WHERE hash = $1 AND partition = $2
+                        ),
+                        (SELECT state FROM {state} WHERE hash = $1),
+                        (SELECT generation FROM {state} WHERE hash = $1)",
+                    association = self.association_table(),
+                    state = self.state_table(),
+                ),
+                &[&hash.as_ref(), &partition.as_ref()],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to resolve partition catalog"))?;
         resolution_from_row(&row)
     }
 
@@ -401,7 +439,8 @@ impl FragmentCatalog for PostgresFragmentCatalog {
                               AND a.partition = $1
                               AND a.context = input.context
                         ),
-                        (SELECT state FROM {state} s WHERE s.hash = input.hash)
+                        (SELECT state FROM {state} s WHERE s.hash = input.hash),
+                        (SELECT generation FROM {state} s WHERE s.hash = input.hash)
                      FROM unnest($2::bytea[], $3::bytea[])
                          WITH ORDINALITY AS input(hash, context, ordinality)
                      ORDER BY input.ordinality",
@@ -421,119 +460,32 @@ impl FragmentCatalog for PostgresFragmentCatalog {
         rows.iter().map(resolution_from_row).collect()
     }
 
-    async fn association_exists(
-        &self,
-        partition: Partition,
-        address: Address,
-    ) -> Result<bool, StoreError> {
-        let client = self.connection().await?;
-        let row = client
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM {} WHERE hash = $1 AND partition = $2 AND context = $3
-                    )",
-                    self.association_table()
-                ),
-                &[
-                    &address.hash.as_ref(),
-                    &partition.as_ref(),
-                    &address.context.as_ref(),
-                ],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to query fragment association"))?;
-        row.try_get(0)
-            .map_err(|error| database_error(error, "Failed to read fragment association"))
-    }
-
-    async fn partition_association_exists(
-        &self,
-        partition: Partition,
-        hash: Hash,
-    ) -> Result<bool, StoreError> {
-        let client = self.connection().await?;
-        let row = client
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM {} WHERE hash = $1 AND partition = $2
-                    )",
-                    self.association_table()
-                ),
-                &[&hash.as_ref(), &partition.as_ref()],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to query partition association"))?;
-        row.try_get(0)
-            .map_err(|error| database_error(error, "Failed to read partition association"))
-    }
-
-    async fn publish(&self, hash: Hash) -> Result<(), StoreError> {
+    async fn publish(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
         let mut client = self.connection().await?;
         let transaction = client
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin fragment publication"))?;
         let table = self.state_table();
-        transaction
+        let published = transaction
             .execute(
                 &format!(
-                    "INSERT INTO {table} (hash, state) VALUES ($1, $2)
-                     ON CONFLICT (hash) DO NOTHING"
+                    "INSERT INTO {table} AS current (hash, state) VALUES ($1, $2)
+                     ON CONFLICT (hash) DO UPDATE
+                     SET state = EXCLUDED.state,
+                         generation = nextval('\"{schema}\".fragment_generation_seq')
+                     WHERE current.state <> $3",
+                    schema = self.schema,
                 ),
-                &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+                &[
+                    &address.hash.as_ref(),
+                    &state_to_i16(FragmentState::Stored),
+                    &state_to_i16(FragmentState::Obliterating),
+                ],
             )
             .await
             .map_err(|error| database_error(error, "Failed to publish fragment state"))?;
-        let state = Self::locked_state(&transaction, &table, hash)
-            .await?
-            .ok_or_else(|| StoreError::internal("Fragment state disappeared during publication"))?;
-        match state {
-            FragmentState::Stored => {}
-            FragmentState::Obliterated => {
-                transaction
-                    .execute(
-                        &format!("UPDATE {table} SET state = $2 WHERE hash = $1"),
-                        &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
-                    )
-                    .await
-                    .map_err(|error| database_error(error, "Failed to revive fragment state"))?;
-            }
-            FragmentState::Obliterating => return Err(StoreError::from(SlowDown)),
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit fragment publication"))?;
-        Ok(())
-    }
-
-    async fn repair_missing_payload(&self, hash: Hash) -> Result<(), StoreError> {
-        let client = self.connection().await?;
-        client
-            .execute(
-                &format!(
-                    "DELETE FROM {} WHERE hash = $1 AND state = $2",
-                    self.state_table()
-                ),
-                &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| database_error(error, "Failed to clear lost fragment state"))
-    }
-
-    async fn associate(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin fragment association"))?;
-        let state = Self::locked_state(&transaction, &self.state_table(), address.hash)
-            .await?
-            .ok_or_else(|| StoreError::internal("Cannot associate an unpublished fragment"))?;
-        if state != FragmentState::Stored {
+        if published == 0 {
             return Err(StoreError::from(SlowDown));
         }
         transaction
@@ -554,7 +506,30 @@ impl FragmentCatalog for PostgresFragmentCatalog {
         transaction
             .commit()
             .await
-            .map_err(|error| database_error(error, "Failed to commit fragment association"))
+            .map_err(|error| database_error(error, "Failed to commit fragment publication"))
+    }
+
+    async fn repair_missing_payload(
+        &self,
+        hash: Hash,
+        generation: CatalogGeneration,
+    ) -> Result<(), StoreError> {
+        let client = self.connection().await?;
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE hash = $1 AND state = $2 AND generation = $3",
+                    self.state_table()
+                ),
+                &[
+                    &hash.as_ref(),
+                    &state_to_i16(FragmentState::Stored),
+                    &generation,
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| database_error(error, "Failed to clear lost fragment state"))
     }
 
     async fn begin_obliteration(
@@ -568,7 +543,8 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             .await
             .map_err(|error| database_error(error, "Failed to begin obliteration transaction"))?;
         let state_table = self.state_table();
-        let Some(state) = Self::locked_state(&transaction, &state_table, address.hash).await?
+        let Some((state, _generation)) =
+            Self::locked_state(&transaction, &state_table, address.hash).await?
         else {
             transaction.commit().await.map_err(|error| {
                 database_error(error, "Failed to commit empty obliteration lookup")
@@ -651,7 +627,7 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             .await
             .map_err(|error| database_error(error, "Failed to begin obliteration finalization"))?;
         let table = self.state_table();
-        let state = Self::locked_state(&transaction, &table, hash)
+        let (state, _generation) = Self::locked_state(&transaction, &table, hash)
             .await?
             .ok_or_else(|| StoreError::internal("Cannot finalize a missing fragment state"))?;
         match state {
@@ -691,9 +667,18 @@ fn resolution_from_row(row: &Row) -> Result<CatalogResolution, StoreError> {
     let state: Option<i16> = row
         .try_get(1)
         .map_err(|error| database_error(error, "Failed to read state resolution"))?;
+    let generation: Option<CatalogGeneration> = row
+        .try_get(2)
+        .map_err(|error| database_error(error, "Failed to read generation resolution"))?;
+    if state.is_some() != generation.is_some() {
+        return Err(StoreError::internal(
+            "PostgreSQL fragment state has no publication generation",
+        ));
+    }
     Ok(CatalogResolution {
         associated,
         state: state.map(state_from_i16).transpose()?,
+        generation,
     })
 }
 
@@ -756,8 +741,8 @@ fn database_error(error: tokio_postgres::Error, context: &'static str) -> StoreE
     }
 }
 
-fn migration_checksum() -> String {
-    Sha256::digest(MIGRATION_SQL.as_bytes())
+fn migration_checksum(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -769,6 +754,8 @@ mod tests {
 
     #[test]
     fn migration_checksum_is_sha256() {
-        assert_eq!(migration_checksum().len(), 64);
+        for &(_, sql) in MIGRATIONS {
+            assert_eq!(migration_checksum(sql).len(), 64);
+        }
     }
 }

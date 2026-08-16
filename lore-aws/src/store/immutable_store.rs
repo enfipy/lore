@@ -37,6 +37,7 @@ use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::fragment_catalog::BeginObliteration;
+use lore_storage::fragment_catalog::CatalogGeneration;
 use lore_storage::fragment_catalog::FragmentCatalog;
 use lore_storage::fragment_catalog::FragmentState as CatalogFragmentState;
 #[cfg(test)]
@@ -80,7 +81,7 @@ pub mod metadata_migrator;
 
 enum QueryResultSource {
     LegacyMetadata(Fragment),
-    State,
+    State(Option<CatalogGeneration>),
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -606,7 +607,7 @@ pub struct AwsImmutableStore {
 }
 
 enum FragmentCatalogBackend {
-    DynamoDb(DynamoDb),
+    DynamoDb(Box<DynamoDb>),
     External(Arc<dyn FragmentCatalog>),
 }
 
@@ -627,7 +628,7 @@ impl AwsImmutableStore {
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
         Self {
             s3,
-            catalog: FragmentCatalogBackend::DynamoDb(dynamodb),
+            catalog: FragmentCatalogBackend::DynamoDb(Box::new(dynamodb)),
             bucket: settings.s3.bucket.clone(),
             object_versioning: settings.s3.object_versioning,
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
@@ -701,12 +702,18 @@ impl AwsImmutableStore {
         &self,
         partition: Partition,
         address: Address,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(bool, Option<CatalogGeneration>), StoreError> {
         match &self.catalog {
             FragmentCatalogBackend::External(catalog) => {
-                catalog.association_exists(partition, address).await
+                let resolution = catalog.resolve(partition, address).await?;
+                Ok((
+                    resolution.associated && resolution.state == Some(CatalogFragmentState::Stored),
+                    resolution.generation,
+                ))
             }
-            FragmentCatalogBackend::DynamoDb(_) => self.exists(partition, address).await,
+            FragmentCatalogBackend::DynamoDb(_) => {
+                Ok((self.exists(partition, address).await?, None))
+            }
         }
     }
 
@@ -714,10 +721,14 @@ impl AwsImmutableStore {
         &self,
         partition: Partition,
         address: Address,
+        payload_confirmed: bool,
     ) -> Result<(), StoreError> {
         match &self.catalog {
             FragmentCatalogBackend::External(catalog) => {
-                catalog.associate(partition, address).await
+                if !payload_confirmed {
+                    self.head_fragment(address.hash).await?;
+                }
+                catalog.publish(partition, address).await
             }
             FragmentCatalogBackend::DynamoDb(_) => {
                 self.associate_fragment(partition, address).await
@@ -729,18 +740,22 @@ impl AwsImmutableStore {
         &self,
         partition: Partition,
         address: Address,
-    ) -> Result<(Option<FragmentState>, bool), StoreError> {
+    ) -> Result<(Option<FragmentState>, bool, Option<CatalogGeneration>), StoreError> {
         match &self.catalog {
             FragmentCatalogBackend::External(catalog) => {
                 let resolution = catalog.resolve(partition, address).await?;
-                Ok((resolution.state.map(catalog_state), resolution.associated))
+                Ok((
+                    resolution.state.map(catalog_state),
+                    resolution.associated,
+                    resolution.generation,
+                ))
             }
             FragmentCatalogBackend::DynamoDb(_) => {
                 let (associated, state) = tokio::join!(
                     self.exists(partition, address),
                     self.load_state(address.hash)
                 );
-                Ok((state?, associated?))
+                Ok((state?, associated?, None))
             }
         }
     }
@@ -851,13 +866,13 @@ impl AwsImmutableStore {
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
         if let FragmentCatalogBackend::External(catalog) = &self.catalog {
             let resolution = catalog.resolve(partition, address).await?;
-            let miss = (QueryResultSource::State, StoreGetData::default());
+            let miss = (QueryResultSource::State(None), StoreGetData::default());
             if !resolution.associated {
                 return Ok(miss);
             }
             return match resolution.state {
                 Some(CatalogFragmentState::Stored) => Ok((
-                    QueryResultSource::State,
+                    QueryResultSource::State(resolution.generation),
                     StoreGetData::metadata(
                         stored_durable(Fragment::default()),
                         StoreMatch::MatchFull,
@@ -879,7 +894,7 @@ impl AwsImmutableStore {
             self.load_state(address.hash)
         );
 
-        let miss = Ok((QueryResultSource::State, StoreGetData::default()));
+        let miss = Ok((QueryResultSource::State(None), StoreGetData::default()));
 
         if !associated? {
             return miss;
@@ -889,7 +904,7 @@ impl AwsImmutableStore {
 
         match state? {
             Some(FragmentState::Stored) => Ok((
-                QueryResultSource::State,
+                QueryResultSource::State(None),
                 StoreGetData::metadata(stored_durable(Fragment::default()), match_made, partition),
             )),
             Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
@@ -1100,7 +1115,12 @@ impl AwsImmutableStore {
     /// was, and the alarm has been raised regardless.
     ///
     /// `labels` carries the calling operation's context, for the reason on [`Self::do_query`].
-    async fn report_missing_payload(&self, address: Address, labels: &[KeyValue]) {
+    async fn report_missing_payload(
+        &self,
+        address: Address,
+        generation: Option<CatalogGeneration>,
+        labels: &[KeyValue],
+    ) {
         self.missing_payload_counter.add(1, labels);
         error!(
             %address,
@@ -1109,7 +1129,14 @@ impl AwsImmutableStore {
         );
 
         if let FragmentCatalogBackend::External(catalog) = &self.catalog {
-            if let Err(error) = catalog.repair_missing_payload(address.hash).await {
+            let Some(generation) = generation else {
+                warn!(%address, "Missing external catalog generation for a lost payload");
+                return;
+            };
+            if let Err(error) = catalog
+                .repair_missing_payload(address.hash, generation)
+                .await
+            {
                 warn!(%address, ?error, "Failed to clear state for a lost payload");
             }
             return;
@@ -1501,8 +1528,8 @@ impl AwsImmutableStore {
                 })?;
         }
 
-        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
-            return catalog.publish(hash).await;
+        if matches!(&self.catalog, FragmentCatalogBackend::External(_)) {
+            return Ok(());
         }
 
         let state = self.publish_state(hash).await?;
@@ -2059,7 +2086,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 QueryResultSource::LegacyMetadata(fragment) => {
                     Ok(StoreGetData::metadata(fragment, match_made, partition))
                 }
-                QueryResultSource::State => {
+                QueryResultSource::State(generation) => {
                     let head_output = match head_result {
                         Some(result) => result,
                         None => head_fut.await,
@@ -2068,8 +2095,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     match head_output {
                         Ok(fragment) => Ok(StoreGetData::metadata(fragment, match_made, partition)),
                         Err(e) if e.is_address_not_found() => {
-                            self.report_missing_payload(address, &self.labels_get_metadata)
-                                .await;
+                            self.report_missing_payload(
+                                address,
+                                generation,
+                                &self.labels_get_metadata,
+                            )
+                            .await;
                             Ok(miss)
                         }
                         Err(e) => Err(e),
@@ -2106,7 +2137,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 };
                 // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
                 // early return. Exists error takes priority over any load error.
-                if !exists_result? {
+                let (exists, generation) = exists_result?;
+                if !exists {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
 
@@ -2120,7 +2152,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     .err()
                     .is_some_and(StoreError::is_address_not_found)
                 {
-                    self.report_missing_payload(address, &self.labels_get).await;
+                    self.report_missing_payload(address, generation, &self.labels_get)
+                        .await;
                 }
 
                 load_output
@@ -2155,13 +2188,34 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         }
         timed!(self.latency_histogram, &self.labels_put, {
             let probe = if self.force_write {
-                (None, false)
+                (None, false, None)
             } else {
                 self.probe_backend(partition, address).await?
             };
 
+            if matches!(
+                (&self.catalog, probe.0),
+                (
+                    FragmentCatalogBackend::External(_),
+                    Some(FragmentState::Stored)
+                )
+            ) {
+                return match self.associate_backend(partition, address, false).await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.is_address_not_found() => {
+                        self.report_missing_payload(address, probe.2, &self.labels_put)
+                            .await;
+                        let payload = payload.ok_or(error)?;
+                        self.write_payload_and_state(address.hash, fragment, payload)
+                            .await?;
+                        self.associate_backend(partition, address, true).await
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+
             match probe {
-                (Some(FragmentState::Obliterating), _) => {
+                (Some(FragmentState::Obliterating), _, _) => {
                     debug!(
                         "Received request to put fragment at {address} that is in the process of \
                          being obliterated"
@@ -2169,13 +2223,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     Err(StoreError::from(SlowDown))
                 }
 
-                (Some(FragmentState::Stored), true) => Ok(()),
+                (Some(FragmentState::Stored), true, _) => Ok(()),
 
-                (Some(FragmentState::Stored), false) if payload.is_some() => {
-                    self.associate_backend(partition, address).await
+                (Some(FragmentState::Stored), false, _) if payload.is_some() => {
+                    self.associate_backend(partition, address, false).await
                 }
 
-                (Some(FragmentState::Stored), false) => {
+                (Some(FragmentState::Stored), false, _) => {
                     Err(StoreError::internal("Payload buffer required"))
                 }
 
@@ -2183,7 +2237,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     Some(payload) => {
                         self.write_payload_and_state(address.hash, fragment, payload)
                             .await?;
-                        self.associate_backend(partition, address).await?;
+                        self.associate_backend(partition, address, true).await?;
                         Ok(())
                     }
                     None => Err(StoreError::internal("Payload buffer required")),
@@ -2358,19 +2412,44 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            let present = if source_address.context.is_zero() {
-                self.has_partition_association(source_partition, source_address.hash)
-                    .await?
+            let (source_exists, generation) = if source_address.context.is_zero() {
+                match &self.catalog {
+                    FragmentCatalogBackend::External(catalog) => {
+                        let resolution = catalog
+                            .resolve_partition(source_partition, source_address.hash)
+                            .await?;
+                        (
+                            resolution.associated
+                                && resolution.state == Some(CatalogFragmentState::Stored),
+                            resolution.generation,
+                        )
+                    }
+                    FragmentCatalogBackend::DynamoDb(_) => (
+                        self.has_partition_association(source_partition, source_address.hash)
+                            .await?,
+                        None,
+                    ),
+                }
             } else {
                 self.association_exists_backend(source_partition, source_address)
                     .await?
             };
-            if !present {
+            if !source_exists {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
-            self.associate_backend(destination_partition, destination_address)
-                .await
+            let result = self
+                .associate_backend(destination_partition, destination_address, false)
+                .await;
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(StoreError::is_address_not_found)
+            {
+                self.report_missing_payload(source_address, generation, &self.labels_copy)
+                    .await;
+            }
+            result
         })
         .into()
     }
