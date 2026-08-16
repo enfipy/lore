@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -35,6 +36,9 @@ use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::fragment_catalog::BeginObliteration;
+use lore_storage::fragment_catalog::FragmentCatalog;
+use lore_storage::fragment_catalog::FragmentState as CatalogFragmentState;
 #[cfg(test)]
 use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -161,6 +165,14 @@ impl FragmentState {
     }
 }
 
+fn catalog_state(state: CatalogFragmentState) -> FragmentState {
+    match state {
+        CatalogFragmentState::Stored => FragmentState::Stored,
+        CatalogFragmentState::Obliterating => FragmentState::Obliterating,
+        CatalogFragmentState::Obliterated => FragmentState::Obliterated,
+    }
+}
+
 /// A row in the fragment state table. Presence of the row means the hash exists in some state.
 ///
 /// The `state` field is what distinguishes a row written under this model from one written when
@@ -247,6 +259,7 @@ impl S3StoreSettings {
         self
     }
 
+    /// Declare whether object deletion must remove historical versions.
     pub fn with_object_versioning(mut self, object_versioning: S3ObjectVersioning) -> Self {
         self.object_versioning = object_versioning;
         self
@@ -307,6 +320,21 @@ pub struct AwsImmutableStoreSettings {
     pub dynamodb: DynamoDbImmutableStoreSettings,
     #[serde(default)]
     pub force_write: bool,
+}
+
+/// Object-store settings used with a non-DynamoDB fragment catalog.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ObjectStoreImmutableStoreSettings {
+    pub s3: S3StoreSettings,
+    #[serde(default)]
+    pub force_write: bool,
+}
+
+impl ObjectStoreImmutableStoreSettings {
+    /// Create object-store settings for an external fragment catalog.
+    pub fn new(s3: S3StoreSettings, force_write: bool) -> Self {
+        Self { s3, force_write }
+    }
 }
 
 impl AwsImmutableStoreSettings {
@@ -549,7 +577,7 @@ struct GetS3objectContentsOutput {
 
 pub struct AwsImmutableStore {
     s3: S3,
-    dynamodb: DynamoDb,
+    catalog: FragmentCatalogBackend,
     bucket: String,
     object_versioning: S3ObjectVersioning,
     fragments_table_name: Arc<str>,
@@ -577,6 +605,11 @@ pub struct AwsImmutableStore {
     association_without_state_counter: Counter<u64>,
 }
 
+enum FragmentCatalogBackend {
+    DynamoDb(DynamoDb),
+    External(Arc<dyn FragmentCatalog>),
+}
+
 impl AwsImmutableStore {
     pub fn new(s3: S3, dynamodb: DynamoDb, settings: &AwsImmutableStoreSettings) -> Self {
         let provider = AwsImmutableStoreInstrumentProvider;
@@ -594,7 +627,7 @@ impl AwsImmutableStore {
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
         Self {
             s3,
-            dynamodb,
+            catalog: FragmentCatalogBackend::DynamoDb(dynamodb),
             bucket: settings.s3.bucket.clone(),
             object_versioning: settings.s3.object_versioning,
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
@@ -625,6 +658,93 @@ impl AwsImmutableStore {
         }
     }
 
+    /// Compose S3-compatible payload storage with a backend-neutral fragment catalog.
+    pub fn with_catalog(
+        s3: S3,
+        catalog: Arc<dyn FragmentCatalog>,
+        settings: &ObjectStoreImmutableStoreSettings,
+    ) -> Self {
+        let provider = AwsImmutableStoreInstrumentProvider;
+        Self {
+            s3,
+            catalog: FragmentCatalogBackend::External(catalog),
+            bucket: settings.s3.bucket.clone(),
+            object_versioning: settings.s3.object_versioning,
+            fragments_table_name: Arc::from(""),
+            fragment_state_table_name: Arc::from(""),
+            fragment_metadata_table_name: None,
+            force_write: settings.force_write,
+            obliteration_drain: Duration::ZERO,
+            latency_histogram: provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+            labels_get: provider.get_labels_for_operation_context("get"),
+            labels_put: provider.get_labels_for_operation_context("put"),
+            labels_obliterate: provider.get_labels_for_operation_context("obliterate"),
+            labels_copy: provider.get_labels_for_operation_context("copy"),
+            labels_get_metadata: provider.get_labels_for_operation_context("get_metadata"),
+            labels_query: provider.get_labels_for_operation_context("query"),
+            missing_payload_counter: provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME),
+            association_without_state_counter: provider
+                .counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME),
+        }
+    }
+
+    fn dynamodb(&self) -> Result<&DynamoDb, StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::DynamoDb(client) => Ok(client),
+            FragmentCatalogBackend::External(_) => Err(StoreError::internal(
+                "DynamoDB operation requested from an external fragment catalog",
+            )),
+        }
+    }
+
+    async fn association_exists_backend(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<bool, StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                catalog.association_exists(partition, address).await
+            }
+            FragmentCatalogBackend::DynamoDb(_) => self.exists(partition, address).await,
+        }
+    }
+
+    async fn associate_backend(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<(), StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                catalog.associate(partition, address).await
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                self.associate_fragment(partition, address).await
+            }
+        }
+    }
+
+    async fn probe_backend(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<(Option<FragmentState>, bool), StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                let resolution = catalog.resolve(partition, address).await?;
+                Ok((resolution.state.map(catalog_state), resolution.associated))
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                let (associated, state) = tokio::join!(
+                    self.exists(partition, address),
+                    self.load_state(address.hash)
+                );
+                Ok((state?, associated?))
+            }
+        }
+    }
+
     /// Whether this partition holds the association for this address, which is the whole of what
     /// this store will serve: it isolates partitions, so it reads no wider than the association
     /// asked about.
@@ -641,7 +761,7 @@ impl AwsImmutableStore {
         })?;
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .get_item(
                 &self.fragments_table_name,
                 item,
@@ -685,7 +805,7 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .batch_get_item(&self.fragments_table_name, items, true)
             .await
             .map_err(|e| {
@@ -729,6 +849,31 @@ impl AwsImmutableStore {
         address: Address,
         labels: &[KeyValue],
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
+        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            let resolution = catalog.resolve(partition, address).await?;
+            let miss = (QueryResultSource::State, StoreGetData::default());
+            if !resolution.associated {
+                return Ok(miss);
+            }
+            return match resolution.state {
+                Some(CatalogFragmentState::Stored) => Ok((
+                    QueryResultSource::State,
+                    StoreGetData::metadata(
+                        stored_durable(Fragment::default()),
+                        StoreMatch::MatchFull,
+                        partition,
+                    ),
+                )),
+                Some(CatalogFragmentState::Obliterating | CatalogFragmentState::Obliterated) => {
+                    Ok(miss)
+                }
+                None => {
+                    self.association_without_state_counter.add(1, labels);
+                    Ok(miss)
+                }
+            };
+        }
+
         let (associated, state) = tokio::join!(
             self.exists(partition, address),
             self.load_state(address.hash)
@@ -789,6 +934,35 @@ impl AwsImmutableStore {
         addresses: &[Address],
         results: &mut [StoreMatchResult],
     ) -> Result<(), StoreError> {
+        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            let resolutions = catalog.resolve_batch(partition, addresses).await?;
+            if resolutions.len() != addresses.len() {
+                return Err(StoreError::internal(
+                    "Fragment catalog returned an unexpected batch size",
+                ));
+            }
+            for ((address, resolution), result) in
+                addresses.iter().zip(resolutions).zip(results.iter_mut())
+            {
+                if resolution.associated && resolution.state == Some(CatalogFragmentState::Stored) {
+                    *result = StoreMatchResult {
+                        match_made: StoreMatch::MatchFull,
+                        partition,
+                        stored_local: false,
+                        stored_durable: true,
+                    };
+                } else {
+                    if resolution.associated && resolution.state.is_none() {
+                        self.association_without_state_counter
+                            .add(1, &self.labels_query);
+                        trace!(%address, "Query found an association with no stored payload");
+                    }
+                    *result = StoreMatchResult::default();
+                }
+            }
+            return Ok(());
+        }
+
         // Neither read needs what the other returns.
         let (associations, states) = if self.fragment_metadata_table_name.is_some() {
             let (associations, states) = tokio::join!(
@@ -870,7 +1044,7 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
+            .dynamodb()?
             .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
             .await
         {
@@ -934,6 +1108,13 @@ impl AwsImmutableStore {
              been lost. Clearing its state so the content can be stored again."
         );
 
+        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            if let Err(error) = catalog.repair_missing_payload(address.hash).await {
+                warn!(%address, ?error, "Failed to clear state for a lost payload");
+            }
+            return;
+        }
+
         match self.load_state(address.hash).await {
             Ok(Some(FragmentState::Stored)) => {
                 if let Err(error) = self.clear_state(address.hash).await {
@@ -959,7 +1140,7 @@ impl AwsImmutableStore {
             StoreError::internal_with_context(e, "Failed to serialize fragment state for delete")
         })?;
 
-        self.dynamodb
+        self.dynamodb()?
             .delete_item(&self.fragment_state_table_name, item)
             .await
             .map_err(|e| {
@@ -1022,7 +1203,7 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
+            .dynamodb()?
             .put_item_conditional(
                 &self.fragment_state_table_name,
                 item,
@@ -1066,7 +1247,7 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb.put_item(&self.fragments_table_name, item).await
+        self.dynamodb()?.put_item(&self.fragments_table_name, item).await
             .map_err(|e| {
                 warn!({REPOSITORY_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1103,7 +1284,7 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .batch_get_item(&self.fragment_state_table_name, items, true)
             .await
             .map_err(|e| {
@@ -1166,7 +1347,7 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .batch_get_item(table_name, items, true /* consistent read */)
             .await
             .map_err(|e| {
@@ -1201,7 +1382,10 @@ impl AwsImmutableStore {
         partition: Partition,
         hash: Hash,
     ) -> Result<bool, StoreError> {
-        self.dynamodb
+        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            return catalog.partition_association_exists(partition, hash).await;
+        }
+        self.dynamodb()?
             .query_single(
                 &self.fragments_table_name,
                 PartitionAssociationQuery(hash, partition),
@@ -1227,7 +1411,7 @@ impl AwsImmutableStore {
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
-        self.dynamodb
+        self.dynamodb()?
             .query_single(&self.fragments_table_name, FragmentsQuery(hash))
             .await
             .map(|output| output.count > 0)
@@ -1261,7 +1445,7 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb
+        self.dynamodb()?
             .delete_item(&self.fragments_table_name, item)
             .await
             .map_err(|e| {
@@ -1317,7 +1501,12 @@ impl AwsImmutableStore {
                 })?;
         }
 
-        match self.publish_state(hash).await? {
+        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            return catalog.publish(hash).await;
+        }
+
+        let state = self.publish_state(hash).await?;
+        match state {
             FragmentState::Stored => {}
             FragmentState::Obliterating => {
                 info!(
@@ -1474,7 +1663,7 @@ impl AwsImmutableStore {
         })?;
 
         let Some(av_map) = self
-            .dynamodb
+            .dynamodb()?
             .get_item(
                 &self.fragment_state_table_name,
                 item,
@@ -1536,7 +1725,7 @@ impl AwsImmutableStore {
         })?;
 
         let entry = self
-            .dynamodb
+            .dynamodb()?
             .get_item(table_name, item, true /* consistent read */)
             .await
             .map_err(|e| {
@@ -1902,7 +2091,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             timed!(self.latency_histogram, &self.labels_get, {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.exists(partition, address);
+                let exists_fut = self.association_exists_backend(partition, address);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -1968,11 +2157,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             let probe = if self.force_write {
                 (None, false)
             } else {
-                let (associated, state) = tokio::join!(
-                    self.exists(partition, address),
-                    self.load_state(address.hash)
-                );
-                (state?, associated?)
+                self.probe_backend(partition, address).await?
             };
 
             match probe {
@@ -1987,7 +2172,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 (Some(FragmentState::Stored), true) => Ok(()),
 
                 (Some(FragmentState::Stored), false) if payload.is_some() => {
-                    self.associate_fragment(partition, address).await
+                    self.associate_backend(partition, address).await
                 }
 
                 (Some(FragmentState::Stored), false) => {
@@ -1998,7 +2183,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     Some(payload) => {
                         self.write_payload_and_state(address.hash, fragment, payload)
                             .await?;
-                        self.associate_fragment(partition, address).await?;
+                        self.associate_backend(partition, address).await?;
                         Ok(())
                     }
                     None => Err(StoreError::internal("Payload buffer required")),
@@ -2020,6 +2205,49 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // Note: given the importance of the work done here, and how relatively infrequently we
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
+
+            if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+                match catalog
+                    .begin_obliteration(partition, address)
+                    .instrument(span.clone())
+                    .await?
+                {
+                    BeginObliteration::NoState => {
+                        info!("No fragment state for {address}, nothing to obliterate");
+                        return Ok(());
+                    }
+                    BeginObliteration::AlreadyObliterated => {
+                        info!("Fragment {address} has already been obliterated");
+                        return Ok(());
+                    }
+                    BeginObliteration::ResumePayloadDeletion => {
+                        info!("Resuming interrupted payload deletion for {address}");
+                    }
+                    BeginObliteration::ReferencesRemain => {
+                        stats
+                            .num_fragments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    BeginObliteration::PayloadUnreferenced => {
+                        stats
+                            .num_fragments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                self.clone()
+                    .obliterate_sub_fragments(partition, address, stats.clone())
+                    .instrument(span.clone())
+                    .await?;
+                self.delete_payload(address.hash)
+                    .instrument(span.clone())
+                    .await?;
+                stats
+                    .num_payloads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return catalog.finalize_obliteration(address.hash).await;
+            }
 
             // Content written before the state table existed has no row here, so this returns
             // having deleted nothing: the association stays, and still resolves to a full match.
@@ -2134,13 +2362,14 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 self.has_partition_association(source_partition, source_address.hash)
                     .await?
             } else {
-                self.exists(source_partition, source_address).await?
+                self.association_exists_backend(source_partition, source_address)
+                    .await?
             };
             if !present {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
-            self.associate_fragment(destination_partition, destination_address)
+            self.associate_backend(destination_partition, destination_address)
                 .await
         })
         .into()
@@ -2183,8 +2412,10 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     }
 
     fn max_query_batch(&self) -> Option<usize> {
-        // DynamoDB batch size cannot exceed 100
-        Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT)
+        match &self.catalog {
+            FragmentCatalogBackend::DynamoDb(_) => Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT),
+            FragmentCatalogBackend::External(catalog) => catalog.max_query_batch(),
+        }
     }
 }
 
@@ -3644,6 +3875,50 @@ mod test {
             .expect_err("listing versions fails");
 
         assert_ne!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterated)
+        );
+    }
+
+    #[tokio::test]
+    async fn unversioned_obliteration_does_not_list_versions() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        let (s3, dynamodb) = wire(&fake);
+        let mut settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: DynamoDbImmutableStoreSettings::new(
+                FRAGMENTS_TABLE_NAME.to_string(),
+                FRAGMENT_STATE_TABLE_NAME.to_string(),
+            ),
+            force_write: false,
+        };
+        settings.s3.object_versioning = S3ObjectVersioning::Unversioned;
+        settings.dynamodb.timeout_millis = 1;
+        let store = Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings));
+
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+        fake.fail(Fault::ObjectList);
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("unversioned deletion must not list versions");
+
+        assert!(fake.object(address.hash).is_none());
+        assert_eq!(
             fake.state_of(address.hash),
             Some(FragmentState::Obliterated)
         );

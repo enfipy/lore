@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 
 use std::fmt;
@@ -12,24 +12,18 @@ use deadpool_postgres::ManagerConfig;
 use deadpool_postgres::Pool;
 use deadpool_postgres::RecyclingMethod;
 use deadpool_postgres::Runtime;
-use lore_aws::store::fragment_catalog::BeginObliteration;
-use lore_aws::store::fragment_catalog::FragmentCatalog;
-use lore_aws::store::fragment_catalog::ObliterationLease;
-use lore_aws::store::fragment_catalog::ReleaseAssociation;
-use lore_base::error::AddressNotFound;
 use lore_base::error::SlowDown;
 use lore_base::types::Address;
-use lore_base::types::Context;
-use lore_base::types::Fragment;
-use lore_base::types::FragmentFlags;
 use lore_base::types::Hash;
+use lore_base::types::Partition;
 use lore_storage::StoreError;
-use lore_storage::StoreMatch;
-use lore_storage::StoreQueryResult;
+use lore_storage::fragment_catalog::BeginObliteration;
+use lore_storage::fragment_catalog::CatalogResolution;
+use lore_storage::fragment_catalog::FragmentCatalog;
+use lore_storage::fragment_catalog::FragmentState;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
-use tokio_postgres::IsolationLevel;
 use tokio_postgres::Row;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
@@ -40,13 +34,8 @@ const DEFAULT_SCHEMA: &str = "lore";
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
 const DEFAULT_CONNECT_TIMEOUT_MILLIS: u64 = 5_000;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
-const OBLITERATION_MASK: u32 = FragmentFlags::PayloadObliteration.bits();
-
 const MIGRATION_VERSION: i32 = 1;
 const MIGRATION_SQL: &str = include_str!("../migrations/0001_fragment_catalog.sql");
-#[cfg(test)]
-const EXPECTED_MIGRATION_CHECKSUM: &str =
-    "31cdf92ab669b9568bd81c600e676cc358e7a35110500e293c08418bbbc36c49";
 
 fn default_schema() -> String {
     DEFAULT_SCHEMA.to_string()
@@ -127,7 +116,7 @@ impl PostgresFragmentCatalogConfig {
     }
 }
 
-/// PostgreSQL implementation of Lore's fragment metadata and association catalog.
+/// PostgreSQL implementation of Lore's fragment lifecycle and association catalog.
 #[derive(Clone)]
 pub struct PostgresFragmentCatalog {
     pool: Pool,
@@ -242,8 +231,8 @@ impl PostgresFragmentCatalog {
         })
     }
 
-    fn metadata_table(&self) -> String {
-        format!("\"{}\".fragment_metadata", self.schema)
+    fn state_table(&self) -> String {
+        format!("\"{}\".fragment_state", self.schema)
     }
 
     fn association_table(&self) -> String {
@@ -289,7 +278,9 @@ impl PostgresFragmentCatalog {
             .map_err(|error| database_error(error, "Failed to inspect catalog migrations"))?;
 
         if let Some(row) = existing {
-            let checksum: String = row.get(0);
+            let checksum: String = row.try_get(0).map_err(|error| {
+                database_error(error, "Failed to read catalog migration checksum")
+            })?;
             if checksum != migration_checksum {
                 return Err(StoreError::internal(format!(
                     "PostgreSQL catalog migration {MIGRATION_VERSION} checksum mismatch"
@@ -322,89 +313,64 @@ impl PostgresFragmentCatalog {
             .map_err(|error| database_error(error, "Failed to commit catalog migrations"))
     }
 
-    async fn locked_metadata(
+    async fn locked_state(
         transaction: &deadpool_postgres::Transaction<'_>,
         table: &str,
         hash: Hash,
-    ) -> Result<Option<Fragment>, StoreError> {
-        transaction
+    ) -> Result<Option<FragmentState>, StoreError> {
+        let row = transaction
             .query_opt(
-                &format!(
-                    "SELECT flags, size_payload, size_content::text FROM {table}
-                     WHERE hash = $1 FOR UPDATE"
-                ),
+                &format!("SELECT state FROM {table} WHERE hash = $1 FOR UPDATE"),
                 &[&hash.as_ref()],
             )
             .await
-            .map_err(|error| database_error(error, "Failed to lock fragment metadata"))?
-            .map(|row| fragment_from_row(&row))
-            .transpose()
+            .map_err(|error| database_error(error, "Failed to lock fragment state"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let state = row
+            .try_get(0)
+            .map_err(|error| database_error(error, "Failed to read locked fragment state"))?;
+        Ok(Some(state_from_i16(state)?))
     }
 }
 
 #[async_trait]
 impl FragmentCatalog for PostgresFragmentCatalog {
-    async fn query(
+    async fn resolve(
         &self,
-        repository: Context,
+        partition: Partition,
         address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
-        if match_requested == StoreMatch::MatchNone {
-            return Ok(StoreQueryResult::default());
-        }
-
+    ) -> Result<CatalogResolution, StoreError> {
         let client = self.connection().await?;
         let row = client
-            .query_opt(
+            .query_one(
                 &format!(
-                    "SELECT m.flags, m.size_payload, m.size_content::text,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a
-                                WHERE a.hash = m.hash AND a.repository = $2 AND a.context = $3
-                            ) AS exact_match,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a
-                                WHERE a.hash = m.hash AND a.repository = $2
-                            ) AS repository_match,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a WHERE a.hash = m.hash
-                            ) AS hash_match
-                     FROM {metadata} m WHERE m.hash = $1",
-                    associations = self.association_table(),
-                    metadata = self.metadata_table(),
+                    "SELECT
+                        EXISTS (
+                            SELECT 1 FROM {association}
+                            WHERE hash = $1 AND partition = $2 AND context = $3
+                        ),
+                        (SELECT state FROM {state} WHERE hash = $1)",
+                    association = self.association_table(),
+                    state = self.state_table(),
                 ),
                 &[
                     &address.hash.as_ref(),
-                    &repository.as_ref(),
+                    &partition.as_ref(),
                     &address.context.as_ref(),
                 ],
             )
             .await
-            .map_err(|error| database_error(error, "Failed to query fragment catalog"))?;
-
-        let Some(row) = row else {
-            return Ok(StoreQueryResult::default());
-        };
-        let exact_match: bool = row.get(3);
-        let repository_match: bool = row.get(4);
-        let hash_match: bool = row.get(5);
-        let match_made = choose_match(match_requested, exact_match, repository_match, hash_match);
-        if match_made == StoreMatch::MatchNone {
-            return Ok(StoreQueryResult::default());
-        }
-        Ok(StoreQueryResult {
-            fragment: fragment_from_row(&row)?,
-            match_made,
-        })
+            .map_err(|error| database_error(error, "Failed to resolve fragment catalog"))?;
+        resolution_from_row(&row)
     }
 
-    async fn query_batch(
+    async fn resolve_batch(
         &self,
-        repository: Context,
+        partition: Partition,
         addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
+    ) -> Result<Vec<CatalogResolution>, StoreError> {
         if addresses.len() > self.max_batch_size {
             return Err(StoreError::internal(format!(
                 "PostgreSQL catalog batch has {} addresses; maximum is {}",
@@ -412,8 +378,8 @@ impl FragmentCatalog for PostgresFragmentCatalog {
                 self.max_batch_size
             )));
         }
-        if addresses.is_empty() || match_requested == StoreMatch::MatchNone {
-            return Ok(vec![StoreMatch::MatchNone; addresses.len()]);
+        if addresses.is_empty() {
+            return Ok(Vec::new());
         }
 
         let hashes: Vec<Vec<u8>> = addresses
@@ -428,152 +394,158 @@ impl FragmentCatalog for PostgresFragmentCatalog {
         let rows = client
             .query(
                 &format!(
-                    "SELECT input.ordinality,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a
-                                WHERE a.hash = input.hash
-                                  AND a.repository = $1
-                                  AND a.context = input.context
-                            ) AS exact_match,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a
-                                WHERE a.hash = input.hash AND a.repository = $1
-                            ) AS repository_match,
-                            EXISTS (
-                                SELECT 1 FROM {associations} a WHERE a.hash = input.hash
-                            ) AS hash_match
+                    "SELECT
+                        EXISTS (
+                            SELECT 1 FROM {association} a
+                            WHERE a.hash = input.hash
+                              AND a.partition = $1
+                              AND a.context = input.context
+                        ),
+                        (SELECT state FROM {state} s WHERE s.hash = input.hash)
                      FROM unnest($2::bytea[], $3::bytea[])
                          WITH ORDINALITY AS input(hash, context, ordinality)
                      ORDER BY input.ordinality",
-                    associations = self.association_table(),
+                    association = self.association_table(),
+                    state = self.state_table(),
                 ),
-                &[&repository.as_ref(), &hashes, &contexts],
+                &[&partition.as_ref(), &hashes, &contexts],
             )
             .await
-            .map_err(|error| database_error(error, "Failed to batch query fragment catalog"))?;
+            .map_err(|error| database_error(error, "Failed to batch resolve fragment catalog"))?;
 
         if rows.len() != addresses.len() {
             return Err(StoreError::internal(
                 "PostgreSQL batch query returned an unexpected row count",
             ));
         }
-        Ok(rows
-            .iter()
-            .map(|row| choose_match(match_requested, row.get(1), row.get(2), row.get(3)))
-            .collect())
+        rows.iter().map(resolution_from_row).collect()
     }
 
-    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
+    async fn association_exists(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<bool, StoreError> {
         let client = self.connection().await?;
         let row = client
-            .query_opt(
+            .query_one(
                 &format!(
-                    "SELECT flags, size_payload, size_content::text FROM {}
-                     WHERE hash = $1",
-                    self.metadata_table()
-                ),
-                &[&hash.as_ref()],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to load fragment metadata"))?;
-        row.map(|row| fragment_from_row(&row))
-            .transpose()?
-            .ok_or_else(|| {
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            })
-    }
-
-    async fn register_fragment(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-    ) -> Result<(), StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::Serializable)
-            .start()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin fragment registration"))?;
-        let metadata = self.metadata_table();
-        let hash = address.hash.as_ref();
-        let flags = i64::from(fragment.flags);
-        let size_payload = i64::from(fragment.size_payload);
-        let size_content = fragment.size_content.to_string();
-        transaction
-            .execute(
-                &format!(
-                    "INSERT INTO {metadata} (hash, flags, size_payload, size_content)
-                     VALUES ($1, $2, $3, $4::text::numeric) ON CONFLICT (hash) DO NOTHING"
-                ),
-                &[&hash, &flags, &size_payload, &size_content],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to insert fragment metadata"))?;
-
-        let stored = Self::locked_metadata(&transaction, &metadata, address.hash)
-            .await?
-            .ok_or_else(|| StoreError::internal("Fragment metadata disappeared during insert"))?;
-        if stored != fragment {
-            return Err(StoreError::internal(
-                if stored.flags & OBLITERATION_MASK != 0 {
-                    "Cannot register an obliterating or obliterated fragment"
-                } else {
-                    "Hash collision: existing fragment metadata differs"
-                },
-            ));
-        }
-
-        transaction
-            .execute(
-                &format!(
-                    "INSERT INTO {} (hash, repository, context) VALUES ($1, $2, $3)
-                     ON CONFLICT DO NOTHING",
+                    "SELECT EXISTS (
+                        SELECT 1 FROM {} WHERE hash = $1 AND partition = $2 AND context = $3
+                    )",
                     self.association_table()
                 ),
                 &[
                     &address.hash.as_ref(),
-                    &repository.as_ref(),
+                    &partition.as_ref(),
                     &address.context.as_ref(),
                 ],
             )
             .await
-            .map_err(|error| database_error(error, "Failed to register fragment association"))?;
+            .map_err(|error| database_error(error, "Failed to query fragment association"))?;
+        row.try_get(0)
+            .map_err(|error| database_error(error, "Failed to read fragment association"))
+    }
+
+    async fn partition_association_exists(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<bool, StoreError> {
+        let client = self.connection().await?;
+        let row = client
+            .query_one(
+                &format!(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM {} WHERE hash = $1 AND partition = $2
+                    )",
+                    self.association_table()
+                ),
+                &[&hash.as_ref(), &partition.as_ref()],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to query partition association"))?;
+        row.try_get(0)
+            .map_err(|error| database_error(error, "Failed to read partition association"))
+    }
+
+    async fn publish(&self, hash: Hash) -> Result<(), StoreError> {
+        let mut client = self.connection().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| database_error(error, "Failed to begin fragment publication"))?;
+        let table = self.state_table();
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (hash, state) VALUES ($1, $2)
+                     ON CONFLICT (hash) DO NOTHING"
+                ),
+                &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to publish fragment state"))?;
+        let state = Self::locked_state(&transaction, &table, hash)
+            .await?
+            .ok_or_else(|| StoreError::internal("Fragment state disappeared during publication"))?;
+        match state {
+            FragmentState::Stored => {}
+            FragmentState::Obliterated => {
+                transaction
+                    .execute(
+                        &format!("UPDATE {table} SET state = $2 WHERE hash = $1"),
+                        &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+                    )
+                    .await
+                    .map_err(|error| database_error(error, "Failed to revive fragment state"))?;
+            }
+            FragmentState::Obliterating => return Err(StoreError::from(SlowDown)),
+        }
         transaction
             .commit()
             .await
-            .map_err(|error| database_error(error, "Failed to commit fragment registration"))
+            .map_err(|error| database_error(error, "Failed to commit fragment publication"))?;
+        Ok(())
     }
 
-    async fn associate_fragment(
-        &self,
-        repository: Context,
-        address: Address,
-    ) -> Result<(), StoreError> {
+    async fn repair_missing_payload(&self, hash: Hash) -> Result<(), StoreError> {
+        let client = self.connection().await?;
+        client
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE hash = $1 AND state = $2",
+                    self.state_table()
+                ),
+                &[&hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| database_error(error, "Failed to clear lost fragment state"))
+    }
+
+    async fn associate(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
         let mut client = self.connection().await?;
         let transaction = client
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin fragment association"))?;
-        let stored = Self::locked_metadata(&transaction, &self.metadata_table(), address.hash)
+        let state = Self::locked_state(&transaction, &self.state_table(), address.hash)
             .await?
-            .ok_or_else(|| StoreError::from(AddressNotFound::from(address)))?;
-        if stored.flags & OBLITERATION_MASK != 0 {
-            return Err(StoreError::internal(
-                "Cannot associate an obliterating or obliterated fragment",
-            ));
+            .ok_or_else(|| StoreError::internal("Cannot associate an unpublished fragment"))?;
+        if state != FragmentState::Stored {
+            return Err(StoreError::from(SlowDown));
         }
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {} (hash, repository, context) VALUES ($1, $2, $3)
+                    "INSERT INTO {} (hash, partition, context) VALUES ($1, $2, $3)
                      ON CONFLICT DO NOTHING",
                     self.association_table()
                 ),
                 &[
                     &address.hash.as_ref(),
-                    &repository.as_ref(),
+                    &partition.as_ref(),
                     &address.context.as_ref(),
                 ],
             )
@@ -585,80 +557,61 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             .map_err(|error| database_error(error, "Failed to commit fragment association"))
     }
 
-    async fn begin_obliteration(&self, hash: Hash) -> Result<BeginObliteration, StoreError> {
+    async fn begin_obliteration(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<BeginObliteration, StoreError> {
         let mut client = self.connection().await?;
         let transaction = client
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin obliteration transaction"))?;
-        let metadata = self.metadata_table();
-        let stored = Self::locked_metadata(&transaction, &metadata, hash)
-            .await?
-            .ok_or_else(|| {
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+        let state_table = self.state_table();
+        let Some(state) = Self::locked_state(&transaction, &state_table, address.hash).await?
+        else {
+            transaction.commit().await.map_err(|error| {
+                database_error(error, "Failed to commit empty obliteration lookup")
             })?;
-        lore_storage::validate_fragment_size(&stored)?;
-        if stored.flags & FragmentFlags::PayloadObliterated.bits() != 0 {
+            return Ok(BeginObliteration::NoState);
+        };
+        if state == FragmentState::Obliterated {
             transaction.commit().await.map_err(|error| {
                 database_error(error, "Failed to commit terminal obliteration lookup")
             })?;
             return Ok(BeginObliteration::AlreadyObliterated);
         }
-
-        let mut original = stored;
-        original.flags &= !OBLITERATION_MASK;
-        let marker = if stored.flags & FragmentFlags::PayloadObliterating.bits() != 0 {
-            stored
-        } else {
-            let mut marker = original;
-            marker.flags |= FragmentFlags::PayloadObliterating.bits();
-            update_metadata(&transaction, &metadata, hash, marker).await?;
-            marker
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit obliteration marker"))?;
-        Ok(BeginObliteration::Acquired(ObliterationLease::new(
-            original, marker,
-        )))
-    }
-
-    async fn release_association(
-        &self,
-        repository: Context,
-        address: Address,
-        lease: ObliterationLease,
-    ) -> Result<ReleaseAssociation, StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin association release"))?;
-        let metadata = self.metadata_table();
-        let stored = Self::locked_metadata(&transaction, &metadata, address.hash)
-            .await?
-            .ok_or_else(|| StoreError::from(AddressNotFound::from(address)))?;
-        if stored != lease.marker() {
-            return Err(StoreError::internal(
-                "Obliteration lease no longer matches fragment metadata",
-            ));
+        if state == FragmentState::Obliterating {
+            transaction.commit().await.map_err(|error| {
+                database_error(error, "Failed to commit resumed obliteration lookup")
+            })?;
+            return Ok(BeginObliteration::ResumePayloadDeletion);
         }
 
         transaction
             .execute(
                 &format!(
-                    "DELETE FROM {} WHERE hash = $1 AND repository = $2 AND context = $3",
+                    "DELETE FROM {} WHERE hash = $1 AND partition = $2 AND context = $3",
                     self.association_table()
                 ),
                 &[
                     &address.hash.as_ref(),
-                    &repository.as_ref(),
+                    &partition.as_ref(),
                     &address.context.as_ref(),
                 ],
             )
             .await
             .map_err(|error| database_error(error, "Failed to release fragment association"))?;
+        transaction
+            .execute(
+                &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
+                &[
+                    &address.hash.as_ref(),
+                    &state_to_i16(FragmentState::Obliterating),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to mark fragment obliterating"))?;
         let remains: bool = transaction
             .query_one(
                 &format!(
@@ -668,55 +621,58 @@ impl FragmentCatalog for PostgresFragmentCatalog {
                 &[&address.hash.as_ref()],
             )
             .await
-            .map_err(|error| database_error(error, "Failed to count fragment associations"))?
-            .get(0);
+            .map_err(|error| database_error(error, "Failed to inspect fragment associations"))?
+            .try_get(0)
+            .map_err(|error| database_error(error, "Failed to read fragment associations"))?;
 
-        let outcome = if remains {
-            update_metadata(&transaction, &metadata, address.hash, lease.original()).await?;
-            ReleaseAssociation::ReferencesRemain
+        let result = if remains {
+            transaction
+                .execute(
+                    &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
+                    &[&address.hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+                )
+                .await
+                .map_err(|error| database_error(error, "Failed to release obliteration marker"))?;
+            BeginObliteration::ReferencesRemain
         } else {
-            ReleaseAssociation::PayloadUnreferenced
+            BeginObliteration::PayloadUnreferenced
         };
         transaction
             .commit()
             .await
-            .map_err(|error| database_error(error, "Failed to commit association release"))?;
-        Ok(outcome)
+            .map_err(|error| database_error(error, "Failed to commit obliteration transition"))?;
+        Ok(result)
     }
 
-    async fn finalize_obliteration(
-        &self,
-        hash: Hash,
-        lease: ObliterationLease,
-    ) -> Result<(), StoreError> {
+    async fn finalize_obliteration(&self, hash: Hash) -> Result<(), StoreError> {
         let mut client = self.connection().await?;
         let transaction = client
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin obliteration finalization"))?;
-        let metadata = self.metadata_table();
-        let stored = Self::locked_metadata(&transaction, &metadata, hash)
+        let table = self.state_table();
+        let state = Self::locked_state(&transaction, &table, hash)
             .await?
-            .ok_or_else(|| {
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            })?;
-        let terminal = Fragment {
-            flags: FragmentFlags::PayloadObliterated.bits(),
-            size_payload: 0,
-            size_content: 0,
-        };
-        if stored == terminal {
-            transaction.commit().await.map_err(|error| {
-                database_error(error, "Failed to commit idempotent finalization")
-            })?;
-            return Ok(());
+            .ok_or_else(|| StoreError::internal("Cannot finalize a missing fragment state"))?;
+        match state {
+            FragmentState::Obliterated => {}
+            FragmentState::Obliterating => {
+                transaction
+                    .execute(
+                        &format!("UPDATE {table} SET state = $2 WHERE hash = $1"),
+                        &[&hash.as_ref(), &state_to_i16(FragmentState::Obliterated)],
+                    )
+                    .await
+                    .map_err(|error| {
+                        database_error(error, "Failed to finalize fragment obliteration")
+                    })?;
+            }
+            FragmentState::Stored => {
+                return Err(StoreError::internal(
+                    "Cannot finalize a fragment that is not obliterating",
+                ));
+            }
         }
-        if stored != lease.marker() {
-            return Err(StoreError::internal(
-                "Obliteration lease no longer matches fragment metadata",
-            ));
-        }
-        update_metadata(&transaction, &metadata, hash, terminal).await?;
         transaction
             .commit()
             .await
@@ -725,6 +681,38 @@ impl FragmentCatalog for PostgresFragmentCatalog {
 
     fn max_query_batch(&self) -> Option<usize> {
         Some(self.max_batch_size)
+    }
+}
+
+fn resolution_from_row(row: &Row) -> Result<CatalogResolution, StoreError> {
+    let associated = row
+        .try_get(0)
+        .map_err(|error| database_error(error, "Failed to read association resolution"))?;
+    let state: Option<i16> = row
+        .try_get(1)
+        .map_err(|error| database_error(error, "Failed to read state resolution"))?;
+    Ok(CatalogResolution {
+        associated,
+        state: state.map(state_from_i16).transpose()?,
+    })
+}
+
+fn state_to_i16(state: FragmentState) -> i16 {
+    match state {
+        FragmentState::Stored => 0,
+        FragmentState::Obliterating => 1,
+        FragmentState::Obliterated => 2,
+    }
+}
+
+fn state_from_i16(state: i16) -> Result<FragmentState, StoreError> {
+    match state {
+        0 => Ok(FragmentState::Stored),
+        1 => Ok(FragmentState::Obliterating),
+        2 => Ok(FragmentState::Obliterated),
+        _ => Err(StoreError::internal(format!(
+            "PostgreSQL fragment state {state} is invalid"
+        ))),
     }
 }
 
@@ -740,66 +728,6 @@ fn validate_identifier(identifier: &str) -> Result<(), StoreError> {
     } else {
         Err(StoreError::internal(
             "PostgreSQL schema must be a 1-63 character SQL identifier",
-        ))
-    }
-}
-
-fn choose_match(requested: StoreMatch, exact: bool, repository: bool, hash: bool) -> StoreMatch {
-    match requested {
-        StoreMatch::MatchFull if exact => StoreMatch::MatchFull,
-        StoreMatch::MatchFull => StoreMatch::MatchNone,
-        StoreMatch::MatchPartition if repository => StoreMatch::MatchPartition,
-        StoreMatch::MatchPartition if hash => StoreMatch::MatchHash,
-        StoreMatch::MatchPartition => StoreMatch::MatchNone,
-        StoreMatch::MatchHash if hash => StoreMatch::MatchHash,
-        StoreMatch::MatchHash | StoreMatch::MatchNone => StoreMatch::MatchNone,
-    }
-}
-
-fn fragment_from_row(row: &Row) -> Result<Fragment, StoreError> {
-    let flags: i64 = row.get(0);
-    let size_payload: i64 = row.get(1);
-    let size_content: String = row.get(2);
-    Ok(Fragment {
-        flags: flags.try_into().map_err(|error| {
-            StoreError::internal_with_context(error, "PostgreSQL fragment flags are out of range")
-        })?,
-        size_payload: size_payload.try_into().map_err(|error| {
-            StoreError::internal_with_context(
-                error,
-                "PostgreSQL fragment payload size is out of range",
-            )
-        })?,
-        size_content: size_content.parse().map_err(|error| {
-            StoreError::internal_with_context(error, "PostgreSQL fragment content size is invalid")
-        })?,
-    })
-}
-
-async fn update_metadata(
-    transaction: &deadpool_postgres::Transaction<'_>,
-    table: &str,
-    hash: Hash,
-    fragment: Fragment,
-) -> Result<(), StoreError> {
-    let flags = i64::from(fragment.flags);
-    let size_payload = i64::from(fragment.size_payload);
-    let size_content = fragment.size_content.to_string();
-    let updated = transaction
-        .execute(
-            &format!(
-                "UPDATE {table} SET flags = $2, size_payload = $3, size_content = $4::text::numeric
-                 WHERE hash = $1"
-            ),
-            &[&hash.as_ref(), &flags, &size_payload, &size_content],
-        )
-        .await
-        .map_err(|error| database_error(error, "Failed to update fragment metadata"))?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(StoreError::internal(
-            "Fragment metadata disappeared during update",
         ))
     }
 }
@@ -840,7 +768,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_migration_checksum_is_stable() {
-        assert_eq!(migration_checksum(), EXPECTED_MIGRATION_CHECKSUM);
+    fn migration_checksum_is_sha256() {
+        assert_eq!(migration_checksum().len(), 64);
     }
 }

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 pub mod chunker;
 pub mod compress;
@@ -7,6 +8,7 @@ pub mod conformance;
 pub mod defragment;
 pub mod error;
 pub mod errors;
+pub mod fragment_catalog;
 pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;

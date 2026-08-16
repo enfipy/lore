@@ -1,3 +1,6 @@
+# Copyright 2026 David
+# SPDX-License-Identifier: MIT
+
 # Overlay for loreserver-postgres. Secrets should be supplied through environment variables.
 
 [immutable_store]
@@ -40,8 +43,7 @@ max_batch_size = 10_000
 provider = "consul"
 
 [plugins.consul]
-# CONSUL_HTTP_TOKEN supplies the ACL token without placing it in this file.
-address = "http://127.0.0.1:8500"
+# CONSUL_HTTP_ADDR and CONSUL_HTTP_TOKEN configure the client without placing secrets here.
 service_name = "lore-server"
 ignore_address = ""
 poll_interval_secs = 30

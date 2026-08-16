@@ -1,3 +1,6 @@
+# Copyright 2026 David
+# SPDX-License-Identifier: MIT
+
 [package]
 name = "lore-storage"
 edition = "2024"
@@ -40,6 +43,7 @@ zerocopy = { workspace = true }
 
 [features]
 default = []
+catalog-contract-tests = []
 failure_generator = []
 oodle = []
 trace_log = []

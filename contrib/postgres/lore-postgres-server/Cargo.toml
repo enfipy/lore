@@ -1,3 +1,6 @@
+# Copyright 2026 David
+# SPDX-License-Identifier: MIT
+
 [package]
 name = "lore-postgres-server"
 edition.workspace = true
@@ -9,7 +12,6 @@ publish = false
 anyhow = "1.0.103"
 lore-aws.workspace = true
 lore-base.workspace = true
-lore-hashicorp.workspace = true
 lore-postgres = { path = "../lore-postgres" }
 lore-server.workspace = true
 lore-storage.workspace = true
