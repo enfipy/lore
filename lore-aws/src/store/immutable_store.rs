@@ -201,11 +201,25 @@ impl FragmentStateEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum S3ObjectVersioning {
+    /// The backend may retain historical object versions. Obliteration must enumerate and delete
+    /// every version rather than relying on an unversioned delete.
+    #[default]
+    Versioned,
+    /// The backend stores only one value per key. Obliteration can permanently remove it with one
+    /// exact-key `DeleteObject` request.
+    Unversioned,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct S3StoreSettings {
     pub bucket: String,
     pub endpoint_url: Option<String>,
     pub region: Option<String>,
+    #[serde(default)]
+    pub object_versioning: S3ObjectVersioning,
     pub slow_operation_threshold_millis: u64,
     #[serde(default = "default_aws_timeout_millis")]
     pub timeout_millis: u64,
@@ -217,6 +231,7 @@ impl S3StoreSettings {
             bucket,
             endpoint_url: None,
             region: None,
+            object_versioning: S3ObjectVersioning::default(),
             slow_operation_threshold_millis: u64::MAX,
             timeout_millis: default_aws_timeout_millis(),
         }
@@ -229,6 +244,11 @@ impl S3StoreSettings {
 
     pub fn with_region(mut self, region: String) -> Self {
         self.region = Some(region);
+        self
+    }
+
+    pub fn with_object_versioning(mut self, object_versioning: S3ObjectVersioning) -> Self {
+        self.object_versioning = object_versioning;
         self
     }
 }
@@ -531,6 +551,7 @@ pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
     bucket: String,
+    object_versioning: S3ObjectVersioning,
     fragments_table_name: Arc<str>,
     /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
     /// lifecycle state only, never a fragment.
@@ -575,6 +596,7 @@ impl AwsImmutableStore {
             s3,
             dynamodb,
             bucket: settings.s3.bucket.clone(),
+            object_versioning: settings.s3.object_versioning,
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             fragment_state_table_name: Arc::from(
                 settings.dynamodb.fragment_state_table_name.clone(),
@@ -1318,6 +1340,22 @@ impl AwsImmutableStore {
     async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+
+        if self.object_versioning == S3ObjectVersioning::Unversioned {
+            return self
+                .s3
+                .delete_object(self.bucket.as_str(), hash, None)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    warn!("Failed to delete unversioned payload for hash: {hash}: {e:?}");
+                    if matches!(&e, AwsError::AwsSdkError(_)) {
+                        StoreError::from(SlowDown)
+                    } else {
+                        StoreError::internal_with_context(e, "S3 delete object failed")
+                    }
+                });
+        }
 
         let versions: Option<Vec<Option<String>>> = self
             .s3
