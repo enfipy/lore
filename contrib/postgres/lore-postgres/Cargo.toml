@@ -12,6 +12,7 @@ publish = false
 async-trait.workspace = true
 deadpool-postgres.workspace = true
 lore-base.workspace = true
+lore-error-set.workspace = true
 lore-storage.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

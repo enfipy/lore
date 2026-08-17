@@ -16,6 +16,7 @@ use lore_base::error::SlowDown;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_error_set::prelude::*;
 use lore_storage::StoreError;
 use lore_storage::fragment_catalog::BeginObliteration;
 use lore_storage::fragment_catalog::CatalogGeneration;
@@ -267,10 +268,7 @@ impl PostgresFragmentCatalog {
     }
 
     async fn connection(&self) -> Result<deadpool_postgres::Client, StoreError> {
-        self.pool.get().await.map_err(|error| {
-            warn!(?error, "Failed to acquire PostgreSQL catalog connection");
-            StoreError::from(SlowDown)
-        })
+        self.pool.get().await.map_err(pool_error)
     }
 
     fn state_table(&self) -> String {
@@ -811,10 +809,28 @@ fn database_error(error: tokio_postgres::Error, context: &'static str) -> StoreE
         context, "PostgreSQL fragment catalog operation failed"
     );
     if retryable {
-        StoreError::from(SlowDown)
+        retryable_error(error, context)
     } else {
         StoreError::internal_with_context(error, context)
     }
+}
+
+fn pool_error(error: deadpool_postgres::PoolError) -> StoreError {
+    const CONTEXT: &str = "Failed to acquire PostgreSQL catalog connection";
+    warn!(?error, "{CONTEXT}");
+    match error {
+        deadpool_postgres::PoolError::Backend(error) => database_error(error, CONTEXT),
+        error @ deadpool_postgres::PoolError::Timeout(_) => retryable_error(error, CONTEXT),
+        error => StoreError::internal_with_context(error, CONTEXT),
+    }
+}
+
+fn retryable_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+    context: &'static str,
+) -> StoreError {
+    let source = StoreError::internal_with_context(error, context);
+    StoreError::SlowDown(SlowDown.chain_err_from(source, "retryable PostgreSQL failure"))
 }
 
 fn migration_checksum(sql: &str) -> String {
@@ -833,5 +849,20 @@ mod tests {
         for &(_, sql) in MIGRATIONS {
             assert_eq!(migration_checksum(sql).len(), 64);
         }
+    }
+
+    #[test]
+    fn pool_timeouts_preserve_their_trace_as_slow_down() {
+        let error = pool_error(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Wait,
+        ));
+        assert!(matches!(error, StoreError::SlowDown(_)));
+        assert!(error.trace().len() >= 2);
+    }
+
+    #[test]
+    fn permanent_pool_configuration_errors_are_internal() {
+        let error = pool_error(deadpool_postgres::PoolError::NoRuntimeSpecified);
+        assert!(matches!(error, StoreError::Internal(_)));
     }
 }
