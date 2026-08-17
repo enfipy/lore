@@ -30,6 +30,7 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
+use lore_error_set::prelude::ChainError;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -1036,6 +1037,7 @@ impl AwsImmutableStore {
                     *result = StoreMatchResult {
                         match_made: StoreMatch::MatchFull,
                         partition,
+                        context: address.context,
                         stored_local: false,
                         stored_durable: true,
                     };
@@ -1641,7 +1643,11 @@ impl AwsImmutableStore {
                 .map_err(|e| {
                     warn!("Failed to delete unversioned payload for hash: {hash}: {e:?}");
                     if matches!(&e, AwsError::AwsSdkError(_)) {
-                        StoreError::from(SlowDown)
+                        let source =
+                            StoreError::internal_with_context(e, "S3 delete object failed");
+                        StoreError::SlowDown(
+                            SlowDown.chain_err_from(source, "retryable S3 delete object failure"),
+                        )
                     } else {
                         StoreError::internal_with_context(e, "S3 delete object failed")
                     }
@@ -2491,7 +2497,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 self.resolve_partition_backend(source_partition, source_address.hash)
                     .await?
             } else {
-                self.resolve_backend(source_partition, source_address).await?
+                self.resolve_backend(source_partition, source_address)
+                    .await?
             };
             if !source.stored_association() {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
