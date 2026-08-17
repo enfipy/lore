@@ -38,6 +38,7 @@ use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::fragment_catalog::BeginObliteration;
 use lore_storage::fragment_catalog::CatalogGeneration;
+use lore_storage::fragment_catalog::CatalogPublication;
 use lore_storage::fragment_catalog::FragmentCatalog;
 use lore_storage::fragment_catalog::FragmentState as CatalogFragmentState;
 #[cfg(test)]
@@ -82,6 +83,52 @@ pub mod metadata_migrator;
 enum QueryResultSource {
     LegacyMetadata(Fragment),
     State(Option<CatalogGeneration>),
+}
+
+#[derive(Clone, Copy)]
+enum BackendPublication {
+    DynamoDb(FragmentState),
+    External(CatalogPublication),
+}
+
+impl BackendPublication {
+    fn state(self) -> FragmentState {
+        match self {
+            Self::DynamoDb(state) => state,
+            Self::External(publication) => catalog_state(publication.state),
+        }
+    }
+
+    fn generation(self) -> Option<CatalogGeneration> {
+        match self {
+            Self::DynamoDb(_) => None,
+            Self::External(publication) => Some(publication.generation),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BackendResolution {
+    associated: bool,
+    publication: Option<BackendPublication>,
+}
+
+impl BackendResolution {
+    fn state(self) -> Option<FragmentState> {
+        self.publication.map(BackendPublication::state)
+    }
+
+    fn generation(self) -> Option<CatalogGeneration> {
+        self.publication.and_then(BackendPublication::generation)
+    }
+
+    fn stored_association(self) -> bool {
+        self.associated && self.state() == Some(FragmentState::Stored)
+    }
+
+    fn is_external_publication(self) -> bool {
+        matches!(self.publication, Some(BackendPublication::External(_)))
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -581,17 +628,7 @@ pub struct AwsImmutableStore {
     catalog: FragmentCatalogBackend,
     bucket: String,
     object_versioning: S3ObjectVersioning,
-    fragments_table_name: Arc<str>,
-    /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
-    /// lifecycle state only, never a fragment.
-    fragment_state_table_name: Arc<str>,
-    /// Set only where objects predating the move onto the S3 object may still exist. `None` is a
-    /// deployment that has never written one, and reads accordingly refuse to guess.
-    fragment_metadata_table_name: Option<Arc<str>>,
     force_write: bool,
-    /// How long to wait between removing an association and counting what remains, so a put that
-    /// had already passed its state probe has time to land its own association and be counted.
-    obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
     labels_put: LabelArray,
@@ -607,8 +644,43 @@ pub struct AwsImmutableStore {
 }
 
 enum FragmentCatalogBackend {
-    DynamoDb(Box<DynamoDb>),
+    DynamoDb(DynamoDbCatalogBackend),
     External(Arc<dyn FragmentCatalog>),
+}
+
+struct DynamoDbCatalogBackend {
+    client: Box<DynamoDb>,
+    fragments_table: Arc<str>,
+    state_table: Arc<str>,
+    /// Set only where objects predating object metadata may still exist.
+    legacy_metadata_table: Option<Arc<str>>,
+    /// Lets a put already past its state probe publish before reference counting.
+    obliteration_drain: Duration,
+}
+
+impl FragmentCatalogBackend {
+    fn dynamodb(&self) -> Result<&DynamoDbCatalogBackend, StoreError> {
+        match self {
+            Self::DynamoDb(catalog) => Ok(catalog),
+            Self::External(_) => Err(StoreError::internal(
+                "DynamoDB operation requested from an external fragment catalog",
+            )),
+        }
+    }
+
+    fn external(&self) -> Option<&Arc<dyn FragmentCatalog>> {
+        match self {
+            Self::DynamoDb(_) => None,
+            Self::External(catalog) => Some(catalog),
+        }
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.external()
+            .map_or(Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT), |catalog| {
+                catalog.max_query_batch()
+            })
+    }
 }
 
 impl AwsImmutableStore {
@@ -628,25 +700,25 @@ impl AwsImmutableStore {
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
         Self {
             s3,
-            catalog: FragmentCatalogBackend::DynamoDb(Box::new(dynamodb)),
+            catalog: FragmentCatalogBackend::DynamoDb(DynamoDbCatalogBackend {
+                client: Box::new(dynamodb),
+                fragments_table: Arc::from(settings.dynamodb.fragments_table_name.clone()),
+                state_table: Arc::from(settings.dynamodb.fragment_state_table_name.clone()),
+                legacy_metadata_table: settings
+                    .dynamodb
+                    .fragment_metadata_table_name
+                    .as_ref()
+                    .map(|name| Arc::from(name.clone())),
+                obliteration_drain: Duration::from_millis(
+                    settings
+                        .dynamodb
+                        .timeout_millis
+                        .max(MIN_OBLITERATION_DRAIN_MILLIS),
+                ),
+            }),
             bucket: settings.s3.bucket.clone(),
             object_versioning: settings.s3.object_versioning,
-            fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
-            fragment_state_table_name: Arc::from(
-                settings.dynamodb.fragment_state_table_name.clone(),
-            ),
-            fragment_metadata_table_name: settings
-                .dynamodb
-                .fragment_metadata_table_name
-                .as_ref()
-                .map(|name| Arc::from(name.clone())),
             force_write: settings.force_write,
-            obliteration_drain: Duration::from_millis(
-                settings
-                    .dynamodb
-                    .timeout_millis
-                    .max(MIN_OBLITERATION_DRAIN_MILLIS),
-            ),
             latency_histogram,
             labels_get,
             labels_put,
@@ -671,11 +743,7 @@ impl AwsImmutableStore {
             catalog: FragmentCatalogBackend::External(catalog),
             bucket: settings.s3.bucket.clone(),
             object_versioning: settings.s3.object_versioning,
-            fragments_table_name: Arc::from(""),
-            fragment_state_table_name: Arc::from(""),
-            fragment_metadata_table_name: None,
             force_write: settings.force_write,
-            obliteration_drain: Duration::ZERO,
             latency_histogram: provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
             labels_get: provider.get_labels_for_operation_context("get"),
             labels_put: provider.get_labels_for_operation_context("put"),
@@ -690,29 +758,57 @@ impl AwsImmutableStore {
     }
 
     fn dynamodb(&self) -> Result<&DynamoDb, StoreError> {
-        match &self.catalog {
-            FragmentCatalogBackend::DynamoDb(client) => Ok(client),
-            FragmentCatalogBackend::External(_) => Err(StoreError::internal(
-                "DynamoDB operation requested from an external fragment catalog",
-            )),
-        }
+        Ok(&self.catalog.dynamodb()?.client)
     }
 
-    async fn association_exists_backend(
+    async fn resolve_backend(
         &self,
         partition: Partition,
         address: Address,
-    ) -> Result<(bool, Option<CatalogGeneration>), StoreError> {
+    ) -> Result<BackendResolution, StoreError> {
         match &self.catalog {
             FragmentCatalogBackend::External(catalog) => {
                 let resolution = catalog.resolve(partition, address).await?;
-                Ok((
-                    resolution.associated && resolution.state == Some(CatalogFragmentState::Stored),
-                    resolution.generation,
-                ))
+                Ok(BackendResolution {
+                    associated: resolution.associated,
+                    publication: resolution.publication.map(BackendPublication::External),
+                })
             }
             FragmentCatalogBackend::DynamoDb(_) => {
-                Ok((self.exists(partition, address).await?, None))
+                let (associated, state) = tokio::join!(
+                    self.exists(partition, address),
+                    self.load_state(address.hash)
+                );
+                Ok(BackendResolution {
+                    associated: associated?,
+                    publication: state?.map(BackendPublication::DynamoDb),
+                })
+            }
+        }
+    }
+
+    async fn resolve_partition_backend(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<BackendResolution, StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                let resolution = catalog.resolve_partition(partition, hash).await?;
+                Ok(BackendResolution {
+                    associated: resolution.associated,
+                    publication: resolution.publication.map(BackendPublication::External),
+                })
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                let (associated, state) = tokio::join!(
+                    self.has_partition_association(partition, hash),
+                    self.load_state(hash)
+                );
+                Ok(BackendResolution {
+                    associated: associated?,
+                    publication: state?.map(BackendPublication::DynamoDb),
+                })
             }
         }
     }
@@ -736,30 +832,6 @@ impl AwsImmutableStore {
         }
     }
 
-    async fn probe_backend(
-        &self,
-        partition: Partition,
-        address: Address,
-    ) -> Result<(Option<FragmentState>, bool, Option<CatalogGeneration>), StoreError> {
-        match &self.catalog {
-            FragmentCatalogBackend::External(catalog) => {
-                let resolution = catalog.resolve(partition, address).await?;
-                Ok((
-                    resolution.state.map(catalog_state),
-                    resolution.associated,
-                    resolution.generation,
-                ))
-            }
-            FragmentCatalogBackend::DynamoDb(_) => {
-                let (associated, state) = tokio::join!(
-                    self.exists(partition, address),
-                    self.load_state(address.hash)
-                );
-                Ok((state?, associated?, None))
-            }
-        }
-    }
-
     /// Whether this partition holds the association for this address, which is the whole of what
     /// this store will serve: it isolates partitions, so it reads no wider than the association
     /// asked about.
@@ -778,7 +850,7 @@ impl AwsImmutableStore {
         let output = self
             .dynamodb()?
             .get_item(
-                &self.fragments_table_name,
+                &self.catalog.dynamodb()?.fragments_table,
                 item,
                 true, /* consistent read */
             )
@@ -821,7 +893,7 @@ impl AwsImmutableStore {
 
         let output = self
             .dynamodb()?
-            .batch_get_item(&self.fragments_table_name, items, true)
+            .batch_get_item(&self.catalog.dynamodb()?.fragments_table, items, true)
             .await
             .map_err(|e| {
                 warn!("DynamoDb association resolve failed: {e:?}");
@@ -864,15 +936,15 @@ impl AwsImmutableStore {
         address: Address,
         labels: &[KeyValue],
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
-        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+        if let Some(catalog) = self.catalog.external() {
             let resolution = catalog.resolve(partition, address).await?;
             let miss = (QueryResultSource::State(None), StoreGetData::default());
             if !resolution.associated {
                 return Ok(miss);
             }
-            return match resolution.state {
+            return match resolution.state() {
                 Some(CatalogFragmentState::Stored) => Ok((
-                    QueryResultSource::State(resolution.generation),
+                    QueryResultSource::State(resolution.generation()),
                     StoreGetData::metadata(
                         stored_durable(Fragment::default()),
                         StoreMatch::MatchFull,
@@ -914,7 +986,7 @@ impl AwsImmutableStore {
             None => {
                 // if not in the `state` table then it could be a legacy fragment
                 // that only exists in the metadata table
-                if self.fragment_metadata_table_name.is_some()
+                if self.catalog.dynamodb()?.legacy_metadata_table.is_some()
                     && let Some(fragment) = self.fragment_from_metadata_table(address.hash).await?
                 {
                     let legacy_fragment_state = FragmentState::from_bits(fragment.flags);
@@ -949,7 +1021,7 @@ impl AwsImmutableStore {
         addresses: &[Address],
         results: &mut [StoreMatchResult],
     ) -> Result<(), StoreError> {
-        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+        if let Some(catalog) = self.catalog.external() {
             let resolutions = catalog.resolve_batch(partition, addresses).await?;
             if resolutions.len() != addresses.len() {
                 return Err(StoreError::internal(
@@ -959,7 +1031,8 @@ impl AwsImmutableStore {
             for ((address, resolution), result) in
                 addresses.iter().zip(resolutions).zip(results.iter_mut())
             {
-                if resolution.associated && resolution.state == Some(CatalogFragmentState::Stored) {
+                if resolution.associated && resolution.state() == Some(CatalogFragmentState::Stored)
+                {
                     *result = StoreMatchResult {
                         match_made: StoreMatch::MatchFull,
                         partition,
@@ -967,7 +1040,7 @@ impl AwsImmutableStore {
                         stored_durable: true,
                     };
                 } else {
-                    if resolution.associated && resolution.state.is_none() {
+                    if resolution.associated && resolution.publication.is_none() {
                         self.association_without_state_counter
                             .add(1, &self.labels_query);
                         trace!(%address, "Query found an association with no stored payload");
@@ -979,7 +1052,7 @@ impl AwsImmutableStore {
         }
 
         // Neither read needs what the other returns.
-        let (associations, states) = if self.fragment_metadata_table_name.is_some() {
+        let (associations, states) = if self.catalog.dynamodb()?.legacy_metadata_table.is_some() {
             let (associations, states) = tokio::join!(
                 self.associations_present(partition, addresses),
                 self.states_for(addresses)
@@ -1060,7 +1133,7 @@ impl AwsImmutableStore {
 
         match self
             .dynamodb()?
-            .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
+            .put_item_conditional(&self.catalog.dynamodb()?.state_table, item, RowAbsent)
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
@@ -1128,7 +1201,7 @@ impl AwsImmutableStore {
              been lost. Clearing its state so the content can be stored again."
         );
 
-        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+        if let Some(catalog) = self.catalog.external() {
             let Some(generation) = generation else {
                 warn!(%address, "Missing external catalog generation for a lost payload");
                 return;
@@ -1168,7 +1241,7 @@ impl AwsImmutableStore {
         })?;
 
         self.dynamodb()?
-            .delete_item(&self.fragment_state_table_name, item)
+            .delete_item(&self.catalog.dynamodb()?.state_table, item)
             .await
             .map_err(|e| {
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1232,7 +1305,7 @@ impl AwsImmutableStore {
         match self
             .dynamodb()?
             .put_item_conditional(
-                &self.fragment_state_table_name,
+                &self.catalog.dynamodb()?.state_table,
                 item,
                 StateUnchanged(expected),
             )
@@ -1274,7 +1347,9 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb()?.put_item(&self.fragments_table_name, item).await
+        self.dynamodb()?
+            .put_item(&self.catalog.dynamodb()?.fragments_table, item)
+            .await
             .map_err(|e| {
                 warn!({REPOSITORY_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1312,7 +1387,7 @@ impl AwsImmutableStore {
 
         let output = self
             .dynamodb()?
-            .batch_get_item(&self.fragment_state_table_name, items, true)
+            .batch_get_item(&self.catalog.dynamodb()?.state_table, items, true)
             .await
             .map_err(|e| {
                 warn!("DynamoDb fragment state resolve failed: {e:?}");
@@ -1349,7 +1424,7 @@ impl AwsImmutableStore {
         &self,
         hashes: &[Hash],
     ) -> Result<HashMap<Hash, FragmentState>, StoreError> {
-        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+        let Some(table_name) = self.catalog.dynamodb()?.legacy_metadata_table.as_ref() else {
             return Ok(HashMap::new());
         };
 
@@ -1409,12 +1484,9 @@ impl AwsImmutableStore {
         partition: Partition,
         hash: Hash,
     ) -> Result<bool, StoreError> {
-        if let FragmentCatalogBackend::External(catalog) = &self.catalog {
-            return catalog.partition_association_exists(partition, hash).await;
-        }
         self.dynamodb()?
             .query_single(
-                &self.fragments_table_name,
+                &self.catalog.dynamodb()?.fragments_table,
                 PartitionAssociationQuery(hash, partition),
             )
             .await
@@ -1439,7 +1511,10 @@ impl AwsImmutableStore {
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
         self.dynamodb()?
-            .query_single(&self.fragments_table_name, FragmentsQuery(hash))
+            .query_single(
+                &self.catalog.dynamodb()?.fragments_table,
+                FragmentsQuery(hash),
+            )
             .await
             .map(|output| output.count > 0)
             .map_err(|e| {
@@ -1473,7 +1548,7 @@ impl AwsImmutableStore {
         })?;
 
         self.dynamodb()?
-            .delete_item(&self.fragments_table_name, item)
+            .delete_item(&self.catalog.dynamodb()?.fragments_table, item)
             .await
             .map_err(|e| {
                 warn!("Failed to delete fragment association for partition: {partition} and address: {address}: {e:?}");
@@ -1528,7 +1603,7 @@ impl AwsImmutableStore {
                 })?;
         }
 
-        if matches!(&self.catalog, FragmentCatalogBackend::External(_)) {
+        if self.catalog.external().is_some() {
             return Ok(());
         }
 
@@ -1692,7 +1767,7 @@ impl AwsImmutableStore {
         let Some(av_map) = self
             .dynamodb()?
             .get_item(
-                &self.fragment_state_table_name,
+                &self.catalog.dynamodb()?.state_table,
                 item,
                 true, /* consistent read */
             )
@@ -1732,7 +1807,7 @@ impl AwsImmutableStore {
         &self,
         hash: Hash,
     ) -> Result<Option<Fragment>, StoreError> {
-        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+        let Some(table_name) = self.catalog.dynamodb()?.legacy_metadata_table.as_ref() else {
             warn!(
                 %hash,
                 "Stored object carries no fragment metadata and no fragment metadata table is \
@@ -2122,7 +2197,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             timed!(self.latency_histogram, &self.labels_get, {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.association_exists_backend(partition, address);
+                let exists_fut = self.resolve_backend(partition, address);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -2137,8 +2212,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 };
                 // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
                 // early return. Exists error takes priority over any load error.
-                let (exists, generation) = exists_result?;
-                if !exists {
+                let resolution = exists_result?;
+                if !resolution.stored_association() {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
 
@@ -2152,7 +2227,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     .err()
                     .is_some_and(StoreError::is_address_not_found)
                 {
-                    self.report_missing_payload(address, generation, &self.labels_get)
+                    self.report_missing_payload(address, resolution.generation(), &self.labels_get)
                         .await;
                 }
 
@@ -2187,24 +2262,24 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             lore_storage::validate_fragment_size(&fragment)?;
         }
         timed!(self.latency_histogram, &self.labels_put, {
-            let probe = if self.force_write {
-                (None, false, None)
+            let resolution = if self.force_write {
+                BackendResolution::default()
             } else {
-                self.probe_backend(partition, address).await?
+                self.resolve_backend(partition, address).await?
             };
 
-            if matches!(
-                (&self.catalog, probe.0),
-                (
-                    FragmentCatalogBackend::External(_),
-                    Some(FragmentState::Stored)
-                )
-            ) {
+            if resolution.state() == Some(FragmentState::Stored)
+                && resolution.is_external_publication()
+            {
                 return match self.associate_backend(partition, address, false).await {
                     Ok(()) => Ok(()),
                     Err(error) if error.is_address_not_found() => {
-                        self.report_missing_payload(address, probe.2, &self.labels_put)
-                            .await;
+                        self.report_missing_payload(
+                            address,
+                            resolution.generation(),
+                            &self.labels_put,
+                        )
+                        .await;
                         let payload = payload.ok_or(error)?;
                         self.write_payload_and_state(address.hash, fragment, payload)
                             .await?;
@@ -2214,8 +2289,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 };
             }
 
-            match probe {
-                (Some(FragmentState::Obliterating), _, _) => {
+            match (resolution.state(), resolution.associated) {
+                (Some(FragmentState::Obliterating), _) => {
                     debug!(
                         "Received request to put fragment at {address} that is in the process of \
                          being obliterated"
@@ -2223,13 +2298,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     Err(StoreError::from(SlowDown))
                 }
 
-                (Some(FragmentState::Stored), true, _) => Ok(()),
+                (Some(FragmentState::Stored), true) => Ok(()),
 
-                (Some(FragmentState::Stored), false, _) if payload.is_some() => {
+                (Some(FragmentState::Stored), false) if payload.is_some() => {
                     self.associate_backend(partition, address, false).await
                 }
 
-                (Some(FragmentState::Stored), false, _) => {
+                (Some(FragmentState::Stored), false) => {
                     Err(StoreError::internal("Payload buffer required"))
                 }
 
@@ -2260,7 +2335,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
 
-            if let FragmentCatalogBackend::External(catalog) = &self.catalog {
+            if let Some(catalog) = self.catalog.external() {
                 match catalog
                     .begin_obliteration(partition, address)
                     .instrument(span.clone())
@@ -2345,7 +2420,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .instrument(span.clone())
                 .await?;
 
-            tokio::time::sleep(self.obliteration_drain).await;
+            tokio::time::sleep(self.catalog.dynamodb()?.obliteration_drain).await;
 
             info!("Association deleted, re-checking for other associations...");
             if self
@@ -2412,29 +2487,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            let (source_exists, generation) = if source_address.context.is_zero() {
-                match &self.catalog {
-                    FragmentCatalogBackend::External(catalog) => {
-                        let resolution = catalog
-                            .resolve_partition(source_partition, source_address.hash)
-                            .await?;
-                        (
-                            resolution.associated
-                                && resolution.state == Some(CatalogFragmentState::Stored),
-                            resolution.generation,
-                        )
-                    }
-                    FragmentCatalogBackend::DynamoDb(_) => (
-                        self.has_partition_association(source_partition, source_address.hash)
-                            .await?,
-                        None,
-                    ),
-                }
-            } else {
-                self.association_exists_backend(source_partition, source_address)
+            let source = if source_address.context.is_zero() {
+                self.resolve_partition_backend(source_partition, source_address.hash)
                     .await?
+            } else {
+                self.resolve_backend(source_partition, source_address).await?
             };
-            if !source_exists {
+            if !source.stored_association() {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
@@ -2446,7 +2505,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .err()
                 .is_some_and(StoreError::is_address_not_found)
             {
-                self.report_missing_payload(source_address, generation, &self.labels_copy)
+                self.report_missing_payload(source_address, source.generation(), &self.labels_copy)
                     .await;
             }
             result
@@ -2491,10 +2550,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     }
 
     fn max_query_batch(&self) -> Option<usize> {
-        match &self.catalog {
-            FragmentCatalogBackend::DynamoDb(_) => Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT),
-            FragmentCatalogBackend::External(catalog) => catalog.max_query_batch(),
-        }
+        self.catalog.max_query_batch()
     }
 }
 

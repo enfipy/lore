@@ -2568,7 +2568,10 @@ mod tests {
                         .await
                         .expect_err("durable failure must reach the caller");
 
-                    assert!(error.is_internal(), "expected internal error, got {error:?}");
+                    assert!(
+                        error.is_internal(),
+                        "expected internal error, got {error:?}"
+                    );
                 })
                 .await;
         }

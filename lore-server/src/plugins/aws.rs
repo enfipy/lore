@@ -46,28 +46,20 @@ const PLUGIN_NAME: &str = "aws";
 // Configuration Structs
 // =============================================================================
 
-/// Configuration for the AWS immutable store plugin.
-///
-/// This configuration is deserialized from TOML and contains all settings
-/// needed to create an [`AwsImmutableStore`].
+/// Reusable configuration for S3-compatible immutable payload storage.
 #[derive(Debug, Clone, Deserialize)]
-//#[serde(deny_unknown_fields)]
-pub struct AwsImmutableStorePluginConfig {
-    /// HTTP client settings for AWS operations.
+pub struct S3ImmutableStorePluginConfig {
+    /// HTTP client settings for object-store operations.
     #[serde(default)]
     pub http: HttpClientSettings,
-
     /// S3 bucket name for storing fragment payloads.
     pub s3_bucket: String,
-
     /// Optional S3 endpoint URL (for `LocalStack` or other S3-compatible services).
     #[serde(default)]
     pub s3_endpoint_url: Option<String>,
-
     /// Optional S3 region.
     #[serde(default)]
     pub s3_region: Option<String>,
-
     /// Whether the S3-compatible backend retains historical object versions.
     ///
     /// Defaults to `versioned`, which preserves the existing conservative behavior. Set this to
@@ -75,6 +67,101 @@ pub struct AwsImmutableStorePluginConfig {
     /// permanently removes the payload.
     #[serde(default)]
     pub s3_object_versioning: S3ObjectVersioning,
+
+    /// Slow operation threshold in milliseconds for S3 operations.
+    #[serde(default = "default_slow_threshold")]
+    pub s3_slow_operation_threshold_millis: u64,
+
+    /// Timeout in milliseconds for object-store operations.
+    #[serde(default = "default_timeout")]
+    pub timeout_millis: u64,
+
+    /// Force write mode (bypasses some safety checks).
+    #[serde(default)]
+    pub force_write: bool,
+
+    /// Force path-style S3 addressing for compatible stores behind non-AWS hostnames.
+    #[serde(default)]
+    pub s3_force_path_style: bool,
+}
+
+/// Invalid shared S3-compatible immutable-store configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum S3ImmutableStoreConfigError {
+    /// An object store cannot address an unnamed bucket.
+    #[error("s3_bucket must not be empty")]
+    EmptyBucket,
+    /// A zero operation timeout would fail every request immediately.
+    #[error("timeout_millis must be greater than zero")]
+    ZeroTimeout,
+}
+
+impl S3ImmutableStorePluginConfig {
+    /// Validate settings shared by all S3-compatible immutable-store plugins.
+    pub fn validate(&self) -> Result<(), S3ImmutableStoreConfigError> {
+        if self.s3_bucket.trim().is_empty() {
+            return Err(S3ImmutableStoreConfigError::EmptyBucket);
+        }
+        if self.timeout_millis == 0 {
+            return Err(S3ImmutableStoreConfigError::ZeroTimeout);
+        }
+        Ok(())
+    }
+
+    /// Build and verify the configured S3-compatible client at plugin startup.
+    pub fn create_client(&self, plugin_name: &str) -> Result<lore_aws::s3::S3, PluginError> {
+        let config = self.clone();
+        // Plugin construction is synchronous and runs once at startup. The plugin trait does not
+        // expose an asynchronous construction hook.
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::block_in_place(|| {
+            runtime().block_on(Box::pin(async move {
+                AwsClientBuilder::builder()
+                    .with_http_settings(&config.http)
+                    .maybe_endpoint(config.s3_endpoint_url)
+                    .maybe_region(config.s3_region)
+                    .with_timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(Duration::from_millis(config.timeout_millis))
+                            .build(),
+                    )
+                    .build_config()
+                    .await
+                    .with_slow_operation_threshold(config.s3_slow_operation_threshold_millis)
+                    .s3_with_path_style(config.s3_force_path_style)
+                    .ensure_bucket(config.s3_bucket)
+                    .build()
+                    .await
+                    .map_err(|error| {
+                        PluginError::from(PluginInitError {
+                            plugin_name: plugin_name.to_string(),
+                            message: format!("Failed to create S3-compatible client: {error}"),
+                        })
+                    })
+            }))
+        })
+    }
+
+    /// Convert plugin settings to the immutable store's object-store settings.
+    pub fn store_settings(&self) -> S3StoreSettings {
+        S3StoreSettings {
+            bucket: self.s3_bucket.clone(),
+            endpoint_url: self.s3_endpoint_url.clone(),
+            region: self.s3_region.clone(),
+            object_versioning: self.s3_object_versioning,
+            slow_operation_threshold_millis: self.s3_slow_operation_threshold_millis,
+            timeout_millis: self.timeout_millis,
+        }
+    }
+}
+
+/// Configuration for the AWS immutable store plugin.
+#[derive(Debug, Clone, Deserialize)]
+//#[serde(deny_unknown_fields)]
+pub struct AwsImmutableStorePluginConfig {
+    /// S3-compatible payload-store settings.
+    #[serde(flatten)]
+    pub s3: S3ImmutableStorePluginConfig,
 
     /// `DynamoDB` table name for storing fragment associations.
     pub dynamodb_fragments_table: String,
@@ -109,26 +196,9 @@ pub struct AwsImmutableStorePluginConfig {
     #[serde(default)]
     pub dynamodb_region: Option<String>,
 
-    /// Slow operation threshold in milliseconds for S3 operations.
-    #[serde(default = "default_slow_threshold")]
-    pub s3_slow_operation_threshold_millis: u64,
-
     /// Slow operation threshold in milliseconds for `DynamoDB` operations.
     #[serde(default = "default_slow_threshold")]
     pub dynamodb_slow_operation_threshold_millis: u64,
-
-    /// Timeout in milliseconds for AWS operations.
-    #[serde(default = "default_timeout")]
-    pub timeout_millis: u64,
-
-    /// Force write mode (bypasses some safety checks).
-    #[serde(default)]
-    pub force_write: bool,
-
-    /// Force path-style S3 addressing (required for S3-compatible stores behind
-    /// non-AWS hostnames like `MinIO` in Docker).
-    #[serde(default)]
-    pub s3_force_path_style: bool,
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -224,13 +294,19 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         let plugin_name = self.name();
 
         // Deserialize and validate configuration without creating AWS clients
-        let _plugin_config: AwsImmutableStorePluginConfig =
+        let plugin_config: AwsImmutableStorePluginConfig =
             config.clone().try_into().map_err(|e| {
                 PluginError::from(PluginConfigError {
                     plugin_name: plugin_name.to_string(),
                     message: format!("Failed to deserialize AWS immutable store config: {e}"),
                 })
             })?;
+        plugin_config.s3.validate().map_err(|error| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message: error.to_string(),
+            })
+        })?;
 
         Ok(())
     }
@@ -249,55 +325,27 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
 
         info!(
             plugin_name = plugin_name,
-            s3_bucket = %plugin_config.s3_bucket,
+            s3_bucket = %plugin_config.s3.s3_bucket,
             fragments_table = %plugin_config.dynamodb_fragments_table,
             fragment_state_table = %plugin_config.dynamodb_fragment_state_table,
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
-        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
-        // at a time, so at most one core is handed off at a time.
-        #[allow(clippy::disallowed_methods)]
-        let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
-            runtime().block_on(Box::pin(async {
-                // Build S3 client
-                let s3_client = Box::pin(
-                    AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
-                        .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
-                        .maybe_region(plugin_config.s3_region.clone())
-                        .with_timeout_config(
-                            TimeoutConfig::builder()
-                                .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
-                                ))
-                                .build(),
-                        )
-                        .build_config(),
-                )
-                .await
-                .with_slow_operation_threshold(plugin_config.s3_slow_operation_threshold_millis)
-                .s3_with_path_style(plugin_config.s3_force_path_style)
-                .ensure_bucket(&plugin_config.s3_bucket)
-                .build()
-                .await
-                .map_err(|e| {
-                    PluginError::from(PluginInitError {
-                        plugin_name: plugin_name.to_string(),
-                        message: format!("Failed to create S3 client: {e}"),
-                    })
-                })?;
+        let s3_client = plugin_config.s3.create_client(plugin_name)?;
 
-                // Build DynamoDB client
+        // DynamoDB construction is also asynchronous behind a synchronous plugin hook.
+        #[allow(clippy::disallowed_methods)]
+        let dynamodb_client = tokio::task::block_in_place(|| {
+            runtime().block_on(Box::pin(async {
                 let dynamodb_client_builder = Box::pin(
                     AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
+                        .with_http_settings(&plugin_config.s3.http)
                         .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
                         .maybe_region(plugin_config.dynamodb_region.clone())
                         .with_timeout_config(
                             TimeoutConfig::builder()
                                 .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
+                                    plugin_config.s3.timeout_millis,
                                 ))
                                 .build(),
                         )
@@ -321,19 +369,11 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                             })
                         })?;
 
-                Ok::<_, PluginError>((s3_client, dynamodb_client))
+                Ok::<_, PluginError>(dynamodb_client)
             }))
         })?;
 
-        // Create settings
-        let s3_settings = S3StoreSettings {
-            bucket: plugin_config.s3_bucket,
-            endpoint_url: plugin_config.s3_endpoint_url,
-            region: plugin_config.s3_region,
-            object_versioning: plugin_config.s3_object_versioning,
-            slow_operation_threshold_millis: plugin_config.s3_slow_operation_threshold_millis,
-            timeout_millis: plugin_config.timeout_millis,
-        };
+        let s3_settings = plugin_config.s3.store_settings();
 
         let dynamodb_settings = DynamoDbImmutableStoreSettings {
             fragments_table_name: plugin_config.dynamodb_fragments_table,
@@ -342,13 +382,13 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             endpoint_url: plugin_config.dynamodb_endpoint_url,
             region: plugin_config.dynamodb_region,
             slow_operation_threshold_millis: plugin_config.dynamodb_slow_operation_threshold_millis,
-            timeout_millis: plugin_config.timeout_millis,
+            timeout_millis: plugin_config.s3.timeout_millis,
         };
 
         let store_settings = AwsImmutableStoreSettings::new(
             s3_settings,
             dynamodb_settings,
-            plugin_config.force_write,
+            plugin_config.s3.force_write,
         );
 
         let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
@@ -688,14 +728,14 @@ mod tests {
         let config: toml::Value = toml::from_str(config_str).unwrap();
         let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
 
-        assert_eq!(plugin_config.s3_bucket, "test-bucket");
+        assert_eq!(plugin_config.s3.s3_bucket, "test-bucket");
         assert_eq!(
-            plugin_config.s3_endpoint_url,
+            plugin_config.s3.s3_endpoint_url,
             Some("http://localhost:4566".to_string())
         );
-        assert_eq!(plugin_config.s3_region, Some("us-east-1".to_string()));
+        assert_eq!(plugin_config.s3.s3_region, Some("us-east-1".to_string()));
         assert_eq!(
-            plugin_config.s3_object_versioning,
+            plugin_config.s3.s3_object_versioning,
             S3ObjectVersioning::Unversioned
         );
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
@@ -708,10 +748,10 @@ mod tests {
             Some("http://localhost:4566".to_string())
         );
         assert_eq!(plugin_config.dynamodb_region, Some("us-east-1".to_string()));
-        assert_eq!(plugin_config.s3_slow_operation_threshold_millis, 1000);
+        assert_eq!(plugin_config.s3.s3_slow_operation_threshold_millis, 1000);
         assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
-        assert_eq!(plugin_config.timeout_millis, 3000);
-        assert!(plugin_config.force_write);
+        assert_eq!(plugin_config.s3.timeout_millis, 3000);
+        assert!(plugin_config.s3.force_write);
     }
 
     /// A configuration written before this change points at the table holding fragment metadata,
@@ -763,11 +803,11 @@ mod tests {
         let config: toml::Value = toml::from_str(config_str).unwrap();
         let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
 
-        assert_eq!(plugin_config.s3_bucket, "test-bucket");
-        assert!(plugin_config.s3_endpoint_url.is_none());
-        assert!(plugin_config.s3_region.is_none());
+        assert_eq!(plugin_config.s3.s3_bucket, "test-bucket");
+        assert!(plugin_config.s3.s3_endpoint_url.is_none());
+        assert!(plugin_config.s3.s3_region.is_none());
         assert_eq!(
-            plugin_config.s3_object_versioning,
+            plugin_config.s3.s3_object_versioning,
             S3ObjectVersioning::Versioned
         );
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
@@ -777,13 +817,16 @@ mod tests {
         );
         assert!(plugin_config.dynamodb_endpoint_url.is_none());
         assert!(plugin_config.dynamodb_region.is_none());
-        assert_eq!(plugin_config.s3_slow_operation_threshold_millis, u64::MAX);
+        assert_eq!(
+            plugin_config.s3.s3_slow_operation_threshold_millis,
+            u64::MAX
+        );
         assert_eq!(
             plugin_config.dynamodb_slow_operation_threshold_millis,
             u64::MAX
         );
-        assert_eq!(plugin_config.timeout_millis, 5000);
-        assert!(!plugin_config.force_write);
+        assert_eq!(plugin_config.s3.timeout_millis, 5000);
+        assert!(!plugin_config.s3.force_write);
     }
 
     #[tokio::test]
