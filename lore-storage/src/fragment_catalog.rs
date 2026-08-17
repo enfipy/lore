@@ -24,17 +24,49 @@ pub enum FragmentState {
 }
 
 /// Opaque publication generation used to reject stale cross-store observations.
-pub type CatalogGeneration = i64;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogGeneration(i64);
+
+impl CatalogGeneration {
+    /// Construct a generation from a catalog backend's native value.
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Return the value for persistence by a catalog backend.
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
+/// One complete payload publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogPublication {
+    /// Current lifecycle state.
+    pub state: FragmentState,
+    /// Generation that identifies this exact publication.
+    pub generation: CatalogGeneration,
+}
 
 /// Catalog facts needed to resolve one address.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CatalogResolution {
     /// Whether this exact partition/context association exists.
     pub associated: bool,
-    /// Current lifecycle state, or `None` when the hash was never published.
-    pub state: Option<FragmentState>,
-    /// Generation of the current publication, present exactly when `state` is present.
-    pub generation: Option<CatalogGeneration>,
+    /// Current publication, or `None` when the hash was never published.
+    pub publication: Option<CatalogPublication>,
+}
+
+impl CatalogResolution {
+    /// Current lifecycle state, when a publication exists.
+    pub fn state(self) -> Option<FragmentState> {
+        self.publication.map(|publication| publication.state)
+    }
+
+    /// Generation of the current publication.
+    pub fn generation(self) -> Option<CatalogGeneration> {
+        self.publication.map(|publication| publication.generation)
+    }
 }
 
 /// Result of releasing one association and claiming obliteration when possible.
@@ -136,8 +168,11 @@ pub mod contract {
             .await
             .expect("resolve stored");
         assert!(first.associated);
-        assert_eq!(first.state, Some(FragmentState::Stored));
-        let first_generation = first.generation.expect("stored generation");
+        assert_eq!(
+            first.publication.map(|publication| publication.state),
+            Some(FragmentState::Stored)
+        );
+        let first_generation = first.publication.expect("stored publication").generation;
         catalog
             .publish(first_partition, address)
             .await
@@ -150,15 +185,22 @@ pub mod contract {
             .resolve(first_partition, address)
             .await
             .expect("resolve after stale repair");
-        assert_eq!(current.state, Some(FragmentState::Stored));
-        assert_ne!(current.generation, Some(first_generation));
+        assert_eq!(
+            current.publication.map(|publication| publication.state),
+            Some(FragmentState::Stored)
+        );
+        assert_ne!(
+            current
+                .publication
+                .map(|publication| publication.generation),
+            Some(first_generation)
+        );
         let partition = catalog
             .resolve_partition(first_partition, address.hash)
             .await
             .expect("resolve partition association");
         assert!(partition.associated);
-        assert_eq!(partition.state, current.state);
-        assert_eq!(partition.generation, current.generation);
+        assert_eq!(partition.publication, current.publication);
         assert!(
             !catalog
                 .resolve_partition(second_partition, address.hash)
@@ -225,8 +267,9 @@ pub mod contract {
             .resolve(first_partition, address)
             .await
             .expect("resolve revived")
-            .generation
-            .expect("revived generation");
+            .publication
+            .expect("revived publication")
+            .generation;
         catalog
             .repair_missing_payload(address.hash, generation)
             .await
@@ -236,7 +279,29 @@ pub mod contract {
             .await
             .expect("resolve repaired");
         assert!(repaired.associated);
-        assert_eq!(repaired.state, None);
-        assert_eq!(repaired.generation, None);
+        assert_eq!(repaired.publication, None);
+
+        assert_eq!(
+            catalog
+                .begin_obliteration(first_partition, address)
+                .await
+                .expect("obliterate repaired association"),
+            BeginObliteration::NoState
+        );
+        let replacement = Address {
+            hash: address.hash,
+            context: Context::from([0x17; 16]),
+        };
+        catalog
+            .publish(second_partition, replacement)
+            .await
+            .expect("publish replacement association");
+        assert!(
+            !catalog
+                .resolve(first_partition, address)
+                .await
+                .expect("resolve obliterated repaired association")
+                .associated
+        );
     }
 }

@@ -118,7 +118,7 @@ async fn stale_missing_report_cannot_erase_a_later_publication() {
             .await
             .expect("observe stored payload");
         assert!(observed.associated);
-        let observed_generation = observed.generation.expect("observed generation");
+        let observed_generation = observed.generation().expect("observed generation");
 
         catalog
             .publish(partition, address)
@@ -134,8 +134,8 @@ async fn stale_missing_report_cannot_erase_a_later_publication() {
                 .resolve(partition, address)
                 .await
                 .expect("resolve after stale report")
-                .state,
-            observed.state,
+                .state(),
+            observed.state(),
             "a report based on an older observation erased a later publication"
         );
     })

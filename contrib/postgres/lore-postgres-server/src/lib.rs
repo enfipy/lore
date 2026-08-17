@@ -3,15 +3,9 @@
 //! Derived Lore server with a PostgreSQL catalog and S3-compatible payload storage.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use lore_aws::clients::AwsClientBuilder;
-use lore_aws::clients::HttpClientSettings;
-use lore_aws::clients::TimeoutConfig;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::ObjectStoreImmutableStoreSettings;
-use lore_aws::store::immutable_store::S3ObjectVersioning;
-use lore_aws::store::immutable_store::S3StoreSettings;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
@@ -20,6 +14,7 @@ use lore_postgres::PostgresFragmentCatalogConfig;
 use lore_server::plugins::ImmutableStorePluginFactory;
 use lore_server::plugins::PluginError;
 use lore_server::plugins::PluginRegistry;
+use lore_server::plugins::aws::S3ImmutableStorePluginConfig;
 use lore_storage::ImmutableStore;
 use serde::Deserialize;
 use tracing::info;
@@ -27,58 +22,15 @@ use tracing::info;
 /// Configuration name used in `[immutable_store]` and `[plugins]`.
 pub const PLUGIN_NAME: &str = "postgres_s3";
 
-fn default_slow_threshold() -> u64 {
-    u64::MAX
-}
-
-fn default_timeout() -> u64 {
-    5_000
-}
-
 /// PostgreSQL catalog plus S3-compatible payload-store configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresS3ImmutableStorePluginConfig {
-    /// HTTP client settings for S3-compatible operations.
-    #[serde(default)]
-    pub http: HttpClientSettings,
-    /// Bucket that holds fragment payload bytes.
-    pub s3_bucket: String,
-    /// S3-compatible endpoint. Cloudflare R2 uses its account endpoint.
-    #[serde(default)]
-    pub s3_endpoint_url: Option<String>,
-    /// S3-compatible region. Cloudflare R2 uses `auto`.
-    #[serde(default)]
-    pub s3_region: Option<String>,
-    /// Whether the backend retains historical object versions.
-    #[serde(default)]
-    pub s3_object_versioning: S3ObjectVersioning,
-    /// Slow-operation threshold for payload requests.
-    #[serde(default = "default_slow_threshold")]
-    pub s3_slow_operation_threshold_millis: u64,
-    /// End-to-end timeout for payload requests.
-    #[serde(default = "default_timeout")]
-    pub timeout_millis: u64,
-    /// Use path-style S3 addressing.
-    #[serde(default)]
-    pub s3_force_path_style: bool,
-    /// Overwrite an existing payload during writes.
-    #[serde(default)]
-    pub force_write: bool,
+    /// Shared S3-compatible payload-store settings.
+    #[serde(flatten)]
+    pub s3: S3ImmutableStorePluginConfig,
     /// PostgreSQL catalog connection and namespace.
     pub postgres: PostgresFragmentCatalogConfig,
-}
-
-impl PostgresS3ImmutableStorePluginConfig {
-    fn validate(&self) -> Result<(), String> {
-        if self.s3_bucket.trim().is_empty() {
-            return Err("s3_bucket must not be empty".to_string());
-        }
-        if self.timeout_millis == 0 {
-            return Err("timeout_millis must be greater than zero".to_string());
-        }
-        self.postgres.validate().map_err(|error| error.to_string())
-    }
 }
 
 /// Creates an immutable store backed by PostgreSQL metadata and S3-compatible payloads.
@@ -96,10 +48,16 @@ impl PostgresS3ImmutableStorePluginFactory {
                     message: format!("Failed to deserialize PostgreSQL/S3 config: {error}"),
                 })
             })?;
-        parsed.validate().map_err(|message| {
+        parsed.s3.validate().map_err(|error| {
             PluginError::from(PluginConfigError {
                 plugin_name: PLUGIN_NAME.to_string(),
-                message,
+                message: error.to_string(),
+            })
+        })?;
+        parsed.postgres.validate().map_err(|error| {
+            PluginError::from(PluginConfigError {
+                plugin_name: PLUGIN_NAME.to_string(),
+                message: error.to_string(),
             })
         })?;
         Ok(parsed)
@@ -119,63 +77,33 @@ impl ImmutableStorePluginFactory for PostgresS3ImmutableStorePluginFactory {
         let plugin_config = self.parse(config)?;
         info!(
             plugin_name = PLUGIN_NAME,
-            s3_bucket = %plugin_config.s3_bucket,
+            s3_bucket = %plugin_config.s3.s3_bucket,
             postgres_schema = %plugin_config.postgres.schema,
-            object_versioning = ?plugin_config.s3_object_versioning,
+            object_versioning = ?plugin_config.s3.s3_object_versioning,
             "Creating PostgreSQL catalog with S3-compatible payload storage"
         );
 
-        // Plugin construction is synchronous and runs once at startup; this mirrors the built-in
-        // AWS factory because the plugin interface has no asynchronous construction hook.
-        #[allow(clippy::disallowed_methods)]
-        let (s3_client, catalog) = tokio::task::block_in_place(|| {
-            runtime().block_on(Box::pin(async {
-                let s3_client = AwsClientBuilder::builder()
-                    .with_http_settings(&plugin_config.http)
-                    .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
-                    .maybe_region(plugin_config.s3_region.clone())
-                    .with_timeout_config(
-                        TimeoutConfig::builder()
-                            .operation_timeout(Duration::from_millis(plugin_config.timeout_millis))
-                            .build(),
-                    )
-                    .build_config()
-                    .await
-                    .with_slow_operation_threshold(plugin_config.s3_slow_operation_threshold_millis)
-                    .s3_with_path_style(plugin_config.s3_force_path_style)
-                    .ensure_bucket(&plugin_config.s3_bucket)
-                    .build()
-                    .await
-                    .map_err(|error| {
-                        PluginError::from(PluginInitError {
-                            plugin_name: PLUGIN_NAME.to_string(),
-                            message: format!("Failed to create S3-compatible client: {error}"),
-                        })
-                    })?;
+        let s3_client = plugin_config.s3.create_client(PLUGIN_NAME)?;
 
-                let catalog = PostgresFragmentCatalog::connect(plugin_config.postgres.clone())
+        // PostgreSQL connection is asynchronous behind the synchronous plugin hook.
+        #[allow(clippy::disallowed_methods)]
+        let catalog = tokio::task::block_in_place(|| {
+            runtime().block_on(Box::pin(async {
+                PostgresFragmentCatalog::connect(plugin_config.postgres.clone())
                     .await
                     .map_err(|error| {
                         PluginError::from(PluginInitError {
                             plugin_name: PLUGIN_NAME.to_string(),
                             message: format!("Failed to create PostgreSQL catalog: {error}"),
                         })
-                    })?;
-
-                Ok::<_, PluginError>((s3_client, catalog))
+                    })
             }))
         })?;
 
-        let s3_settings = S3StoreSettings {
-            bucket: plugin_config.s3_bucket,
-            endpoint_url: plugin_config.s3_endpoint_url,
-            region: plugin_config.s3_region,
-            object_versioning: plugin_config.s3_object_versioning,
-            slow_operation_threshold_millis: plugin_config.s3_slow_operation_threshold_millis,
-            timeout_millis: plugin_config.timeout_millis,
-        };
-        let settings =
-            ObjectStoreImmutableStoreSettings::new(s3_settings, plugin_config.force_write);
+        let settings = ObjectStoreImmutableStoreSettings::new(
+            plugin_config.s3.store_settings(),
+            plugin_config.s3.force_write,
+        );
         Ok(Arc::new(AwsImmutableStore::with_catalog(
             s3_client,
             Arc::new(catalog),
@@ -214,7 +142,10 @@ schema = "lore_catalog"
         let factory = PostgresS3ImmutableStorePluginFactory;
         let parsed = factory.parse(&config()).expect("config should validate");
 
-        assert_eq!(parsed.s3_object_versioning, S3ObjectVersioning::Unversioned);
+        assert_eq!(
+            parsed.s3.s3_object_versioning,
+            lore_aws::store::immutable_store::S3ObjectVersioning::Unversioned
+        );
         let debug = format!("{parsed:?}");
         assert!(!debug.contains("do-not-log"));
         assert!(debug.contains("<redacted>"));

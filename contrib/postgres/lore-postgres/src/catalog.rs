@@ -19,6 +19,7 @@ use lore_base::types::Partition;
 use lore_storage::StoreError;
 use lore_storage::fragment_catalog::BeginObliteration;
 use lore_storage::fragment_catalog::CatalogGeneration;
+use lore_storage::fragment_catalog::CatalogPublication;
 use lore_storage::fragment_catalog::CatalogResolution;
 use lore_storage::fragment_catalog::FragmentCatalog;
 use lore_storage::fragment_catalog::FragmentState;
@@ -42,6 +43,42 @@ const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("../migrations/0002_fragment_generation.sql"),
     ),
 ];
+
+#[derive(Debug, thiserror::Error)]
+#[error("{details}")]
+struct NativeCertificateErrors {
+    details: String,
+    #[source]
+    first: Option<rustls_native_certs::Error>,
+}
+
+impl From<Vec<rustls_native_certs::Error>> for NativeCertificateErrors {
+    fn from(errors: Vec<rustls_native_certs::Error>) -> Self {
+        let details = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Self {
+            details: format!("{} native certificate error(s): {details}", errors.len()),
+            first: errors.into_iter().next(),
+        }
+    }
+}
+
+/// Invalid PostgreSQL fragment-catalog configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresFragmentCatalogConfigError {
+    /// Schema is not a safe unquoted SQL identifier.
+    #[error("PostgreSQL schema must be a 1-63 character SQL identifier")]
+    InvalidSchema,
+    /// A pool with no connections cannot serve catalog operations.
+    #[error("PostgreSQL max_connections must be greater than zero")]
+    ZeroConnections,
+    /// A zero-sized batch cannot resolve any address.
+    #[error("PostgreSQL max_batch_size must be greater than zero")]
+    ZeroBatchSize,
+}
 
 fn default_schema() -> String {
     DEFAULT_SCHEMA.to_string()
@@ -106,17 +143,13 @@ impl PostgresFragmentCatalogConfig {
     }
 
     /// Validate settings without opening a database connection.
-    pub fn validate(&self) -> Result<(), StoreError> {
+    pub fn validate(&self) -> Result<(), PostgresFragmentCatalogConfigError> {
         validate_identifier(&self.schema)?;
         if self.max_connections == 0 {
-            return Err(StoreError::internal(
-                "PostgreSQL max_connections must be greater than zero",
-            ));
+            return Err(PostgresFragmentCatalogConfigError::ZeroConnections);
         }
         if self.max_batch_size == 0 {
-            return Err(StoreError::internal(
-                "PostgreSQL max_batch_size must be greater than zero",
-            ));
+            return Err(PostgresFragmentCatalogConfigError::ZeroBatchSize);
         }
         Ok(())
     }
@@ -143,7 +176,9 @@ impl fmt::Debug for PostgresFragmentCatalog {
 impl PostgresFragmentCatalog {
     /// Connect, verify the pool, and apply catalog migrations transactionally.
     pub async fn connect(config: PostgresFragmentCatalogConfig) -> Result<Self, StoreError> {
-        config.validate()?;
+        config.validate().map_err(|error| {
+            StoreError::internal_with_context(error, "Invalid PostgreSQL catalog configuration")
+        })?;
 
         let mut pg_config =
             tokio_postgres::Config::from_str(&config.connection_string).map_err(|error| {
@@ -165,9 +200,10 @@ impl PostgresFragmentCatalog {
             SslMode::Prefer | SslMode::Require => {
                 let (connector, certificate_errors) = MakeRustlsConnect::with_native_certs()
                     .map_err(|errors| {
-                        StoreError::internal(format!(
-                            "Failed to load PostgreSQL TLS trust roots: {errors:?}"
-                        ))
+                        StoreError::internal_with_context(
+                            NativeCertificateErrors::from(errors),
+                            "Failed to load PostgreSQL TLS trust roots",
+                        )
                     })?;
                 if !certificate_errors.is_empty() {
                     warn!(
@@ -342,7 +378,24 @@ impl PostgresFragmentCatalog {
         let generation = row
             .try_get(1)
             .map_err(|error| database_error(error, "Failed to read publication generation"))?;
-        Ok(Some((state_from_i16(state)?, generation)))
+        Ok(Some((
+            state_from_i16(state)?,
+            CatalogGeneration::new(generation),
+        )))
+    }
+
+    async fn lock_hash(
+        transaction: &deadpool_postgres::Transaction<'_>,
+        hash: Hash,
+    ) -> Result<(), StoreError> {
+        let bytes = hash.data();
+        let first = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let second = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        transaction
+            .query_one("SELECT pg_advisory_xact_lock($1, $2)", &[&first, &second])
+            .await
+            .map(|_| ())
+            .map_err(|error| database_error(error, "Failed to lock fragment publication"))
     }
 }
 
@@ -466,6 +519,7 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin fragment publication"))?;
+        Self::lock_hash(&transaction, address.hash).await?;
         let table = self.state_table();
         let published = transaction
             .execute(
@@ -524,7 +578,7 @@ impl FragmentCatalog for PostgresFragmentCatalog {
                 &[
                     &hash.as_ref(),
                     &state_to_i16(FragmentState::Stored),
-                    &generation,
+                    &generation.value(),
                 ],
             )
             .await
@@ -542,10 +596,27 @@ impl FragmentCatalog for PostgresFragmentCatalog {
             .transaction()
             .await
             .map_err(|error| database_error(error, "Failed to begin obliteration transaction"))?;
+        Self::lock_hash(&transaction, address.hash).await?;
         let state_table = self.state_table();
         let Some((state, _generation)) =
             Self::locked_state(&transaction, &state_table, address.hash).await?
         else {
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {} WHERE hash = $1 AND partition = $2 AND context = $3",
+                        self.association_table()
+                    ),
+                    &[
+                        &address.hash.as_ref(),
+                        &partition.as_ref(),
+                        &address.context.as_ref(),
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    database_error(error, "Failed to release orphaned fragment association")
+                })?;
             transaction.commit().await.map_err(|error| {
                 database_error(error, "Failed to commit empty obliteration lookup")
             })?;
@@ -667,7 +738,7 @@ fn resolution_from_row(row: &Row) -> Result<CatalogResolution, StoreError> {
     let state: Option<i16> = row
         .try_get(1)
         .map_err(|error| database_error(error, "Failed to read state resolution"))?;
-    let generation: Option<CatalogGeneration> = row
+    let generation: Option<i64> = row
         .try_get(2)
         .map_err(|error| database_error(error, "Failed to read generation resolution"))?;
     if state.is_some() != generation.is_some() {
@@ -677,8 +748,15 @@ fn resolution_from_row(row: &Row) -> Result<CatalogResolution, StoreError> {
     }
     Ok(CatalogResolution {
         associated,
-        state: state.map(state_from_i16).transpose()?,
-        generation,
+        publication: state
+            .zip(generation)
+            .map(|(state, generation)| {
+                Ok::<_, StoreError>(CatalogPublication {
+                    state: state_from_i16(state)?,
+                    generation: CatalogGeneration::new(generation),
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -701,7 +779,7 @@ fn state_from_i16(state: i16) -> Result<FragmentState, StoreError> {
     }
 }
 
-fn validate_identifier(identifier: &str) -> Result<(), StoreError> {
+fn validate_identifier(identifier: &str) -> Result<(), PostgresFragmentCatalogConfigError> {
     let valid_length = !identifier.is_empty() && identifier.len() <= 63;
     let mut characters = identifier.bytes();
     let valid_first = characters
@@ -711,9 +789,7 @@ fn validate_identifier(identifier: &str) -> Result<(), StoreError> {
     if valid_length && valid_first && valid_rest {
         Ok(())
     } else {
-        Err(StoreError::internal(
-            "PostgreSQL schema must be a 1-63 character SQL identifier",
-        ))
+        Err(PostgresFragmentCatalogConfigError::InvalidSchema)
     }
 }
 
