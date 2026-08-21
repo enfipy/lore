@@ -154,18 +154,25 @@ until curl --fail --silent "http://127.0.0.1:$CONSUL_PORT/v1/status/leader"; do 
 
 ### 2. Source, helpers, and configuration
 
-The helper programs are retained in the original evidence and covered by its 146-file manifest.
-Verify before copying them. Configuration starts from the repository's non-secret example; every
+The non-secret helper programs are archived in the companion proof repository. Pin its commit and
+verify each helper before copying it. Configuration starts from Lore's non-secret example; every
 run-specific path, port, endpoint, name, and credential is supplied by environment override.
 
 ```sh
 RETAINED=/var/tmp/lore-final-20260817t053000z
-(cd "$RETAINED" && sha256sum --check evidence/sha256-manifest.txt)
-install -m 0755 "$RETAINED/evidence/r2_matrix_bc599c9.py" \
+git clone https://github.com/enfipy/cloud.git "$RUN_ROOT/harness"
+git -C "$RUN_ROOT/harness" switch --detach d003a991cbcfbf388585980036abbdcc7df38819
+cat >"$RUN_ROOT/evidence/harness.sha256" <<'EOF'
+6dc80b04ad0e0190f4ee83142fc704195ba1e46518b80eda3d50f078cde3ab7f  proofs/0001-lore-r2/r2_matrix.py
+2bdf439fbfac087c308e3d064f54b464454d03cf48ad6b6348272b251e352f40  proofs/0001-lore-r2/r2_reverse_proxy.py
+60c7170018d745b42fbd010c08db890e66c7f85f18d39026d09e75864e52b863  proofs/0001-lore-r2/verify_catalog_r2.py
+EOF
+(cd "$RUN_ROOT/harness" && sha256sum --check "$RUN_ROOT/evidence/harness.sha256")
+install -m 0755 "$RUN_ROOT/harness/proofs/0001-lore-r2/r2_matrix.py" \
   "$RUN_ROOT/evidence/r2_matrix.py"
-install -m 0755 "$RETAINED/evidence/verify_catalog_r2_bc599c9.py" \
+install -m 0755 "$RUN_ROOT/harness/proofs/0001-lore-r2/verify_catalog_r2.py" \
   "$RUN_ROOT/evidence/verify_catalog_r2.py"
-install -m 0755 "$RETAINED/evidence/r2_reverse_proxy_bc599c9.py" \
+install -m 0755 "$RUN_ROOT/harness/proofs/0001-lore-r2/r2_reverse_proxy.py" \
   "$RUN_ROOT/evidence/r2_reverse_proxy.py"
 
 git clone https://github.com/enfipy/lore.git "$RUN_ROOT/src"
