@@ -52,6 +52,23 @@ pub enum BucketVersioningValidationError {
     /// The provider failed the capability probe.
     #[error("failed to query S3 bucket versioning: {0}")]
     Request(AwsError<SdkError<GetBucketVersioningError>>),
+    /// The provider denied the versioning query while exposing an object-history API.
+    #[error(
+        "cannot verify unversioned S3 semantics: bucket versioning was denied ({versioning}) \
+         but ListObjectVersions is available"
+    )]
+    HistoryApiAvailable {
+        versioning: AwsError<SdkError<GetBucketVersioningError>>,
+    },
+    /// Both the versioning query and the fallback object-history probe failed.
+    #[error(
+        "cannot verify unversioned S3 semantics: bucket versioning failed ({versioning}); \
+         ListObjectVersions failed ({history})"
+    )]
+    HistoryProbe {
+        versioning: AwsError<SdkError<GetBucketVersioningError>>,
+        history: AwsError<SdkError<ListObjectVersionsError>>,
+    },
 }
 
 fn validate_bucket_versioning_status(
@@ -71,13 +88,16 @@ fn validate_bucket_versioning_status(
     })
 }
 
-fn is_not_implemented(error: &AwsError<SdkError<GetBucketVersioningError>>) -> bool {
+fn is_service_error<E>(error: &AwsError<SdkError<E>>, status: u16, code: &str) -> bool
+where
+    E: ProvideErrorMetadata,
+{
     let AwsError::AwsSdkError(error) = error else {
         return false;
     };
     match &**error {
         SdkError::ServiceError(error) => {
-            error.raw().status().as_u16() == 501 || error.err().code() == Some("NotImplemented")
+            error.raw().status().as_u16() == status || error.err().code() == Some(code)
         }
         _ => false,
     }
@@ -184,9 +204,41 @@ impl S3Impl {
         match output {
             Ok(output) => validate_bucket_versioning_status(expected, output.status.as_ref()),
             Err(error)
-                if expected == S3ObjectVersioning::Unversioned && is_not_implemented(&error) =>
+                if expected == S3ObjectVersioning::Unversioned
+                    && is_service_error(&error, 501, "NotImplemented") =>
             {
                 Ok(())
+            }
+            Err(versioning)
+                if expected == S3ObjectVersioning::Unversioned
+                    && is_service_error(&versioning, 403, "AccessDenied") =>
+            {
+                let history = self
+                    .client
+                    .list_object_versions()
+                    .bucket(bucket)
+                    .max_keys(1)
+                    .send()
+                    .observe(
+                        self.instruments.operation_latency_histogram.clone(),
+                        self.instruments
+                            .instrument_provider
+                            .get_labels_for_operation_context("list_object_versions_capability"),
+                        observe_aws_operation_callback(self.slow_operation_duration),
+                    )
+                    .await
+                    .output
+                    .map_err(AwsError::sdk_error);
+                match history {
+                    Err(error) if is_service_error(&error, 501, "NotImplemented") => Ok(()),
+                    Ok(_) => {
+                        Err(BucketVersioningValidationError::HistoryApiAvailable { versioning })
+                    }
+                    Err(history) => Err(BucketVersioningValidationError::HistoryProbe {
+                        versioning,
+                        history,
+                    }),
+                }
             }
             Err(error) => Err(BucketVersioningValidationError::Request(error)),
         }
@@ -367,10 +419,14 @@ impl S3Impl {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningError;
+    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
     use aws_sdk_s3::types::BucketVersioningStatus;
 
     use super::*;
     use crate::store::immutable_store::S3ObjectVersioning;
+    use crate::store::test_util::aws_error;
 
     #[test]
     fn versioned_mode_requires_an_enabled_bucket() {
@@ -408,5 +464,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn service_error_classification_uses_status_or_code() {
+        let denied = aws_error(
+            GetBucketVersioningError::generic(
+                ErrorMetadata::builder().code("AccessDenied").build(),
+            ),
+            400,
+        );
+        assert!(is_service_error(&denied, 403, "AccessDenied"));
+
+        let unsupported = aws_error(
+            ListObjectVersionsError::generic(ErrorMetadata::builder().build()),
+            501,
+        );
+        assert!(is_service_error(&unsupported, 501, "NotImplemented"));
+    }
+
+    #[test]
+    fn service_error_classification_rejects_other_failures() {
+        let failure = aws_error(
+            GetBucketVersioningError::generic(
+                ErrorMetadata::builder().code("InternalError").build(),
+            ),
+            500,
+        );
+        assert!(!is_service_error(&failure, 403, "AccessDenied"));
+        assert!(!is_service_error(&failure, 501, "NotImplemented"));
     }
 }
