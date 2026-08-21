@@ -43,8 +43,10 @@ use lore_storage::fragment_catalog::CatalogGeneration;
 use lore_storage::fragment_catalog::CatalogPublication;
 use lore_storage::fragment_catalog::CatalogResolution;
 use lore_storage::fragment_catalog::FragmentCatalog;
+#[cfg(test)]
 use lore_storage::fragment_catalog::FragmentCatalogGuard;
 use lore_storage::fragment_catalog::FragmentState as CatalogFragmentState;
+use lore_storage::fragment_catalog::unlock_fragment_catalog_guard;
 #[cfg(test)]
 use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -218,22 +220,6 @@ fn catalog_state(state: CatalogFragmentState) -> FragmentState {
         CatalogFragmentState::Stored => FragmentState::Stored,
         CatalogFragmentState::Obliterating => FragmentState::Obliterating,
         CatalogFragmentState::Obliterated => FragmentState::Obliterated,
-    }
-}
-
-async fn unlock_catalog_guard<T>(
-    guard: Box<dyn FragmentCatalogGuard>,
-    result: Result<T, StoreError>,
-) -> Result<T, StoreError> {
-    let unlock = guard.unlock().await;
-    match result {
-        Err(error) => {
-            if let Err(unlock_error) = unlock {
-                warn!(?unlock_error, "Failed to unlock fragment catalog guard");
-            }
-            Err(error)
-        }
-        Ok(value) => unlock.map(|()| value),
     }
 }
 
@@ -1730,7 +1716,14 @@ impl AwsImmutableStore {
                     .map_err(|e| {
                         warn!("Failed to list versions for hash: {hash}: {e:?}");
                         if matches!(&e, AwsError::AwsSdkError(_)) {
-                            StoreError::from(SlowDown)
+                            let source = StoreError::internal_with_context(
+                                e,
+                                "S3 list object versions failed",
+                            );
+                            StoreError::SlowDown(SlowDown.chain_err_from(
+                                source,
+                                "retryable S3 list object versions failure",
+                            ))
                         } else {
                             StoreError::internal_with_context(e, "S3 list object versions failed")
                         }
@@ -1766,7 +1759,14 @@ impl AwsImmutableStore {
                         .map_err(|e| {
                             warn!("Failed to delete payload for hash: {hash}: {e:?}");
                             if matches!(&e, AwsError::AwsSdkError(_)) {
-                                StoreError::from(SlowDown)
+                                let source = StoreError::internal_with_context(
+                                    e,
+                                    "S3 delete object version failed",
+                                );
+                                StoreError::SlowDown(SlowDown.chain_err_from(
+                                    source,
+                                    "retryable S3 delete object version failure",
+                                ))
                             } else {
                                 StoreError::internal_with_context(
                                     e,
@@ -2216,7 +2216,7 @@ impl AwsImmutableStore {
             }
         }
         .await;
-        unlock_catalog_guard(guard, result).await
+        unlock_fragment_catalog_guard(guard, result).await
     }
 
     async fn put_dynamodb(
@@ -2498,7 +2498,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     .instrument(span.clone())
                     .await?;
                 let begin = guard.begin_obliteration(partition, address).await;
-                let begin = unlock_catalog_guard(guard, begin).await?;
+                let begin = unlock_fragment_catalog_guard(guard, begin).await?;
                 match begin {
                     BeginObliteration::NoState => {
                         info!("No fragment state for {address}, nothing to obliterate");
@@ -2549,7 +2549,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     Ok(true)
                 }
                 .await;
-                if unlock_catalog_guard(guard, result).await? {
+                if unlock_fragment_catalog_guard(guard, result).await? {
                     stats
                         .num_payloads
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2748,6 +2748,9 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 
 #[cfg(test)]
 mod test {
+    use std::future::Future;
+
+    use lore_base::runtime::LORE_CONTEXT;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -2765,6 +2768,7 @@ mod test {
 
     use super::*;
     use crate::store::object_metadata::PAYLOAD_FLAGS;
+    use crate::store::setup_execution;
     use crate::store::test_util::*;
 
     type BeginPause = (oneshot::Sender<()>, oneshot::Receiver<()>);
@@ -3046,8 +3050,60 @@ mod test {
         external_store_with_versioning(fake, catalog, S3ObjectVersioning::Unversioned).await
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn publication_racing_obliteration_never_acknowledges_a_missing_payload() {
+    async fn in_test_context<T>(name: &str, test: impl Future<Output = T>) -> T {
+        LORE_CONTEXT
+            .scope(setup_execution(name.to_string()), test)
+            .await
+    }
+
+    macro_rules! context_tests {
+        ($( $(#[$attribute:meta])* $test:ident => $body:ident; )+) => {
+            $(
+                $(#[$attribute])*
+                async fn $test() {
+                    in_test_context(stringify!($test), $body()).await;
+                }
+            )+
+        };
+    }
+
+    context_tests! {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        publication_racing_obliteration_never_acknowledges_a_missing_payload
+            => publication_racing_obliteration_never_acknowledges_a_missing_payload_body;
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        stale_obliterator_cannot_delete_a_revived_payload
+            => stale_obliterator_cannot_delete_a_revived_payload_body;
+        #[tokio::test]
+        versioned_obliteration_deletes_versions_and_delete_markers
+            => versioned_obliteration_deletes_versions_and_delete_markers_body;
+        #[tokio::test]
+        versioned_obliteration_follows_every_history_page
+            => versioned_obliteration_follows_every_history_page_body;
+        #[tokio::test]
+        versioned_obliteration_repeats_until_history_is_empty
+            => versioned_obliteration_repeats_until_history_is_empty_body;
+        #[tokio::test]
+        versioned_obliteration_never_deletes_a_prefix_neighbor
+            => versioned_obliteration_never_deletes_a_prefix_neighbor_body;
+        #[tokio::test]
+        versioned_obliteration_rejects_history_without_a_version_id
+            => versioned_obliteration_rejects_history_without_a_version_id_body;
+        #[tokio::test]
+        successful_delete_response_does_not_tombstone_a_present_payload
+            => successful_delete_response_does_not_tombstone_a_present_payload_body;
+        #[tokio::test]
+        conditional_write_accepts_an_identical_existing_payload
+            => conditional_write_accepts_an_identical_existing_payload_body;
+        #[tokio::test]
+        conditional_write_rejects_different_existing_bytes
+            => conditional_write_rejects_different_existing_bytes_body;
+        #[tokio::test]
+        unversioned_obliteration_does_not_list_versions
+            => unversioned_obliteration_does_not_list_versions_body;
+    }
+
+    async fn publication_racing_obliteration_never_acknowledges_a_missing_payload_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store = external_store(&fake, catalog.clone()).await;
@@ -3125,8 +3181,7 @@ mod test {
             .expect("acknowledged association retains its payload");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stale_obliterator_cannot_delete_a_revived_payload() {
+    async fn stale_obliterator_cannot_delete_a_revived_payload_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store = external_store(&fake, catalog.clone()).await;
@@ -3226,8 +3281,7 @@ mod test {
             .expect("revived association retains its payload");
     }
 
-    #[tokio::test]
-    async fn versioned_obliteration_deletes_versions_and_delete_markers() {
+    async fn versioned_obliteration_deletes_versions_and_delete_markers_body() {
         let fake = Fake::default();
         let store = external_store_with_versioning(
             &fake,
@@ -3270,8 +3324,7 @@ mod test {
         assert_eq!(deleted, vec!["delete-marker-1", "version-1", "version-2"]);
     }
 
-    #[tokio::test]
-    async fn versioned_obliteration_follows_every_history_page() {
+    async fn versioned_obliteration_follows_every_history_page_body() {
         let fake = Fake::default();
         let store = external_store_with_versioning(
             &fake,
@@ -3324,8 +3377,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn versioned_obliteration_repeats_until_history_is_empty() {
+    async fn versioned_obliteration_repeats_until_history_is_empty_body() {
         let fake = Fake::default();
         let store = external_store_with_versioning(
             &fake,
@@ -3383,8 +3435,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn versioned_obliteration_never_deletes_a_prefix_neighbor() {
+    async fn versioned_obliteration_never_deletes_a_prefix_neighbor_body() {
         let fake = Fake::default();
         let store = external_store_with_versioning(
             &fake,
@@ -3443,8 +3494,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn versioned_obliteration_rejects_history_without_a_version_id() {
+    async fn versioned_obliteration_rejects_history_without_a_version_id_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store =
@@ -3488,8 +3538,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn successful_delete_response_does_not_tombstone_a_present_payload() {
+    async fn successful_delete_response_does_not_tombstone_a_present_payload_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store = external_store(&fake, catalog.clone()).await;
@@ -3526,8 +3575,7 @@ mod test {
         assert!(fake.object(address.hash).is_some());
     }
 
-    #[tokio::test]
-    async fn conditional_write_accepts_an_identical_existing_payload() {
+    async fn conditional_write_accepts_an_identical_existing_payload_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store = external_store(&fake, catalog.clone()).await;
@@ -3558,8 +3606,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn conditional_write_rejects_different_existing_bytes() {
+    async fn conditional_write_rejects_different_existing_bytes_body() {
         let fake = Fake::default();
         let catalog = Arc::new(MemoryCatalog::default());
         let store = external_store(&fake, catalog.clone()).await;
@@ -5027,8 +5074,7 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn unversioned_obliteration_does_not_list_versions() {
+    async fn unversioned_obliteration_does_not_list_versions_body() {
         let fake = Fake::default();
         let address = Address {
             hash: random(),

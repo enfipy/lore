@@ -25,6 +25,7 @@ use lore_storage::fragment_catalog::CatalogResolution;
 use lore_storage::fragment_catalog::FragmentCatalog;
 use lore_storage::fragment_catalog::FragmentCatalogGuard;
 use lore_storage::fragment_catalog::FragmentState;
+use lore_storage::fragment_catalog::unlock_fragment_catalog_guard;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -176,14 +177,16 @@ struct PostgresLockAcquisition {
 }
 
 impl PostgresLockAcquisition {
-    fn client(&self) -> &deadpool_postgres::Client {
+    fn client(&self) -> Result<&deadpool_postgres::Client, StoreError> {
         self.client
             .as_ref()
-            .expect("lock acquisition owns a client")
+            .ok_or_else(|| StoreError::internal("PostgreSQL lock acquisition lost its client"))
     }
 
-    fn into_client(mut self) -> deadpool_postgres::Client {
-        self.client.take().expect("lock acquisition owns a client")
+    fn into_client(mut self) -> Result<deadpool_postgres::Client, StoreError> {
+        self.client
+            .take()
+            .ok_or_else(|| StoreError::internal("PostgreSQL lock acquisition lost its client"))
     }
 }
 
@@ -226,22 +229,6 @@ impl Drop for PostgresFragmentCatalogGuard {
             // PostgreSQL session, which releases the lock even when its task was cancelled.
             drop(deadpool_postgres::Object::take(client));
         }
-    }
-}
-
-async fn unlock_guard<T>(
-    guard: Box<dyn FragmentCatalogGuard>,
-    result: Result<T, StoreError>,
-) -> Result<T, StoreError> {
-    let unlock = guard.unlock().await;
-    match result {
-        Err(error) => {
-            if let Err(unlock_error) = unlock {
-                warn!(?unlock_error, "Failed to unlock PostgreSQL fragment guard");
-            }
-            Err(error)
-        }
-        Ok(value) => unlock.map(|()| value),
     }
 }
 
@@ -750,12 +737,12 @@ impl FragmentCatalog for PostgresFragmentCatalog {
         let first = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let second = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         acquisition
-            .client()
+            .client()?
             .query_one("SELECT pg_advisory_lock($1, $2)", &[&first, &second])
             .await
             .map_err(|error| database_error(error, "Failed to lock fragment hash"))?;
         Ok(Box::new(PostgresFragmentCatalogGuard {
-            client: Some(acquisition.into_client()),
+            client: Some(acquisition.into_client()?),
             schema: self.schema.clone(),
             hash,
         }))
@@ -876,7 +863,7 @@ impl FragmentCatalog for PostgresFragmentCatalog {
     async fn publish(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
         let mut guard = FragmentCatalog::lock_hash(self, address.hash).await?;
         let result = guard.publish(partition, address).await;
-        unlock_guard(guard, result).await
+        unlock_fragment_catalog_guard(guard, result).await
     }
 
     async fn repair_missing_payload(
@@ -909,13 +896,13 @@ impl FragmentCatalog for PostgresFragmentCatalog {
     ) -> Result<BeginObliteration, StoreError> {
         let mut guard = FragmentCatalog::lock_hash(self, address.hash).await?;
         let result = guard.begin_obliteration(partition, address).await;
-        unlock_guard(guard, result).await
+        unlock_fragment_catalog_guard(guard, result).await
     }
 
     async fn finalize_obliteration(&self, hash: Hash) -> Result<(), StoreError> {
         let mut guard = FragmentCatalog::lock_hash(self, hash).await?;
         let result = guard.finalize_obliteration().await;
-        unlock_guard(guard, result).await
+        unlock_fragment_catalog_guard(guard, result).await
     }
 
     fn max_query_batch(&self) -> Option<usize> {

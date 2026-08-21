@@ -121,6 +121,23 @@ pub trait FragmentCatalogGuard: Send {
     async fn unlock(self: Box<Self>) -> Result<(), StoreError>;
 }
 
+/// Release a catalog guard while preserving the operation error when both steps fail.
+pub async fn unlock_fragment_catalog_guard<T>(
+    guard: Box<dyn FragmentCatalogGuard>,
+    result: Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let unlock = guard.unlock().await;
+    match result {
+        Err(error) => {
+            if let Err(unlock_error) = unlock {
+                lore_base::lore_warn!("Failed to unlock fragment catalog guard: {unlock_error}");
+            }
+            Err(error)
+        }
+        Ok(value) => unlock.map(|()| value),
+    }
+}
+
 /// Mutable catalog used by an object-backed immutable store.
 ///
 /// Implementations own concurrency control. In particular, `publish` must atomically advance the

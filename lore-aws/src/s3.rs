@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::ops::Range;
@@ -103,6 +104,15 @@ where
     }
 }
 
+fn should_probe_history(
+    expected: S3ObjectVersioning,
+    error: &AwsError<SdkError<GetBucketVersioningError>>,
+) -> bool {
+    expected == S3ObjectVersioning::Unversioned
+        && (is_service_error(error, 403, "AccessDenied")
+            || is_service_error(error, 501, "NotImplemented"))
+}
+
 #[derive(Clone)]
 struct S3InstrumentProvider;
 
@@ -203,16 +213,7 @@ impl S3Impl {
             .map_err(AwsError::sdk_error);
         match output {
             Ok(output) => validate_bucket_versioning_status(expected, output.status.as_ref()),
-            Err(error)
-                if expected == S3ObjectVersioning::Unversioned
-                    && is_service_error(&error, 501, "NotImplemented") =>
-            {
-                Ok(())
-            }
-            Err(versioning)
-                if expected == S3ObjectVersioning::Unversioned
-                    && is_service_error(&versioning, 403, "AccessDenied") =>
-            {
+            Err(versioning) if should_probe_history(expected, &versioning) => {
                 let history = self
                     .client
                     .list_object_versions()
@@ -493,5 +494,23 @@ mod tests {
         );
         assert!(!is_service_error(&failure, 403, "AccessDenied"));
         assert!(!is_service_error(&failure, 501, "NotImplemented"));
+    }
+
+    #[test]
+    fn unavailable_versioning_api_requires_an_object_history_probe() {
+        for (error, status) in [("AccessDenied", 403), ("NotImplemented", 501)] {
+            let failure = aws_error(
+                GetBucketVersioningError::generic(ErrorMetadata::builder().code(error).build()),
+                status,
+            );
+            assert!(should_probe_history(
+                S3ObjectVersioning::Unversioned,
+                &failure
+            ));
+            assert!(!should_probe_history(
+                S3ObjectVersioning::Versioned,
+                &failure
+            ));
+        }
     }
 }
