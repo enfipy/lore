@@ -84,6 +84,43 @@ pub enum BeginObliteration {
     PayloadUnreferenced,
 }
 
+/// Exclusive catalog ownership for one payload hash.
+///
+/// The guard is the seam that lets an object-store adapter keep payload I/O and its catalog
+/// transition ordered across every Lore process. Implementations must release ownership when
+/// [`FragmentCatalogGuard::unlock`] succeeds and must fail closed if a guard is dropped.
+#[async_trait]
+pub trait FragmentCatalogGuard: Send {
+    /// Resolve one address while ownership is held.
+    async fn resolve(
+        &mut self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<CatalogResolution, StoreError>;
+
+    /// Publish the guarded payload and add its exact association.
+    async fn publish(&mut self, partition: Partition, address: Address) -> Result<(), StoreError>;
+
+    /// Clear a missing payload if the guarded publication is still the observed generation.
+    async fn repair_missing_payload(
+        &mut self,
+        generation: CatalogGeneration,
+    ) -> Result<(), StoreError>;
+
+    /// Remove one association and claim the guarded hash when no references remain.
+    async fn begin_obliteration(
+        &mut self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<BeginObliteration, StoreError>;
+
+    /// Replace the guarded in-progress marker with a terminal tombstone.
+    async fn finalize_obliteration(&mut self) -> Result<(), StoreError>;
+
+    /// Release ownership explicitly so failures are observable.
+    async fn unlock(self: Box<Self>) -> Result<(), StoreError>;
+}
+
 /// Mutable catalog used by an object-backed immutable store.
 ///
 /// Implementations own concurrency control. In particular, `publish` must atomically advance the
@@ -92,6 +129,9 @@ pub enum BeginObliteration {
 /// safe to act on.
 #[async_trait]
 pub trait FragmentCatalog: Send + Sync {
+    /// Take exclusive ownership of mutations for one payload hash.
+    async fn lock_hash(&self, hash: Hash) -> Result<Box<dyn FragmentCatalogGuard>, StoreError>;
+
     /// Resolve lifecycle and association facts for one address.
     async fn resolve(
         &self,

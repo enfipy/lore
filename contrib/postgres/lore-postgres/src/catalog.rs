@@ -23,6 +23,7 @@ use lore_storage::fragment_catalog::CatalogGeneration;
 use lore_storage::fragment_catalog::CatalogPublication;
 use lore_storage::fragment_catalog::CatalogResolution;
 use lore_storage::fragment_catalog::FragmentCatalog;
+use lore_storage::fragment_catalog::FragmentCatalogGuard;
 use lore_storage::fragment_catalog::FragmentState;
 use serde::Deserialize;
 use sha2::Digest;
@@ -162,6 +163,362 @@ pub struct PostgresFragmentCatalog {
     pool: Pool,
     schema: Arc<str>,
     max_batch_size: usize,
+}
+
+struct PostgresFragmentCatalogGuard {
+    client: Option<deadpool_postgres::Client>,
+    schema: Arc<str>,
+    hash: Hash,
+}
+
+struct PostgresLockAcquisition {
+    client: Option<deadpool_postgres::Client>,
+}
+
+impl PostgresLockAcquisition {
+    fn client(&self) -> &deadpool_postgres::Client {
+        self.client
+            .as_ref()
+            .expect("lock acquisition owns a client")
+    }
+
+    fn into_client(mut self) -> deadpool_postgres::Client {
+        self.client.take().expect("lock acquisition owns a client")
+    }
+}
+
+impl Drop for PostgresLockAcquisition {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            // Dropping the lock future does not cancel the PostgreSQL query. Close the session so
+            // an advisory lock completed after cancellation can never return to the pool.
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
+}
+
+impl PostgresFragmentCatalogGuard {
+    fn client(&self) -> Result<&deadpool_postgres::Client, StoreError> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| StoreError::internal("PostgreSQL fragment guard is already unlocked"))
+    }
+
+    fn client_mut(&mut self) -> Result<&mut deadpool_postgres::Client, StoreError> {
+        self.client
+            .as_mut()
+            .ok_or_else(|| StoreError::internal("PostgreSQL fragment guard is already unlocked"))
+    }
+
+    fn state_table(&self) -> String {
+        format!("\"{}\".fragment_state", self.schema)
+    }
+
+    fn association_table(&self) -> String {
+        format!("\"{}\".fragment_association", self.schema)
+    }
+}
+
+impl Drop for PostgresFragmentCatalogGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            // A session advisory lock must never return to the pool. Detaching closes the
+            // PostgreSQL session, which releases the lock even when its task was cancelled.
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
+}
+
+async fn unlock_guard<T>(
+    guard: Box<dyn FragmentCatalogGuard>,
+    result: Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let unlock = guard.unlock().await;
+    match result {
+        Err(error) => {
+            if let Err(unlock_error) = unlock {
+                warn!(?unlock_error, "Failed to unlock PostgreSQL fragment guard");
+            }
+            Err(error)
+        }
+        Ok(value) => unlock.map(|()| value),
+    }
+}
+
+#[async_trait]
+impl FragmentCatalogGuard for PostgresFragmentCatalogGuard {
+    async fn resolve(
+        &mut self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<CatalogResolution, StoreError> {
+        if address.hash != self.hash {
+            return Err(StoreError::internal(
+                "PostgreSQL fragment guard used for a different hash",
+            ));
+        }
+        let row = self
+            .client()?
+            .query_one(
+                &format!(
+                    "SELECT
+                        EXISTS (
+                            SELECT 1 FROM {association}
+                            WHERE hash = $1 AND partition = $2 AND context = $3
+                        ),
+                        (SELECT state FROM {state} WHERE hash = $1),
+                        (SELECT generation FROM {state} WHERE hash = $1)",
+                    association = self.association_table(),
+                    state = self.state_table(),
+                ),
+                &[
+                    &address.hash.as_ref(),
+                    &partition.as_ref(),
+                    &address.context.as_ref(),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to resolve guarded fragment"))?;
+        resolution_from_row(&row)
+    }
+
+    async fn publish(&mut self, partition: Partition, address: Address) -> Result<(), StoreError> {
+        if address.hash != self.hash {
+            return Err(StoreError::internal(
+                "PostgreSQL fragment guard used for a different hash",
+            ));
+        }
+        let table = self.state_table();
+        let association_table = self.association_table();
+        let schema = self.schema.clone();
+        let transaction = self
+            .client_mut()?
+            .transaction()
+            .await
+            .map_err(|error| database_error(error, "Failed to begin fragment publication"))?;
+        let published = transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table} AS current (hash, state) VALUES ($1, $2)
+                     ON CONFLICT (hash) DO UPDATE
+                     SET state = EXCLUDED.state,
+                         generation = nextval('\"{schema}\".fragment_generation_seq')
+                     WHERE current.state <> $3",
+                    schema = schema,
+                ),
+                &[
+                    &address.hash.as_ref(),
+                    &state_to_i16(FragmentState::Stored),
+                    &state_to_i16(FragmentState::Obliterating),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to publish fragment state"))?;
+        if published == 0 {
+            return Err(StoreError::from(SlowDown));
+        }
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {} (hash, partition, context) VALUES ($1, $2, $3)
+                     ON CONFLICT DO NOTHING",
+                    association_table
+                ),
+                &[
+                    &address.hash.as_ref(),
+                    &partition.as_ref(),
+                    &address.context.as_ref(),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to associate fragment"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(error, "Failed to commit fragment publication"))
+    }
+
+    async fn repair_missing_payload(
+        &mut self,
+        generation: CatalogGeneration,
+    ) -> Result<(), StoreError> {
+        self.client()?
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE hash = $1 AND state = $2 AND generation = $3",
+                    self.state_table()
+                ),
+                &[
+                    &self.hash.as_ref(),
+                    &state_to_i16(FragmentState::Stored),
+                    &generation.value(),
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| database_error(error, "Failed to clear lost fragment state"))
+    }
+
+    async fn begin_obliteration(
+        &mut self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<BeginObliteration, StoreError> {
+        if address.hash != self.hash {
+            return Err(StoreError::internal(
+                "PostgreSQL fragment guard used for a different hash",
+            ));
+        }
+        let state_table = self.state_table();
+        let association_table = self.association_table();
+        let transaction =
+            self.client_mut()?.transaction().await.map_err(|error| {
+                database_error(error, "Failed to begin obliteration transaction")
+            })?;
+        let Some((state, _generation)) =
+            PostgresFragmentCatalog::locked_state(&transaction, &state_table, address.hash).await?
+        else {
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {association_table}
+                         WHERE hash = $1 AND partition = $2 AND context = $3"
+                    ),
+                    &[
+                        &address.hash.as_ref(),
+                        &partition.as_ref(),
+                        &address.context.as_ref(),
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    database_error(error, "Failed to release orphaned fragment association")
+                })?;
+            transaction.commit().await.map_err(|error| {
+                database_error(error, "Failed to commit empty obliteration lookup")
+            })?;
+            return Ok(BeginObliteration::NoState);
+        };
+        if state == FragmentState::Obliterated {
+            transaction.commit().await.map_err(|error| {
+                database_error(error, "Failed to commit terminal obliteration lookup")
+            })?;
+            return Ok(BeginObliteration::AlreadyObliterated);
+        }
+        if state == FragmentState::Obliterating {
+            transaction.commit().await.map_err(|error| {
+                database_error(error, "Failed to commit resumed obliteration lookup")
+            })?;
+            return Ok(BeginObliteration::ResumePayloadDeletion);
+        }
+
+        transaction
+            .execute(
+                &format!(
+                    "DELETE FROM {association_table}
+                     WHERE hash = $1 AND partition = $2 AND context = $3"
+                ),
+                &[
+                    &address.hash.as_ref(),
+                    &partition.as_ref(),
+                    &address.context.as_ref(),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to release fragment association"))?;
+        transaction
+            .execute(
+                &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
+                &[
+                    &address.hash.as_ref(),
+                    &state_to_i16(FragmentState::Obliterating),
+                ],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to mark fragment obliterating"))?;
+        let remains: bool = transaction
+            .query_one(
+                &format!("SELECT EXISTS (SELECT 1 FROM {association_table} WHERE hash = $1)"),
+                &[&address.hash.as_ref()],
+            )
+            .await
+            .map_err(|error| database_error(error, "Failed to inspect fragment associations"))?
+            .try_get(0)
+            .map_err(|error| database_error(error, "Failed to read fragment associations"))?;
+        let result = if remains {
+            transaction
+                .execute(
+                    &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
+                    &[&address.hash.as_ref(), &state_to_i16(FragmentState::Stored)],
+                )
+                .await
+                .map_err(|error| database_error(error, "Failed to release obliteration marker"))?;
+            BeginObliteration::ReferencesRemain
+        } else {
+            BeginObliteration::PayloadUnreferenced
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(error, "Failed to commit obliteration transition"))?;
+        Ok(result)
+    }
+
+    async fn finalize_obliteration(&mut self) -> Result<(), StoreError> {
+        let table = self.state_table();
+        let hash = self.hash;
+        let transaction =
+            self.client_mut()?.transaction().await.map_err(|error| {
+                database_error(error, "Failed to begin obliteration finalization")
+            })?;
+        let (state, _generation) =
+            PostgresFragmentCatalog::locked_state(&transaction, &table, hash)
+                .await?
+                .ok_or_else(|| StoreError::internal("Cannot finalize a missing fragment state"))?;
+        match state {
+            FragmentState::Obliterated => {}
+            FragmentState::Obliterating => {
+                transaction
+                    .execute(
+                        &format!("UPDATE {table} SET state = $2 WHERE hash = $1"),
+                        &[&hash.as_ref(), &state_to_i16(FragmentState::Obliterated)],
+                    )
+                    .await
+                    .map_err(|error| {
+                        database_error(error, "Failed to finalize fragment obliteration")
+                    })?;
+            }
+            FragmentState::Stored => {
+                return Err(StoreError::internal(
+                    "Cannot finalize a fragment that is not obliterating",
+                ));
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(error, "Failed to commit obliteration finalization"))
+    }
+
+    async fn unlock(mut self: Box<Self>) -> Result<(), StoreError> {
+        let bytes = self.hash.data();
+        let first = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let second = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let unlocked: bool = self
+            .client()?
+            .query_one("SELECT pg_advisory_unlock($1, $2)", &[&first, &second])
+            .await
+            .map_err(|error| database_error(error, "Failed to unlock fragment hash"))?
+            .try_get(0)
+            .map_err(|error| database_error(error, "Failed to read fragment unlock result"))?;
+        if !unlocked {
+            return Err(StoreError::internal(
+                "PostgreSQL fragment hash was not locked by this session",
+            ));
+        }
+        drop(self.client.take());
+        Ok(())
+    }
 }
 
 impl fmt::Debug for PostgresFragmentCatalog {
@@ -381,24 +738,29 @@ impl PostgresFragmentCatalog {
             CatalogGeneration::new(generation),
         )))
     }
-
-    async fn lock_hash(
-        transaction: &deadpool_postgres::Transaction<'_>,
-        hash: Hash,
-    ) -> Result<(), StoreError> {
-        let bytes = hash.data();
-        let first = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let second = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        transaction
-            .query_one("SELECT pg_advisory_xact_lock($1, $2)", &[&first, &second])
-            .await
-            .map(|_| ())
-            .map_err(|error| database_error(error, "Failed to lock fragment publication"))
-    }
 }
 
 #[async_trait]
 impl FragmentCatalog for PostgresFragmentCatalog {
+    async fn lock_hash(&self, hash: Hash) -> Result<Box<dyn FragmentCatalogGuard>, StoreError> {
+        let acquisition = PostgresLockAcquisition {
+            client: Some(self.connection().await?),
+        };
+        let bytes = hash.data();
+        let first = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let second = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        acquisition
+            .client()
+            .query_one("SELECT pg_advisory_lock($1, $2)", &[&first, &second])
+            .await
+            .map_err(|error| database_error(error, "Failed to lock fragment hash"))?;
+        Ok(Box::new(PostgresFragmentCatalogGuard {
+            client: Some(acquisition.into_client()),
+            schema: self.schema.clone(),
+            hash,
+        }))
+    }
+
     async fn resolve(
         &self,
         partition: Partition,
@@ -512,53 +874,9 @@ impl FragmentCatalog for PostgresFragmentCatalog {
     }
 
     async fn publish(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin fragment publication"))?;
-        Self::lock_hash(&transaction, address.hash).await?;
-        let table = self.state_table();
-        let published = transaction
-            .execute(
-                &format!(
-                    "INSERT INTO {table} AS current (hash, state) VALUES ($1, $2)
-                     ON CONFLICT (hash) DO UPDATE
-                     SET state = EXCLUDED.state,
-                         generation = nextval('\"{schema}\".fragment_generation_seq')
-                     WHERE current.state <> $3",
-                    schema = self.schema,
-                ),
-                &[
-                    &address.hash.as_ref(),
-                    &state_to_i16(FragmentState::Stored),
-                    &state_to_i16(FragmentState::Obliterating),
-                ],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to publish fragment state"))?;
-        if published == 0 {
-            return Err(StoreError::from(SlowDown));
-        }
-        transaction
-            .execute(
-                &format!(
-                    "INSERT INTO {} (hash, partition, context) VALUES ($1, $2, $3)
-                     ON CONFLICT DO NOTHING",
-                    self.association_table()
-                ),
-                &[
-                    &address.hash.as_ref(),
-                    &partition.as_ref(),
-                    &address.context.as_ref(),
-                ],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to associate fragment"))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit fragment publication"))
+        let mut guard = FragmentCatalog::lock_hash(self, address.hash).await?;
+        let result = guard.publish(partition, address).await;
+        unlock_guard(guard, result).await
     }
 
     async fn repair_missing_payload(
@@ -589,139 +907,15 @@ impl FragmentCatalog for PostgresFragmentCatalog {
         partition: Partition,
         address: Address,
     ) -> Result<BeginObliteration, StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin obliteration transaction"))?;
-        Self::lock_hash(&transaction, address.hash).await?;
-        let state_table = self.state_table();
-        let Some((state, _generation)) =
-            Self::locked_state(&transaction, &state_table, address.hash).await?
-        else {
-            transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {} WHERE hash = $1 AND partition = $2 AND context = $3",
-                        self.association_table()
-                    ),
-                    &[
-                        &address.hash.as_ref(),
-                        &partition.as_ref(),
-                        &address.context.as_ref(),
-                    ],
-                )
-                .await
-                .map_err(|error| {
-                    database_error(error, "Failed to release orphaned fragment association")
-                })?;
-            transaction.commit().await.map_err(|error| {
-                database_error(error, "Failed to commit empty obliteration lookup")
-            })?;
-            return Ok(BeginObliteration::NoState);
-        };
-        if state == FragmentState::Obliterated {
-            transaction.commit().await.map_err(|error| {
-                database_error(error, "Failed to commit terminal obliteration lookup")
-            })?;
-            return Ok(BeginObliteration::AlreadyObliterated);
-        }
-        if state == FragmentState::Obliterating {
-            transaction.commit().await.map_err(|error| {
-                database_error(error, "Failed to commit resumed obliteration lookup")
-            })?;
-            return Ok(BeginObliteration::ResumePayloadDeletion);
-        }
-
-        transaction
-            .execute(
-                &format!(
-                    "DELETE FROM {} WHERE hash = $1 AND partition = $2 AND context = $3",
-                    self.association_table()
-                ),
-                &[
-                    &address.hash.as_ref(),
-                    &partition.as_ref(),
-                    &address.context.as_ref(),
-                ],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to release fragment association"))?;
-        transaction
-            .execute(
-                &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
-                &[
-                    &address.hash.as_ref(),
-                    &state_to_i16(FragmentState::Obliterating),
-                ],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to mark fragment obliterating"))?;
-        let remains: bool = transaction
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM {} WHERE hash = $1)",
-                    self.association_table()
-                ),
-                &[&address.hash.as_ref()],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to inspect fragment associations"))?
-            .try_get(0)
-            .map_err(|error| database_error(error, "Failed to read fragment associations"))?;
-
-        let result = if remains {
-            transaction
-                .execute(
-                    &format!("UPDATE {state_table} SET state = $2 WHERE hash = $1"),
-                    &[&address.hash.as_ref(), &state_to_i16(FragmentState::Stored)],
-                )
-                .await
-                .map_err(|error| database_error(error, "Failed to release obliteration marker"))?;
-            BeginObliteration::ReferencesRemain
-        } else {
-            BeginObliteration::PayloadUnreferenced
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit obliteration transition"))?;
-        Ok(result)
+        let mut guard = FragmentCatalog::lock_hash(self, address.hash).await?;
+        let result = guard.begin_obliteration(partition, address).await;
+        unlock_guard(guard, result).await
     }
 
     async fn finalize_obliteration(&self, hash: Hash) -> Result<(), StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| database_error(error, "Failed to begin obliteration finalization"))?;
-        let table = self.state_table();
-        let (state, _generation) = Self::locked_state(&transaction, &table, hash)
-            .await?
-            .ok_or_else(|| StoreError::internal("Cannot finalize a missing fragment state"))?;
-        match state {
-            FragmentState::Obliterated => {}
-            FragmentState::Obliterating => {
-                transaction
-                    .execute(
-                        &format!("UPDATE {table} SET state = $2 WHERE hash = $1"),
-                        &[&hash.as_ref(), &state_to_i16(FragmentState::Obliterated)],
-                    )
-                    .await
-                    .map_err(|error| {
-                        database_error(error, "Failed to finalize fragment obliteration")
-                    })?;
-            }
-            FragmentState::Stored => {
-                return Err(StoreError::internal(
-                    "Cannot finalize a fragment that is not obliterating",
-                ));
-            }
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit obliteration finalization"))
+        let mut guard = FragmentCatalog::lock_hash(self, hash).await?;
+        let result = guard.finalize_obliteration().await;
+        unlock_guard(guard, result).await
     }
 
     fn max_query_batch(&self) -> Option<usize> {

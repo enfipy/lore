@@ -1,11 +1,12 @@
 <!-- Copyright 2026 David; SPDX-License-Identifier: MIT -->
 
-# Lore with PostgreSQL, R2, and Consul
+# Lore with PostgreSQL, S3-compatible storage, and Consul
 
 This derived server keeps each system on the job it is designed for:
 
 - PostgreSQL stores fragment lifecycle state and repository associations.
-- Cloudflare R2 stores fragment payload bytes through its S3-compatible API.
+- Hetzner Object Storage or Cloudflare R2 stores fragment payload bytes through its S3-compatible
+  API.
 - Consul discovers Lore peers. Consul KV does not store Lore data.
 
 The catalog interface and its obliteration state contract live in the backend-neutral
@@ -16,8 +17,9 @@ PostgreSQL catalog adapter with Lore's S3-compatible payload adapter.
 The example installs the PostgreSQL catalog and S3-compatible payload store as the durable tier
 behind Lore's local cache. This also gives the Consul topology a live subscriber, so peer discovery
 drives composite-store replication. Payload network calls never run inside PostgreSQL transactions.
-Registration, association, and obliteration transitions use short row-locking transactions so a
-new association cannot cross an active obliteration marker.
+Registration, association, and obliteration transitions use short row-locking transactions plus a
+per-hash PostgreSQL advisory guard, so object I/O is ordered across Lore processes without holding
+a database transaction open over the network.
 
 Keep the example's `replica_factory` section whenever Consul is enabled for a composite store.
 It supplies the client factory used to turn discovered peers into replication targets; omitting it
@@ -36,23 +38,29 @@ The binary is `target/release/loreserver-postgres`.
 
 ## Configure
 
-Start with [`config-r2-consul.toml`](config-r2-consul.toml). Copy it to `local.toml` in a
-dedicated configuration directory and keep credentials outside the file:
+Start with [`config-hetzner-consul.toml`](config-hetzner-consul.toml) for Hetzner or
+[`config-r2-consul.toml`](config-r2-consul.toml) for R2. Copy it to `local.toml` in a dedicated
+configuration directory and keep credentials outside the file:
 
 ```sh
-export AWS_ACCESS_KEY_ID='<R2 access key>'
-export AWS_SECRET_ACCESS_KEY='<R2 secret key>'
+export AWS_ACCESS_KEY_ID='<S3 access key>'
+export AWS_SECRET_ACCESS_KEY='<S3 secret key>'
 export LORE__PLUGINS__POSTGRES_S3__IMMUTABLE_STORE__POSTGRES__CONNECTION_STRING='host=postgres.internal dbname=lore user=lore sslmode=require password=<secret>'
 export CONSUL_HTTP_ADDR='http://consul.internal:8500'
 export CONSUL_HTTP_TOKEN='<Consul ACL token>'
 
-install -m 0600 config-r2-consul.toml /etc/lore/local.toml
+install -m 0600 config-hetzner-consul.toml /etc/lore/local.toml
 target/release/loreserver-postgres --config /etc/lore
 ```
 
-For R2, `s3_object_versioning = "unversioned"` is required. Lore then permanently obliterates a
-payload with one exact-key `DeleteObject` request and does not call `ListObjectVersions`. Leave the
-default `versioned` behavior in place for versioned or unknown S3-compatible backends.
+For Hetzner, enable bucket versioning and use `s3_object_versioning = "versioned"`. Lore deletes
+every exact-key version and delete marker, repeats the listing until empty, and verifies that the
+current object is absent before committing its catalog tombstone. Do not enable Object Lock or a
+retention policy on the Lore bucket: either can intentionally reject permanent obliteration.
+
+For R2, use `s3_object_versioning = "unversioned"`. Lore then permanently obliterates a payload
+with one exact-key `DeleteObject` request. At startup Lore queries the bucket's actual versioning
+state and refuses a configuration that contradicts the provider response.
 
 The example uses local mutable and lock stores, which is appropriate only for a single primary.
 In a multi-node deployment, use a shared implementation for mutable state and locks, or direct all

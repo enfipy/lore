@@ -12,6 +12,7 @@ use aws_sdk_s3 as s3;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+use aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
@@ -22,6 +23,8 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::BucketVersioningStatus;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -35,6 +38,50 @@ use tracing::warn;
 
 use crate::aws_error::AwsError;
 use crate::observe_aws_operation_callback;
+use crate::store::immutable_store::S3ObjectVersioning;
+
+/// Bucket capability mismatch or failed versioning probe.
+#[derive(Debug, thiserror::Error)]
+pub enum BucketVersioningValidationError {
+    /// The provider reported semantics that contradict Lore's configured deletion mode.
+    #[error("S3 bucket versioning mismatch: configured {expected:?}, provider reported {observed}")]
+    Mismatch {
+        expected: S3ObjectVersioning,
+        observed: String,
+    },
+    /// The provider failed the capability probe.
+    #[error("failed to query S3 bucket versioning: {0}")]
+    Request(AwsError<SdkError<GetBucketVersioningError>>),
+}
+
+fn validate_bucket_versioning_status(
+    expected: S3ObjectVersioning,
+    status: Option<&BucketVersioningStatus>,
+) -> Result<(), BucketVersioningValidationError> {
+    let matches = match expected {
+        S3ObjectVersioning::Versioned => status == Some(&BucketVersioningStatus::Enabled),
+        S3ObjectVersioning::Unversioned => status.is_none(),
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(BucketVersioningValidationError::Mismatch {
+        expected,
+        observed: status.map_or_else(|| "unversioned".to_string(), ToString::to_string),
+    })
+}
+
+fn is_not_implemented(error: &AwsError<SdkError<GetBucketVersioningError>>) -> bool {
+    let AwsError::AwsSdkError(error) = error else {
+        return false;
+    };
+    match &**error {
+        SdkError::ServiceError(error) => {
+            error.raw().status().as_u16() == 501 || error.err().code() == Some("NotImplemented")
+        }
+        _ => false,
+    }
+}
 
 #[derive(Clone)]
 struct S3InstrumentProvider;
@@ -109,6 +156,39 @@ impl S3Impl {
                 warn!("Failed to check if bucket exists: {e}");
                 Err(AwsError::sdk_error(e))
             }
+        }
+    }
+
+    /// Verify that the bucket's actual versioning semantics match Lore's deletion mode.
+    #[tracing::instrument(name = "S3Impl::validate_bucket_versioning", skip_all)]
+    pub async fn validate_bucket_versioning(
+        &self,
+        bucket: &str,
+        expected: S3ObjectVersioning,
+    ) -> Result<(), BucketVersioningValidationError> {
+        let output = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                self.instruments
+                    .instrument_provider
+                    .get_labels_for_operation_context("get_bucket_versioning"),
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::sdk_error);
+        match output {
+            Ok(output) => validate_bucket_versioning_status(expected, output.status.as_ref()),
+            Err(error)
+                if expected == S3ObjectVersioning::Unversioned && is_not_implemented(&error) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(BucketVersioningValidationError::Request(error)),
         }
     }
 
@@ -207,12 +287,14 @@ impl S3Impl {
         key: &str,
         body: Bytes,
         metadata: Option<HashMap<String, String>>,
+        if_none_match: Option<String>,
     ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>> {
         self.client
             .put_object()
             .bucket(bucket)
             .key(key)
             .set_metadata(metadata)
+            .set_if_none_match(if_none_match)
             .body(ByteStream::from(body))
             .send()
             .observe(
@@ -231,11 +313,15 @@ impl S3Impl {
         &self,
         bucket: &str,
         key: &str,
+        key_marker: Option<String>,
+        version_id_marker: Option<String>,
     ) -> Result<ListObjectVersionsOutput, AwsError<SdkError<ListObjectVersionsError>>> {
         self.client
             .list_object_versions()
             .bucket(bucket)
             .prefix(key)
+            .set_key_marker(key_marker)
+            .set_version_id_marker(version_id_marker)
             .send()
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
@@ -276,5 +362,51 @@ impl S3Impl {
 
     pub fn sdk_client(&self) -> &s3::Client {
         &self.client
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::types::BucketVersioningStatus;
+
+    use super::*;
+    use crate::store::immutable_store::S3ObjectVersioning;
+
+    #[test]
+    fn versioned_mode_requires_an_enabled_bucket() {
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Versioned,
+                Some(&BucketVersioningStatus::Enabled),
+            )
+            .is_ok()
+        );
+        assert!(validate_bucket_versioning_status(S3ObjectVersioning::Versioned, None).is_err());
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Versioned,
+                Some(&BucketVersioningStatus::Suspended),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unversioned_mode_rejects_versioned_buckets() {
+        assert!(validate_bucket_versioning_status(S3ObjectVersioning::Unversioned, None).is_ok());
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Unversioned,
+                Some(&BucketVersioningStatus::Enabled),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Unversioned,
+                Some(&BucketVersioningStatus::Suspended),
+            )
+            .is_err()
+        );
     }
 }

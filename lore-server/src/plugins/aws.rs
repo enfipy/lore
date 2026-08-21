@@ -116,7 +116,7 @@ impl S3ImmutableStorePluginConfig {
         #[allow(clippy::disallowed_methods)]
         tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async move {
-                AwsClientBuilder::builder()
+                let client = AwsClientBuilder::builder()
                     .with_http_settings(&config.http)
                     .maybe_endpoint(config.s3_endpoint_url)
                     .maybe_region(config.s3_region)
@@ -129,7 +129,7 @@ impl S3ImmutableStorePluginConfig {
                     .await
                     .with_slow_operation_threshold(config.s3_slow_operation_threshold_millis)
                     .s3_with_path_style(config.s3_force_path_style)
-                    .ensure_bucket(config.s3_bucket)
+                    .ensure_bucket(config.s3_bucket.clone())
                     .build()
                     .await
                     .map_err(|error| {
@@ -137,7 +137,17 @@ impl S3ImmutableStorePluginConfig {
                             plugin_name: plugin_name.to_string(),
                             message: format!("Failed to create S3-compatible client: {error}"),
                         })
-                    })
+                    })?;
+                client
+                    .validate_bucket_versioning(&config.s3_bucket, config.s3_object_versioning)
+                    .await
+                    .map_err(|error| {
+                        PluginError::from(PluginInitError {
+                            plugin_name: plugin_name.to_string(),
+                            message: format!("Invalid S3 bucket versioning: {error}"),
+                        })
+                    })?;
+                Ok(client)
             }))
         })
     }

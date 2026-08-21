@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc;
 
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput;
@@ -26,6 +28,8 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::SdkBody;
+use aws_sdk_s3::types::DeleteMarkerEntry;
+use aws_sdk_s3::types::ObjectVersion;
 use aws_sdk_s3::types::error::NoSuchKey;
 use aws_sdk_s3::types::error::NotFound;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -79,6 +83,7 @@ pub(crate) enum Fault {
     AssociationDelete,
     AssociationCount,
     ObjectDelete,
+    ObjectDeleteNoop,
     ObjectList,
 }
 
@@ -95,8 +100,13 @@ pub(crate) struct Storage {
     /// Fired when an obliteration deletes its association, so a task can land one of its own
     /// in the window that follows.
     pub(crate) association_deleted: Option<oneshot::Sender<()>>,
+    /// One-shot rendezvous used to hold a `HeadObject` in a deterministic race test.
+    pub(crate) paused_head: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub(crate) object_reads: usize,
     pub(crate) objects: HashMap<Vec<u8>, StoredObject>,
+    pub(crate) object_history_pages: VecDeque<ListObjectVersionsOutput>,
+    pub(crate) implicit_history_listed: HashSet<Vec<u8>>,
+    pub(crate) deleted_version_ids: Vec<Option<String>>,
     pub(crate) associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
     pub(crate) state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
     /// Rows in the legacy fragment metadata table (separate from the state table). Only
@@ -140,6 +150,55 @@ impl Fake {
             .objects
             .get(&hash.to_string().into_bytes())
             .cloned()
+    }
+
+    pub(crate) fn set_object_history(&self, key: &str, versions: &[&str], delete_markers: &[&str]) {
+        self.set_object_history_pages(key, &[(versions, delete_markers)]);
+    }
+
+    pub(crate) fn set_object_history_pages(&self, key: &str, pages: &[(&[&str], &[&str])]) {
+        let last = pages.len().saturating_sub(1);
+        self.lock().object_history_pages = pages
+            .iter()
+            .enumerate()
+            .map(|(index, (versions, markers))| {
+                ListObjectVersionsOutput::builder()
+                    .set_versions(Some(
+                        versions
+                            .iter()
+                            .map(|version| {
+                                ObjectVersion::builder()
+                                    .key(key)
+                                    .version_id(*version)
+                                    .build()
+                            })
+                            .collect(),
+                    ))
+                    .set_delete_markers(Some(
+                        markers
+                            .iter()
+                            .map(|version| {
+                                DeleteMarkerEntry::builder()
+                                    .key(key)
+                                    .version_id(*version)
+                                    .build()
+                            })
+                            .collect(),
+                    ))
+                    .is_truncated(index < last)
+                    .set_next_key_marker((index < last).then(|| key.to_string()))
+                    .set_next_version_id_marker((index < last).then(|| format!("page-{index}")))
+                    .build()
+            })
+            .collect();
+    }
+
+    pub(crate) fn set_object_history_outputs(&self, pages: Vec<ListObjectVersionsOutput>) {
+        self.lock().object_history_pages = pages.into();
+    }
+
+    pub(crate) fn deleted_version_ids(&self) -> Vec<Option<String>> {
+        self.lock().deleted_version_ids.clone()
     }
 
     pub(crate) fn stored_fragment(&self, hash: Hash) -> Option<Fragment> {
@@ -250,6 +309,19 @@ impl Fake {
             .insert(hash.to_string().into_bytes(), (body.to_vec(), metadata));
     }
 
+    pub(crate) fn put_object(&self, hash: Hash, fragment: Fragment, body: &[u8]) {
+        let key = hash.to_string().into_bytes();
+        let mut storage = self.lock();
+        storage.objects.insert(
+            key.clone(),
+            (
+                body.to_vec(),
+                crate::store::object_metadata::to_object_metadata(&fragment),
+            ),
+        );
+        storage.implicit_history_listed.remove(&key);
+    }
+
     /// Signals when an obliteration deletes its association, so a caller can land its own
     /// between that delete and the re-count — the window the drain exists to cover. Ordering
     /// calls from the outside cannot hit it.
@@ -257,6 +329,14 @@ impl Fake {
         let (sender, receiver) = oneshot::channel();
         self.lock().association_deleted = Some(sender);
         receiver
+    }
+
+    /// Pause the next `HeadObject` after it starts and return start/release handles.
+    pub(crate) fn pause_next_head(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        self.lock().paused_head = Some((started_tx, release_rx));
+        (started_rx, release_tx)
     }
 
     pub(crate) fn has_association(&self, partition: Partition, address: Address) -> bool {
@@ -289,12 +369,22 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
 
     let f = fake.clone();
     s3.expect_put_object()
-        .returning(move |_, key, body, metadata| {
+        .returning(move |_, key, body, metadata, if_none_match| {
             let mut storage = f.lock();
+            if storage.objects.contains_key(key.as_bytes()) && if_none_match.as_deref() == Some("*")
+            {
+                return Err(aws_error(
+                    aws_sdk_s3::operation::put_object::PutObjectError::generic(
+                        ErrorMetadata::builder().code("PreconditionFailed").build(),
+                    ),
+                    412,
+                ));
+            }
             storage.objects.insert(
                 key.as_bytes().to_vec(),
                 (body.to_vec(), metadata.unwrap_or_default()),
             );
+            storage.implicit_history_listed.remove(key.as_bytes());
 
             if let Some((hash, state)) = storage.race_state.take() {
                 let item = serde_dynamo::to_item(FragmentStateEntry::new(hash, state)).unwrap();
@@ -322,21 +412,29 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
 
     let f = fake.clone();
     s3.expect_head_object().returning(move |_, key| {
-        let mut storage = f.lock();
-        storage.object_reads += 1;
-        match storage.objects.get(key.as_bytes()) {
-            Some((_, metadata)) => Ok(HeadObjectOutput::builder()
-                .set_metadata(Some(metadata.clone()))
-                .build()),
-            None => Err(aws_error(
-                HeadObjectError::NotFound(NotFound::builder().build()),
-                404,
-            )),
+        let (result, pause) = {
+            let mut storage = f.lock();
+            storage.object_reads += 1;
+            let result = match storage.objects.get(key.as_bytes()) {
+                Some((_, metadata)) => Ok(HeadObjectOutput::builder()
+                    .set_metadata(Some(metadata.clone()))
+                    .build()),
+                None => Err(aws_error(
+                    HeadObjectError::NotFound(NotFound::builder().build()),
+                    404,
+                )),
+            };
+            (result, storage.paused_head.take())
+        };
+        if let Some((started, release)) = pause {
+            let _ = started.send(());
+            let _ = release.recv();
         }
+        result
     });
 
     let f = fake.clone();
-    s3.expect_delete_object().returning(move |_, key, _| {
+    s3.expect_delete_object().returning(move |_, key, version| {
         if f.failing(Fault::ObjectDelete) {
             return Err(aws_error(
                 DeleteObjectError::generic(ErrorMetadata::builder().code("500").build()),
@@ -344,12 +442,16 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
             ));
         }
 
-        f.lock().objects.remove(key.as_bytes());
+        let mut storage = f.lock();
+        if !storage.faults.contains(&Fault::ObjectDeleteNoop) {
+            storage.objects.remove(key.as_bytes());
+        }
+        storage.deleted_version_ids.push(version);
         Ok(DeleteObjectOutput::builder().build())
     });
 
     let f = fake.clone();
-    s3.expect_list_versions().returning(move |_, _| {
+    s3.expect_list_versions().returning(move |_, key, _, _| {
         if f.failing(Fault::ObjectList) {
             return Err(aws_error(
                 ListObjectVersionsError::generic(ErrorMetadata::builder().code("500").build()),
@@ -357,6 +459,24 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
             ));
         }
 
+        let mut storage = f.lock();
+        if let Some(output) = storage.object_history_pages.pop_front() {
+            return Ok(output);
+        }
+        if storage.objects.contains_key(key.as_bytes())
+            && storage
+                .implicit_history_listed
+                .insert(key.as_bytes().to_vec())
+        {
+            return Ok(ListObjectVersionsOutput::builder()
+                .versions(
+                    ObjectVersion::builder()
+                        .key(key)
+                        .version_id("implicit-current")
+                        .build(),
+                )
+                .build());
+        }
         Ok(ListObjectVersionsOutput::builder().build())
     });
 
