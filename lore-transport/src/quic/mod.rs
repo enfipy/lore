@@ -16,6 +16,7 @@ use lore_error_set::prelude::*;
 use thiserror::Error;
 
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::storage_service::client::StorageClient;
 use crate::traits::Storage;
@@ -93,11 +94,10 @@ pub async fn storage(
     auth_url: &str,
     identity: &str,
     partition: Partition,
-    identity_token: &str,
-    access_token: &str,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
-        .internal(&format!("remote {remote_url} is invalid"))?;
+        .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let storage = StorageClient::connect(
         connection,
@@ -106,11 +106,10 @@ pub async fn storage(
         auth_url,
         identity,
         partition,
-        identity_token,
-        access_token,
+        credentials,
     )
     .await
-    .internal(&format!("connecting to {remote_url}"))?;
+    .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;
 
     Ok(Arc::new(storage))
 }

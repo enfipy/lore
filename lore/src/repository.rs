@@ -29,6 +29,7 @@ use lore_revision::repository::create::CreateOptions;
 use lore_revision::repository::status::StatusOptions;
 use lore_revision::revision;
 use lore_revision::util;
+use lore_revision::util::config::SaveableConfig;
 use lore_revision::util::path::RelativePath;
 use serde::Deserialize;
 use serde::Serialize;
@@ -879,12 +880,6 @@ async fn status_local(
     args: LoreRepositoryStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // Avoid store updates during status, which is effectively read only
-    // State fragments are still prioritized in local store, so prioritize
-    // less file system writes of store files over accuracy in eviction/compaction
-    let mut globals = globals;
-    globals.no_atime = 1;
-
     if args.scan != 0 || args.check_dirty != 0 || args.reset != 0 {
         // Scan and check_dirty persist refreshed dirty flags in the staged
         // state and reset drops the staged anchor; all require write capability
@@ -1411,11 +1406,14 @@ async fn config_get_local(
                     .require_path()?
                     .join(repository.format.dot_dir())
                     .join(lore_revision::repository::CONFIG);
-                let config_str = tokio::fs::read_to_string(&config_path)
+                let config_bytes = lore_io::IoDriver::global()
+                    .read_file_bytes(&config_path)
                     .await
                     .internal("Failed to load config file")?;
+                let config_str =
+                    str::from_utf8(&config_bytes).internal("Failed to load config file")?;
                 let config: lore_revision::repository::RepositoryConfig =
-                    toml::de::from_str(&config_str).internal("Failed to load config file")?;
+                    toml::de::from_str(config_str).internal("Failed to load config file")?;
                 let value = match key.as_str() {
                     "remote_url" => config.remote_url.unwrap_or_default(),
                     "identity" => config.identity.unwrap_or_default(),

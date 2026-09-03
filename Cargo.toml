@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 
 [workspace.dependencies]
 lore = { path = "lore" }
@@ -61,7 +61,7 @@ config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
-diffy = "0.4.2"
+diffy = "0.5.2"
 directories = "6.0.0"
 enum_dispatch = "0.3.13"
 tracing-appender = "0.2.3"
@@ -169,6 +169,15 @@ zerocopy = { version = "0.8.26", features = [
 
 # Note: we currently control debug symbol splitting in .cargo/config.toml
 
+# Unoptimized builds, and the `test` profile that inherits from this one. Every
+# test target links the whole workspace, so full DWARF is copied into each of
+# them: it dominates link time, the size of the target directory and the
+# linker's peak memory. Line tables keep file and line in a backtrace, which is
+# what a failing test reports, and drop the type and variable information a
+# debugger would use.
+[profile.dev]
+debug = "line-tables-only"
+
 # Fast build suitable for local development
 [profile.release]
 debug = "line-tables-only"
@@ -202,3 +211,6 @@ debug-assertions = false
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+# Fixes a `**` backtracking defect that made the filter silently under-exclude;
+# see vendor/glob-match/Cargo.toml.
+glob-match = { path = "vendor/glob-match" }

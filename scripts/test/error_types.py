@@ -115,6 +115,9 @@ class PathExistChildrenLinkError(LoreException): ...
 class NestedLinkError(LoreException): ...
 
 
+class NestedRepositoryError(LoreException): ...
+
+
 class PathExistLinkError(LoreException): ...
 
 
@@ -157,6 +160,12 @@ class BadSharedStoreRemoteUrl(LoreException): ...
 class MissingIdentityError(LoreException):
     """Raised when a commit-producing operation runs without a configured
     identity (no --identity arg, no config.toml identity, no cached auth)."""
+
+
+class NotAuthenticatedError(LoreException):
+    """Raised when an operation needs authentication the caller does not have,
+    e.g. a server-hitting command run against an auth-configured server with no
+    stored token (logged out)."""
 
 
 class NotSupportedError(LoreException):
@@ -208,6 +217,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Link path already has children", PathExistChildrenLinkError),
     ("Link path is already a link", PathExistLinkError),
     ("Nested link", NestedLinkError),
+    ("path is a nested repository", NestedRepositoryError),
     ("A shared store was supposed to exist at", MissingSharedStore),
     ("Invalid repository path", InvalidRepositoryPath),
     ("Loading the shared store for a repo with remote url", WrongSharedStoreRemote),
@@ -226,6 +236,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
     ("Operation not supported", NotSupportedError),
+    ("Not authenticated", NotAuthenticatedError),
 ]
 
 

@@ -56,7 +56,6 @@ mod store_keep_alive_tests {
             layer: Default::default(),
             layer_paths: Default::default(),
             layer_messages: Default::default(),
-            stats: Default::default(),
         }
     }
 
@@ -226,6 +225,7 @@ mod store_keep_alive_tests {
                 no_commit: 0,
                 link: Default::default(),
                 ignore_links: 0,
+                inherit_metadata: Default::default(),
             },
             None,
         )

@@ -18,6 +18,7 @@ use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::metadata::Metadata;
@@ -38,6 +39,12 @@ pub enum FindMatchResult {
     Abort,
 }
 
+/// Walk a branch's history from `revision` until `matcher` accepts a revision.
+///
+/// A zero `revision` starts from the branch latest, preferring the remote one so
+/// a search covers revisions the local store has not seen. An offline or
+/// local-only operation takes the local latest alone, since waiting on the
+/// connect is the whole cost such an operation asked to avoid.
 pub async fn find_revision<F>(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -51,7 +58,9 @@ where
 {
     let mut revision = revision;
     if revision.is_zero() {
-        if let Ok(remote) = repository.remote().await {
+        if !execution_context().globals().offline_or_local()
+            && let Ok(remote) = repository.remote().await
+        {
             revision = branch::load_remote_latest(remote, repository.id, branch)
                 .await
                 .unwrap_or_default();
@@ -84,13 +93,13 @@ where
 
         let state = State::deserialize(repository.clone(), revision)
             .await
-            .internal("deserializing state")?;
+            .forward_any::<FindError>("deserializing state")?;
 
         let metadata = if with_metadata {
             Some(
                 Metadata::deserialize(repository.clone(), state.metadata_hash())
                     .await
-                    .internal("deserializing metadata")?,
+                    .forward_any::<FindError>("deserializing metadata")?,
             )
         } else {
             None
@@ -228,12 +237,17 @@ pub async fn revision_by_number(
     .await
 }
 
-/// Find revision in any branch, or orphaned, by (partial) revision string
+/// Find revision in any branch, or orphaned, by (partial) revision string.
+///
+/// `search_remote` extends the search to the branches only the remote knows,
+/// which costs a connect. A caller resolving from local data alone passes
+/// `false` so a miss fails on local data rather than waiting for one.
 pub async fn revision_by_string(
     repository: Arc<RepositoryContext>,
     current_branch: BranchId,
     signature: &str,
     search_limit: Option<usize>,
+    search_remote: bool,
 ) -> Result<Hash, FindError> {
     if !current_branch.is_zero()
         && let Ok(revision) = crate::find::revision_by_string_in_branch(
@@ -264,7 +278,7 @@ pub async fn revision_by_string(
         }
     }
 
-    if let Ok(remote) = repository.remote().await {
+    if search_remote && let Ok(remote) = repository.remote().await {
         let list = branch::list_remote(remote, repository.id)
             .await
             .unwrap_or_default();
@@ -422,7 +436,7 @@ pub async fn find_impl(
 ) -> Result<(), FindError> {
     let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("deserializing current anchor")?;
+        .forward_any::<FindError>("deserializing current anchor")?;
 
     let result = match options {
         FindOptions::KeyValue { key, value } => {

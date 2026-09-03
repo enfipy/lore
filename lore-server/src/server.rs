@@ -47,6 +47,7 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::grpc::set_user_agent;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use opentelemetry::KeyValue;
@@ -93,6 +94,7 @@ use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::quic::replication_store_service::server::ReplicationStoreService;
 use crate::quic::storage_service::StorageService;
+use crate::quic::stream_handler::AdmissionLimits;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
@@ -123,6 +125,8 @@ mod store_mode {
     pub const REMOTE: &str = "remote";
     pub const COMPOSITE: &str = "composite";
     pub const REPLICATED: &str = "replicated";
+    /// Build no store. `[lock_store]` only.
+    pub const NONE: &str = "none";
 }
 
 /// Command-line options for the Lore server binary.
@@ -340,6 +344,14 @@ impl From<QuicSettings> for QuinnConfigBuilder {
     }
 }
 
+/// Requests a connection may hold in handling, defaulting to the capacity of its streams' pools.
+fn connection_inflight_limit(settings: &QuicSettings, process_limit: usize) -> usize {
+    settings.connection_inflight_limit.unwrap_or_else(|| {
+        let streams = settings.max_bidi_streams.unwrap_or(STREAM_COUNT as u64);
+        process_limit.saturating_mul(streams as usize)
+    })
+}
+
 async fn launch_quinn_server(
     name: &'static str,
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
@@ -442,11 +454,13 @@ async fn launch_grpc_server(
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
+    let locks = lock_store.is_some() && service_settings.lock_service.enabled;
+
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
         jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
-        lock_store.as_ref().map_or("disabled", |_| "enabled"),
+        if locks { "enabled" } else { "disabled" },
     );
 
     // The settings map has no relevant entries to surface yet, so it stays empty.
@@ -723,8 +737,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -743,8 +756,7 @@ impl QuicPublicStreamHandler {
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
                         context,
-                        process_limit,
-                        handler_duration_timeout,
+                        limits,
                     )) as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder
             };
@@ -772,12 +784,8 @@ impl QuicPublicStreamHandler {
                         local_store.clone(),
                         mutable_store.clone(),
                     );
-                    Box::new(StreamHandler::new(
-                        Arc::new(v4_service),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
+                    Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
+                        as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder,
             );
         }
@@ -810,8 +818,7 @@ impl QuicInternalStreamHandler {
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
         {
@@ -820,12 +827,7 @@ impl QuicInternalStreamHandler {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let protocol =
                         ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
-                    Box::new(StreamHandler::new(
-                        Arc::new(protocol),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    ))
+                    Box::new(StreamHandler::new(Arc::new(protocol), context, limits))
                 }),
             );
         }
@@ -960,6 +962,12 @@ fn configure_lock_store_via_plugin(
 ) -> Result<Option<Arc<dyn LockStore>>> {
     if let Some(lock_settings) = &settings.lock_store {
         let mode = &lock_settings.mode;
+
+        // The only way to opt out of a store `default.toml` sets.
+        if mode == store_mode::NONE {
+            info!("No lock store configured, LockService will not register");
+            return Ok(None);
+        }
 
         if mode == store_mode::LOCAL {
             info!("Creating local (in-memory) lock store");
@@ -1108,7 +1116,6 @@ async fn create_local_store(
         options,
         true,  /* Server mode, deserialize all buckets immediately */
         lore_storage::local::immutable_store::ImmutableStoreSettings {
-            allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */
@@ -1118,7 +1125,7 @@ async fn create_local_store(
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         },
@@ -1819,15 +1826,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         None => None,
     };
 
-    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
-        &settings.server.grpc_public_services
-        && let Some(forwarded_requests_settings) = &grpc_public_services.forwarded_requests
-    {
-        let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
-        Some(Arc::new(factory))
-    } else {
-        None
-    };
+    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
+        if let Some(forwarded_requests_settings) =
+            &settings.server.grpc_public_services.forwarded_requests
+        {
+            let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
+            Some(Arc::new(factory))
+        } else {
+            None
+        };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
@@ -1978,9 +1985,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 .handler_timeout_seconds
                 .map(Duration::from_secs);
 
-            /// With 8 streams per connection this amounts to 4000 commands
-            /// being processed in parallel per connection
-            const DEFAULT_PROCESS_LIMIT: usize = 500;
+            /// With the 8 streams a connection opens this amounts to 4000 commands being
+            /// processed in parallel per connection.
+            const DEFAULT_STREAM_MESSAGE_LIMIT: usize = 500;
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(DEFAULT_STREAM_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
                 warn!("No local store available for public QUIC server, operations requiring local store will route to the main store");
@@ -1999,10 +2015,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(DEFAULT_PROCESS_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,
@@ -2059,15 +2072,22 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 immutable_store.clone()
             });
 
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
+
             launch_quinn_server(
                 "internal",
                 Box::new(QuicInternalStreamHandler::new(
                     immutable_store,
                     local_immutable_store,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,

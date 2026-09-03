@@ -40,6 +40,7 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
+use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinHandle;
@@ -241,8 +242,8 @@ impl StoreConfig {
 ///
 /// Incremental GC is the default on write operations (`!read_only`). It is
 /// suppressed by `--no-gc` and on dry-run commands (`suppress_incremental`, which
-/// the caller folds together), since a dry run persists nothing and its background
-/// tasks would otherwise race the dry run's own teardown. Read-only opens never
+/// the caller folds together), since a dry run adds no content to collect and its
+/// background tasks would otherwise race its own teardown. Read-only opens never
 /// spawn it. When enabled but the repository has no `[store]` config, the built-in
 /// [`StoreConfig::client_default`] caps apply.
 fn incremental_gc_options(
@@ -575,6 +576,20 @@ pub struct RepositoryContext {
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// The storage session pool this repository's reads and writes pick from,
+    /// resolved on first use.
+    ///
+    /// Weak on purpose. The strong reference lives in the connection's session
+    /// cache, and `StorageSession::invalidate` clears that cache when the server
+    /// reports a stale session id — after a reconnect that rotated its session
+    /// map, say. An invalidated pool then stops upgrading here, so the next caller
+    /// resolves a fresh one rather than handing out sessions the server has
+    /// forgotten.
+    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
+    /// The lazy storage session this context's reads and writes carry, built on first
+    /// use. Held strongly: a pending session re-resolves after invalidation, so one
+    /// serves every operation against this context's partition for its lifetime.
+    lazy_session: parking_lot::RwLock<Option<Arc<lore_transport::StorageSession>>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -655,6 +670,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system,
         }
     }
@@ -756,9 +773,6 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    // Let the store compaction run one step
-                    immutable_store.clone().compact_stop().await;
-
                     let _ = immutable_store.flush(sync_data).await;
                     if let Some(mutable_store) = mutable_store {
                         let _ = mutable_store.flush(sync_data).await;
@@ -876,6 +890,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
@@ -895,6 +911,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -919,6 +937,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
@@ -938,6 +958,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -971,6 +993,8 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -998,6 +1022,8 @@ impl RepositoryContext {
             is_layer: false,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1025,6 +1051,8 @@ impl RepositoryContext {
             is_layer: true,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1045,6 +1073,8 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: None,
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1120,6 +1150,72 @@ impl RepositoryContext {
             };
         }
         result
+    }
+
+    /// The storage session pool for this repository, resolved once and reused for
+    /// as long as it lives.
+    ///
+    /// `correlation_id` is only read when the pool has to be resolved. It belongs
+    /// to the command being executed and a context belongs to one command, so a
+    /// cached pool is always the one this context's correlation id asked for.
+    pub(crate) async fn session_pool(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
+        if let Some(pool) = self.cached_session_pool() {
+            return Ok(pool);
+        }
+        let remote = self.remote().await?;
+        let pool = remote.session_pool(self.id, correlation_id).await?;
+        *self.session_pool.write() = Arc::downgrade(&pool);
+        Ok(pool)
+    }
+
+    /// The lazy storage session for this context, built once and shared. Partition-scoped,
+    /// so a derived context for a link or a layer resolves its own rather than borrowing one
+    /// started for another partition.
+    pub(crate) fn lazy_session(
+        &self,
+        build: impl FnOnce() -> Arc<lore_transport::StorageSession>,
+    ) -> Arc<lore_transport::StorageSession> {
+        if let Some(session) = self.lazy_session.read().as_ref() {
+            return session.clone();
+        }
+        self.lazy_session.write().get_or_insert_with(build).clone()
+    }
+
+    /// The session pool if one is already resolved and still live, without
+    /// touching the remote. `None` means "resolve it", not "there is none".
+    ///
+    /// Private so the pool is only ever reached through [`Self::session_pool`]. A
+    /// caller handed the pool directly would pick from it eagerly, and an eager
+    /// session cannot be invalidated and retried — see [`crate::immutable`]'s
+    /// session resolution.
+    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+        self.session_pool.read().upgrade()
+    }
+
+    /// Hold `pool` as resolved, standing in for a resolution against a live remote.
+    /// The caller keeps the strong reference, as the connection's session cache
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn set_session_pool(&self, pool: &Arc<SessionPool>) {
+        *self.session_pool.write() = Arc::downgrade(pool);
+    }
+
+    /// Whether this context is known to hold no remote, answered without waiting
+    /// on the state lock or driving a pending connect.
+    ///
+    /// [`RemoteState::Offline`] is terminal, so a `true` answer stands for the life
+    /// of the context and a caller can skip building a storage session outright.
+    /// Everything else answers `false`, a state lock held elsewhere included: that
+    /// costs only the session the caller would have built anyway. A failed connect
+    /// is not offline — a session built on one reports the failure, which is the
+    /// answer that belongs to it.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.remote
+            .try_read()
+            .is_ok_and(|state| matches!(&*state, RemoteState::Offline))
     }
 
     /// Snapshot of the remote state. Awaits the state lock (cheap — only contended
@@ -1329,16 +1425,17 @@ pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), Repositor
 /// remote URL, so defaulting past a read failure presents a repository that merely could not be
 /// opened as one with no remote, and the next save writes that back.
 fn load_config(config_path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    Ok(util::config::load_blocking(config_path).internal("Failed to load config file")?)
+    util::config::load_blocking(config_path)
+        .forward::<RepositoryError>("Failed to load config file")
 }
 
 async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    Ok(util::config::save(config, config_path)
+    util::config::save(config, config_path)
         .await
-        .internal("Failed to save config file")?)
+        .forward::<RepositoryError>("Failed to save config file")
 }
 
 pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
@@ -1500,6 +1597,27 @@ pub fn cache_in_memory_stores(
         .insert(path, mutable);
 }
 
+/// Stop garbage collection for good on every store still live in the caches, so a pass in
+/// flight gives up at its next packfile rather than holding shutdown open until it has
+/// rewritten the rest of the group, and none follows it. For shutdown, where no further
+/// call will be made; a caller that will use the store again wants
+/// [`lore_storage::ImmutableStore::stop_gc`] without `terminate`.
+pub async fn stop_store_gc() {
+    // Collected before awaiting: a `DashMap` guard held across an await blocks every other
+    // reader of the cache.
+    let mut stores: Vec<Arc<dyn ImmutableStore>> = Vec::new();
+    if let Some(cache) = IMMUTABLE_STORE_CACHE.get() {
+        stores.extend(cache.iter().filter_map(|entry| entry.value().upgrade()));
+    }
+    if let Some(cache) = IN_MEMORY_IMMUTABLE_CACHE.get() {
+        stores.extend(cache.iter().map(|entry| entry.value().clone()));
+    }
+
+    // Driven together so every store is asked to stop on the first poll, rather than each
+    // waiting out the one before it.
+    futures::future::join_all(stores.into_iter().map(|store| store.stop_gc(true))).await;
+}
+
 /// Release all cached store references for the given repository path.
 /// Any active `RepositoryContext` instances for this path remain valid
 /// (they hold their own `Arc` to the stores), but once they are dropped
@@ -1597,11 +1715,22 @@ pub async fn create_client_immutable_store(
     create_options: ImmutableStoreCreateOptions,
     verify_write: bool,
 ) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
-    let path = get_shared_store_path_for_repo(config)
-        .await
-        .forward::<RepositoryError>("Failed to access shared store")?
-        .unwrap_or_else(|| dotpath.as_ref().to_owned());
+    create_immutable_store_at_path(
+        get_shared_store_path_for_repo(config)
+            .await
+            .forward::<RepositoryError>("Failed to access shared store")?
+            .unwrap_or_else(|| dotpath.as_ref().to_owned()),
+        create_options,
+        verify_write,
+    )
+    .await
+}
 
+pub async fn create_immutable_store_at_path(
+    path: PathBuf,
+    create_options: ImmutableStoreCreateOptions,
+    verify_write: bool,
+) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_immutable_store(&path) {
         lore_debug!("Reusing cached immutable store");
@@ -1638,7 +1767,6 @@ pub async fn create_client_immutable_store(
         create_options,
         false, /* Don't deserialize all buckets on load */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write,
             ..Default::default()
@@ -1683,6 +1811,13 @@ pub async fn create_client_mutable_store(
         dotpath
     };
 
+    create_mutable_store_at_path(path, immutable_store).await
+}
+
+pub async fn create_mutable_store_at_path(
+    path: PathBuf,
+    immutable_store: Arc<dyn ImmutableStore>,
+) -> Result<Arc<crate::store::mutable::MutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_mutable_store(&path) {
         lore_debug!("Reusing cached mutable store");
@@ -1733,7 +1868,6 @@ pub async fn create_client_memory_stores()
         ImmutableStoreCreateOptions::none(),
         false, /* Client does not deserialize all buckets on startup */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             ..Default::default()
         },
@@ -1775,9 +1909,9 @@ fn connect(
     let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-        // Pre-warm session so it's ready when the command runs
+        // Pre-warm the session pool so it's ready when the command runs
         if !repository.is_zero() {
-            let _ = connection.session(repository, &correlation_id).await;
+            let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
     });
@@ -2220,6 +2354,16 @@ pub async fn load_and_connect_with_token(
 pub const MAX_NAME_LEN: usize = 1000;
 pub const MAX_DESCRIPTION_LEN: usize = 65536;
 
+/// A name is a `/`-separated path of segments, each holding only ASCII
+/// alphanumerics, `-`, `_` and `.`.
+///
+/// Empty and dot-leading segments are rejected because names round-trip through
+/// URLs (see [`parse_url`]), and URL parsing rewrites them: `host/.` and
+/// `host/..` lose the name entirely, `host/org/../other` silently resolves to
+/// `other`, and a trailing `/` is trimmed. The server stores such names fine, so
+/// without this they produce repositories no client can address, or names that
+/// resolve to a different repository than the one written. Dot-leading segments
+/// also carry filesystem meaning for tooling that maps a name onto a directory.
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
@@ -2228,6 +2372,9 @@ pub fn is_valid_name(name: &str) -> bool {
                 !c.is_ascii_alphanumeric() && (c != '/') && (c != '-') && (c != '_') && (c != '.')
             })
             .is_none()
+        && name
+            .split('/')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
 pub async fn create_local(
@@ -3597,6 +3744,104 @@ mod remote_state_tests {
         ))
     }
 
+    /// Nothing is cached until something resolves it, so the first reader or
+    /// writer drives the connect and a command that does neither remotely never
+    /// does.
+    #[tokio::test]
+    async fn a_fresh_context_has_no_session_pool_to_reuse() {
+        for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
+            let context = context_with_state(state).await;
+            assert!(
+                context.cached_session_pool().is_none(),
+                "a context that has resolved nothing reported a pool"
+            );
+        }
+    }
+
+    /// Asking an offline context for a pool must not invent one, and must not
+    /// leave anything cached for the next caller to find.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session_pool() {
+        let context = context_with_state(RemoteState::Offline).await;
+        assert!(context.session_pool("correlation").await.is_err());
+        assert!(context.cached_session_pool().is_none());
+    }
+
+    /// A pool for a context to hold, the strong reference left to the caller as the
+    /// connection's session cache holds it. The session in it is never resolved:
+    /// these tests ask which pool answered, not what it yields.
+    fn held_pool() -> Arc<lore_transport::SessionPool> {
+        let session = Arc::new(lore_transport::StorageSession::pending(|| async {
+            Err(ProtocolError::internal("a pooled session no test resolves"))
+        }));
+        Arc::new(lore_transport::SessionPool::new(vec![session]))
+    }
+
+    /// A pool once resolved is handed back without consulting the remote. This
+    /// context's connect has failed, so an answer at all is proof the pool was
+    /// reused rather than looked up again per call.
+    #[tokio::test]
+    async fn a_resolved_pool_is_reused_without_touching_the_remote() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+
+        let reused = context
+            .session_pool("correlation")
+            .await
+            .expect("a context holding a pool answers from it");
+        assert!(Arc::ptr_eq(&reused, &pool));
+    }
+
+    /// The pool is held weakly, so dropping the pin — which is what
+    /// `StorageSession::invalidate` does to the connection's cache — sends the next
+    /// caller back to the remote rather than handing out sessions the server has
+    /// forgotten.
+    #[tokio::test]
+    async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+        assert!(context.session_pool("correlation").await.is_ok());
+
+        drop(pool);
+        assert!(
+            context.session_pool("correlation").await.is_err(),
+            "an expired pool must send the caller back to the remote"
+        );
+    }
+
+    /// Only the terminal no-remote state answers yes. A failure and a connect
+    /// still in flight both have an answer a session carries, so a caller has to
+    /// build one.
+    #[tokio::test]
+    async fn only_a_context_without_a_remote_is_offline() {
+        assert!(
+            context_with_state(RemoteState::Offline).await.is_offline(),
+            "a context with no remote configured is offline"
+        );
+        for state in [
+            RemoteState::Failed(disconnected()),
+            RemoteState::Pending(ready_remote(Err(no_remote()))),
+        ] {
+            assert!(
+                !context_with_state(state).await.is_offline(),
+                "a context that has not settled on `Offline` reported itself offline"
+            );
+        }
+    }
+
+    /// The answer is taken without waiting, so a state lock held elsewhere reads
+    /// as not offline rather than blocking a caller that only wanted to skip work.
+    #[tokio::test]
+    async fn a_held_state_lock_does_not_answer_offline() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let guard = context.remote.write().await;
+        assert!(!context.is_offline());
+        drop(guard);
+        assert!(context.is_offline());
+    }
+
     #[tokio::test]
     async fn from_result_classifies_no_remote_as_offline() {
         let state = RemoteState::from_result(Err(no_remote()));
@@ -3843,5 +4088,91 @@ mod path_optional_tests {
             .require_path()
             .expect("path-bearing context should return path");
         assert_eq!(got, path.as_path());
+    }
+}
+
+#[cfg(test)]
+mod name_validation_tests {
+    //! Coverage for [`is_valid_name`], in particular the segment rules that keep
+    //! a name stable through the URL parsing in [`parse_url`].
+    use super::MAX_NAME_LEN;
+    use super::is_valid_name;
+    use super::parse_url;
+
+    #[test]
+    fn accepts_names_with_dots_inside_segments() {
+        for name in ["my-repo", "org/my-repo", "my.repo", "org/v1.2/repo_a"] {
+            assert!(is_valid_name(name), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments() {
+        for name in [".", "..", "./repo", "org/../other", "org/repo/..", "../.."] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_leading_segments() {
+        // Not just the traversal-like `.` and `..`: any leading dot is rejected.
+        for name in [
+            "...",
+            ".hidden",
+            ".lore",
+            "org/...",
+            "org/.git",
+            "org/.git/repo",
+        ] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_segments() {
+        for name in ["", "/", "//", "/repo", "repo/", "repo//", "org//repo"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_disallowed_characters_and_oversized_names() {
+        for name in ["repo name", "org\\repo", "repo!", "org/repö"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+        assert!(is_valid_name(&"a".repeat(MAX_NAME_LEN)));
+        assert!(!is_valid_name(&"a".repeat(MAX_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn every_valid_name_survives_url_parsing() {
+        // The point of the segment rules: a valid name is returned unchanged by
+        // `parse_url`, so the repository a client asks for is the one it created.
+        for name in ["repo", "org/repo", "org/v1.2/repo_a", "org/a.b.c/d-e"] {
+            let (_remote_url, parsed) = parse_url(&format!("lores://host/{name}"), false)
+                .unwrap_or_else(|err| panic!("{name} should parse: {err}"));
+            assert_eq!(parsed, name);
+        }
+    }
+
+    #[test]
+    fn rejected_names_are_the_ones_url_parsing_rewrites() {
+        // Each of these either loses the name or resolves to a different one.
+        // Tested because the parse_url logic dictates what kind of names we can allow.
+        // If parse_url changes, the is_valid_name logic needs to be re-evaluated.
+        for (url_name, parsed_as) in [
+            (".", ""),
+            ("..", ""),
+            ("org/../other", "other"),
+            ("./repo", "repo"),
+            ("repo/", "repo"),
+            ("/repo/test//", "repo/test"),
+        ] {
+            assert!(!is_valid_name(url_name), "{url_name} should be rejected");
+            let parsed = parse_url(&format!("lores://host/{url_name}"), false)
+                .map(|(_remote_url, name)| name)
+                .unwrap_or_default();
+            assert_eq!(parsed, parsed_as, "for {url_name}");
+        }
     }
 }

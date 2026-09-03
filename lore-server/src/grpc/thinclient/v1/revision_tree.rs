@@ -52,6 +52,8 @@ pub async fn handler(
     request: Request<RevisionTreeRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionTreeStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -84,7 +86,9 @@ pub async fn handler(
         .scope(execution, async move {
             // Resolve up-front so the unary part of the call can surface
             // NotFound / Internal before the stream opens.
-            let (signature, identifier) = resolve_to_identifier(&repository, query.into()).await?;
+            let (signature, identifier) =
+                resolve_to_identifier(&repository, query.into(), history_step_size, acceleration)
+                    .await?;
 
             if signature.is_zero() {
                 return Err(Status::invalid_argument(
@@ -163,6 +167,7 @@ async fn stream_tree(
             }),
             size: tree_path.size,
             mode: tree_path.mode,
+            tracking: tree_path.tracking,
         };
         if tx
             .send(Ok(RevisionTreeResponse {
@@ -186,6 +191,7 @@ mod test {
     use lore_proto::lore::thin_client::v1::revision_tree_request::Query;
     use lore_revision::branch;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::link::LinkFlags;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
@@ -202,6 +208,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(
@@ -256,7 +263,7 @@ mod test {
                 .await
                 .expect("serialize metadata");
 
-            let state = state::State::new();
+            let state = Arc::new(state::State::new());
             state.set_parent_self(parent);
             state.set_revision_number((idx + 1) as u64);
             state.set_metadata_hash(metadata_hash);
@@ -321,7 +328,7 @@ mod test {
             .await
             .expect("serialize metadata");
 
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(Hash::default());
         state.set_revision_number(1);
         state.set_metadata_hash(metadata_hash);
@@ -391,12 +398,16 @@ mod test {
         (branch_id, signatures[0])
     }
 
+    /// `link_branch` registers a link reference for the mount node: zero for a
+    /// link following its parent's branch, an explicit id for a pinned one.
+    /// `None` leaves the reference unregistered, as an unresolvable link.
     async fn push_branch_with_link(
         repository: &Arc<RepositoryContext>,
         link_name: &str,
         target_repo: RepositoryId,
         target_revision: Hash,
         target_node: lore_revision::node::NodeID,
+        link_branch: Option<BranchId>,
     ) -> (BranchId, Hash) {
         use lore_base::types::Address;
 
@@ -424,7 +435,7 @@ mod test {
             .await
             .expect("serialize metadata");
 
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(Hash::default());
         state.set_revision_number(1);
         state.set_metadata_hash(metadata_hash);
@@ -439,10 +450,24 @@ mod test {
             name_hash: hash_string(link_name),
             ..Default::default()
         };
-        state
+        let link_node_id = state
             .node_add(repository.clone(), ROOT_NODE, link_node, link_name)
             .await
             .expect("node_add link");
+
+        if let Some(link_branch) = link_branch {
+            state
+                .link_add(
+                    repository.clone(),
+                    target_repo,
+                    link_branch,
+                    target_revision,
+                    link_node_id,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("link_add reference");
+        }
 
         let serialized = state
             .serialize(repository.clone(), &write_token)
@@ -486,7 +511,15 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let err = match handler(request, immutable_store, mutable_store).await {
+            let err = match handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            {
                 Ok(_) => panic!("unset query should fail"),
                 Err(err) => err,
             };
@@ -514,6 +547,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -582,6 +617,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -619,6 +656,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -646,6 +685,8 @@ mod test {
                 make_request(repository, Query::Signature(bogus.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -673,6 +714,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -710,6 +753,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("unary part succeeds");
@@ -749,6 +794,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("unary part succeeds");
@@ -798,6 +845,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -841,6 +890,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -894,6 +945,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -947,6 +1000,7 @@ mod test {
                 target_repo,
                 target_revision,
                 ROOT_NODE,
+                None,
             )
             .await;
 
@@ -954,6 +1008,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1023,6 +1079,7 @@ mod test {
                 linked,
                 linked_signature,
                 ROOT_NODE,
+                None,
             )
             .await;
 
@@ -1030,6 +1087,8 @@ mod test {
                 make_request(originating, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1066,6 +1125,107 @@ mod test {
             let child = &nodes[1];
             assert_eq!(child.path, "linked/inner.txt");
             assert_eq!(child.node_type, thin_client_v1::NodeType::File as i32);
+        }))
+        .await;
+    }
+
+    /// Push a revision holding a single link node whose reference is registered
+    /// on `link_branch`, then return the `TreeNode` emitted for the mount path.
+    /// The link target is never pushed, so the walk stops at the mount.
+    async fn link_tree_node(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository: RepositoryId,
+        link_branch: BranchId,
+    ) -> thin_client_v1::TreeNode {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (_branch, signature) = push_branch_with_link(
+            &repository_context,
+            "linked",
+            random::<RepositoryId>(),
+            Hash::from(random::<[u8; 32]>()),
+            ROOT_NODE,
+            Some(link_branch),
+        )
+        .await;
+
+        let response = handler(
+            make_request(repository, Query::Signature(signature.into()), None, None),
+            immutable_store,
+            mutable_store,
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("handler ok");
+
+        let mut nodes: Vec<thin_client_v1::TreeNode> = collect(response)
+            .await
+            .into_iter()
+            .map(|item| item.expect("stream item"))
+            .filter_map(|item| match item.payload {
+                Some(Payload::Node(node)) => Some(node),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            nodes.len(),
+            1,
+            "expected exactly the link entry, got {nodes:?}"
+        );
+        let link_node = nodes.pop().expect("one node");
+        assert_eq!(link_node.path, "linked");
+        assert_eq!(link_node.node_type, thin_client_v1::NodeType::Link as i32);
+        link_node
+    }
+
+    /// A zero-branch link reports `tracking = true`.
+    #[tokio::test]
+    async fn tree_marks_zero_branch_link_as_tracking() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let link_node = link_tree_node(
+                immutable_store,
+                mutable_store,
+                repository,
+                BranchId::default(),
+            )
+            .await;
+            assert!(
+                link_node.tracking,
+                "a zero-branch link must be reported as tracking",
+            );
+        }))
+        .await;
+    }
+
+    /// A link pinned to an explicit branch reports `tracking = false`.
+    #[tokio::test]
+    async fn tree_marks_pinned_link_as_not_tracking() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let link_node = link_tree_node(
+                immutable_store,
+                mutable_store,
+                repository,
+                BranchId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            assert!(
+                !link_node.tracking,
+                "a pinned (non-zero branch) link must not be reported as tracking",
+            );
         }))
         .await;
     }
@@ -1121,6 +1281,7 @@ mod test {
                 linked,
                 linked_signature,
                 ROOT_NODE,
+                None,
             )
             .await;
 
@@ -1130,9 +1291,15 @@ mod test {
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
 
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("handler ok");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("handler ok");
 
             let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
                 .await
@@ -1181,7 +1348,7 @@ mod test {
                 b,
             ));
             let (_branch_b, b_sig) =
-                push_branch_with_link(&b_context, "link_to_c", c, c_sig, ROOT_NODE).await;
+                push_branch_with_link(&b_context, "link_to_c", c, c_sig, ROOT_NODE, None).await;
 
             // A's revision: one link to B.
             let a_context = Arc::new(RepositoryContext::new_server_context(
@@ -1190,12 +1357,14 @@ mod test {
                 a,
             ));
             let (_branch_a, a_sig) =
-                push_branch_with_link(&a_context, "link_to_b", b, b_sig, ROOT_NODE).await;
+                push_branch_with_link(&a_context, "link_to_b", b, b_sig, ROOT_NODE, None).await;
 
             let response = handler(
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1287,7 +1456,7 @@ mod test {
                 .await
                 .expect("serialize metadata");
 
-            let state = state::State::new();
+            let state = Arc::new(state::State::new());
             state.set_parent_self(Hash::default());
             state.set_revision_number(1);
             state.set_metadata_hash(metadata_hash);
@@ -1331,6 +1500,8 @@ mod test {
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1395,6 +1566,7 @@ mod test {
                 linked,
                 linked_signature,
                 ROOT_NODE,
+                None,
             )
             .await;
 
@@ -1408,9 +1580,15 @@ mod test {
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
 
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("unary part succeeds");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("unary part succeeds");
 
             let items: Vec<_> = collect(response).await;
             // Header is emitted before the error.

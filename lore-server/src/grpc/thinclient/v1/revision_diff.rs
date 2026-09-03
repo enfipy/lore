@@ -15,8 +15,6 @@ use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
-use lore_revision::change::FileAction;
-use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
 use lore_revision::link;
 use lore_revision::lore::BranchId;
@@ -115,6 +113,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     config: RevisionDiffConfig,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -144,8 +144,20 @@ pub async fn handler(
         .scope(execution, async move {
             // Resolve both sides up-front so unary errors surface before
             // the stream opens.
-            let (from_sig, from_id) = resolve_to_identifier(&repository, query_from.into()).await?;
-            let (to_sig, to_id) = resolve_to_identifier(&repository, query_to.into()).await?;
+            let (from_sig, from_id) = resolve_to_identifier(
+                &repository,
+                query_from.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
+            let (to_sig, to_id) = resolve_to_identifier(
+                &repository,
+                query_to.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -383,14 +395,14 @@ async fn run_two_way(
             warn_error_to_status(&err, |e| Status::internal(e.to_string()))
         })?;
         let index = match partitions
-            .resolve_or_announce(surviving_repository_id(&change), tx)
+            .resolve_or_announce(change.content_repository_id(), tx)
             .await
         {
             Ok(index) => index,
             Err(SendOutcome::ReceiverDropped) => return Ok(()),
             Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
         };
-        let payload = Payload::Change(node_change_to_diff_change(&change, index));
+        let payload = Payload::Change(node_change_to_diff_change(&change, index).await);
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
             SendOutcome::ReceiverDropped => return Ok(()),
@@ -526,7 +538,7 @@ async fn run_three_way(
         let payload = match item {
             DiffItem::Change(change) => {
                 let index = match partitions
-                    .resolve_or_announce(surviving_repository_id(&change), tx)
+                    .resolve_or_announce(change.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -535,11 +547,11 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Change(node_change_to_diff_change(&change, index))
+                Payload::Change(node_change_to_diff_change(&change, index).await)
             }
             DiffItem::Conflict(pair) => {
                 let index_from = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.0), tx)
+                    .resolve_or_announce(pair.0.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -549,7 +561,7 @@ async fn run_three_way(
                     }
                 };
                 let index_to = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.1), tx)
+                    .resolve_or_announce(pair.1.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -558,7 +570,7 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to))
+                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
             }
         };
         match send_payload(tx, payload).await {
@@ -740,19 +752,8 @@ impl PartitionTable {
     }
 }
 
-/// Repository of the side that survives the change: `from` for a
-/// delete, `to` otherwise. This is the partition its content lives in.
-fn surviving_repository_id(change: &NodeChange) -> RepositoryId {
-    match change.action {
-        FileAction::Delete => change.from.repository.id,
-        _ => change.to.repository.id,
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
-
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchPoint;
     use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom;
@@ -773,6 +774,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(
@@ -812,7 +814,7 @@ mod test {
             .serialize(repository.clone())
             .await
             .expect("serialize metadata");
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
         state.set_metadata_hash(metadata_hash);
@@ -910,6 +912,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -953,6 +957,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1015,6 +1021,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1108,6 +1116,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1202,6 +1212,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1260,6 +1272,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1306,6 +1320,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1376,6 +1392,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1432,6 +1450,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1491,6 +1511,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1587,6 +1609,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1738,65 +1762,6 @@ mod test {
         assert!(
             !table.entries.contains_key(&linked),
             "failed announcement must not poison the table",
-        );
-    }
-
-    #[tokio::test]
-    async fn surviving_repository_id_picks_from_for_delete_to_otherwise() {
-        // Construct two contexts with distinct ids; place `from` and `to`
-        // in different repositories and verify the helper picks the
-        // correct side based on FileAction.
-        let parent_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
-        let parent_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store.clone(),
-            mutable_store.clone(),
-            parent_id,
-        ));
-        let linked_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            linked_id,
-        ));
-        let state = Arc::new(state::State::new());
-        let address = lore_storage::Address::default();
-
-        let make = |action: lore_revision::change::FileAction| NodeChange {
-            action,
-            path: lore_revision::util::path::RelativePath::from_str("p").unwrap(),
-            from_path: None,
-            flags: lore_revision::change::Flags::None,
-            from: lore_revision::change::NodeChangeState {
-                node: 1,
-                repository: linked_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-            to: lore_revision::change::NodeChangeState {
-                node: 2,
-                repository: parent_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-        };
-
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Delete)),
-            linked_id,
-            "Delete surfaces the from side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Add)),
-            parent_id,
-            "Add surfaces the to side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Keep)),
-            parent_id,
-            "Keep surfaces the to side",
         );
     }
 }

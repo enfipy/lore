@@ -164,6 +164,125 @@ pub fn generate_tempdir() -> TempDir {
     TempDir::new("lore-stage-test-")
 }
 
+/// A repository on its own temporary directory, with its anchor branch stored
+/// and its write token held.
+///
+/// The directory is removed when this is dropped, so it has to outlive every use
+/// of `repository`.
+#[allow(dead_code)]
+pub struct TestRepository {
+    pub repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    pub write_token: lore_revision::repository::RepositoryWriteToken,
+    pub path: std::path::PathBuf,
+    _tempdir: TempDir,
+}
+
+/// Creates a repository backed by `immutable_store` and `mutable_store` in a
+/// fresh temporary directory, on a generated default branch.
+///
+/// Call from inside a `LORE_CONTEXT` scope; repository creation reads the
+/// execution context.
+#[allow(dead_code)]
+pub async fn test_repository_create(
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    repository_id: lore_revision::lore::RepositoryId,
+) -> TestRepository {
+    let tempdir = generate_tempdir();
+    let path = tempdir.to_path_buf();
+    let default_branch_id = lore_base::types::Context::from(uuid::Uuid::now_v7());
+    let write_token =
+        lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+    let created = lore_revision::repository::create_local(
+        path.as_path(),
+        &write_token,
+        repository_id,
+        default_branch_id,
+        lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+        lore_revision::repository::RepositoryConfig::default(),
+        false,
+    )
+    .await
+    .expect("Failed to initialize repository");
+
+    let repository = std::sync::Arc::new(
+        lore_revision::repository::RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_path(&path)
+                .with_id(repository_id)
+                .with_instance_id(created.instance_id),
+        )
+        .with_write_token(write_token.share()),
+    );
+
+    lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+        .await
+        .expect("Failed to store anchor branch");
+
+    TestRepository {
+        repository,
+        write_token,
+        path,
+        _tempdir: tempdir,
+    }
+}
+
+/// Creates (or truncates) the file at `path` and writes `contents` to it.
+///
+/// Panics on failure, since a fixture the test cannot write invalidates what it
+/// would go on to assert.
+#[allow(dead_code)]
+pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::write(path, contents)
+        .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
+}
+
+/// Reconciles the working tree against `state_staged`, mutating it in place as
+/// `lore status --scan` does, and returns the changes detected.
+#[allow(dead_code)]
+pub async fn test_scan(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+) -> Vec<lore_revision::change::NodeChange> {
+    let (changes, _stats) = lore_revision::state::diff_filesystem_ex(
+        repository.clone(),
+        state_staged,
+        repository,
+        state_current,
+        None, /* full tree */
+        lore_revision::filter::FilterMode::Full,
+        true, /* scan_dirty */
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+    .expect("Failed to diff filesystem");
+    changes
+}
+
+/// The anchor revision's state, deserialized twice: once as the current
+/// revision and once as the staged state a scan reconciles in place.
+#[allow(dead_code)]
+pub async fn test_anchor_states(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> (
+    std::sync::Arc<lore_revision::state::State>,
+    std::sync::Arc<lore_revision::state::State>,
+) {
+    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+        .await
+        .expect("Failed to load current anchor");
+    let current = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize current state");
+    let staged = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize staged state");
+    (current, staged)
+}
+
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     std::sync::Arc::new(
         lore_revision::interface::ExecutionContext::new_client_with_user_id(

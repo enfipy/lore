@@ -183,23 +183,33 @@ pub struct LoreBranchDiffNodeData {
     /// Set when the change was merged automatically.
     #[serde(with = "u8_as_bool")]
     pub automerged: u8,
+    /// Previous path of the node when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreBranchDiffNodeData {
     fn new(node_change: &NodeChange) -> Self {
-        let is_directory_or_module = if node_change.action == FileAction::Delete {
+        let is_directory_or_link = if node_change.action == FileAction::Delete {
             !node_change.from.flags.contains(NodeFlags::File)
         } else {
             !node_change.to.flags.contains(NodeFlags::File)
         };
+        let display_path = |path: &str| -> LoreString {
+            if is_directory_or_link {
+                format!("{path}/").into()
+            } else {
+                path.into()
+            }
+        };
         Self {
             action: LoreFileAction::from(node_change.action),
-            path: if is_directory_or_module {
-                format!("{}/", node_change.path.as_str()).into()
-            } else {
-                node_change.path.as_str().into()
-            },
+            path: display_path(node_change.path.as_str()),
             automerged: node_change.flags.is_conflict_automerged().into(),
+            from_path: node_change
+                .from_path
+                .as_ref()
+                .map(|path| display_path(path.as_str()))
+                .unwrap_or_default(),
         }
     }
 }
@@ -383,7 +393,7 @@ pub const LATEST_STATUS: &str = "branch-head-status";
 pub const LATEST_HISTORY: &str = "branch-head-history";
 pub const LAST_SYNC: &str = "branch-last-sync";
 pub const METADATA: &str = "branch-metadata";
-pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step";
+pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step-v2";
 pub const REVISION_LIST_STEP: &str = "branch-revision-list-step";
 pub const DEFAULT_HISTORY_STEP_SIZE: u64 = 100;
 
@@ -398,6 +408,17 @@ pub const CACHED_REVISION_LIST_MAGIC: u32 = u32::from_le_bytes(*b"RLSC");
 /// are discarded on load and rebuilt via backfill — there is no
 /// in-place migration.
 pub const CACHED_REVISION_LIST_VERSION: u32 = 1;
+
+/// "functions" passed to `mutable_key_type` that may exist in the Mutable Store that are no longer
+/// referenced by the codebase, and can be removed without data loss.
+///
+/// These are not guaranteed to exist and depend on the versions of `lore-server` that have been
+/// used against the Mutable Store
+pub const ORPHANED_MUTABLE_STORE_KEY_TYPE_FUNCTIONS: [&str; 1] = [
+    // a revision step acceleration key, that had a bug which meant step boundaries were prematurely
+    // sealed and legitimate revisions could not be found in boundaries where they should have been
+    "branch-revision-number-step",
+];
 
 /// Fixed-size header at the start of every cached revision-list blob.
 /// The remainder of the blob is a packed array of `CachedRevisionItem`.
@@ -476,7 +497,12 @@ pub fn revision_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_NUMBER_STEP);
     let key = hash::hash_function_strs_slice(
         salt,
@@ -500,7 +526,12 @@ pub fn revision_list_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_LIST_STEP);
     let key = hash::hash_function_strs_slice(
         salt,
@@ -2867,6 +2898,7 @@ async fn try_auto_resolve_conflict(
             to: change_to.to.clone(),
             path: change_to.path.clone(),
             from_path: change_to.from_path.clone(),
+            observed: change_to.observed,
         }))
     } else {
         Ok(None)
@@ -3872,6 +3904,7 @@ pub fn dispatch_diff_events(diff: &DiffResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::path::RelativePathBuf;
 
     fn branch_id(byte: u8) -> BranchId {
         BranchId::from([byte; 16])
@@ -4074,8 +4107,53 @@ mod tests {
         let token = repository
             .try_write_token()
             .expect("a null context carries a write token");
-        let state = State::new();
+        // Behind an `Arc`, as every other holder of a `State` has it: a bare one
+        // is held across the serialize await, which puts the whole of it in this
+        // future rather than a pointer to it.
+        let state = Arc::new(State::new());
         state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a revision on a branch of its own. Without a distinguishing metadata
+    /// hash it would be addressed as, and so be, the revision the parent's own line
+    /// holds at that number.
+    async fn write_branch_revision(
+        repository: &Arc<RepositoryContext>,
+        parent: Hash,
+        revision_number: u64,
+        distinguisher: u8,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(revision(distinguisher));
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a merge revision, carrying the revision merged in as its other parent.
+    async fn write_merge_revision(
+        repository: &Arc<RepositoryContext>,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent_self);
+        state.set_parent_other(parent_other);
         state.set_revision_number(revision_number);
         state
             .serialize(repository.clone(), token)
@@ -4407,6 +4485,249 @@ mod tests {
         .await;
     }
 
+    /// A trunk 2000 revisions past the branch point, against a search depth of 500,
+    /// with the branch having merged the trunk once in between. The base is the
+    /// revision that merge carried across, which only the merge search can find.
+    #[tokio::test]
+    async fn common_ancestor_finds_an_earlier_merge_beyond_the_search_depth() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            // Numbers chosen to sit either side of the search depth the way the
+            // reported case does: 2000 revisions of trunk since the branch point,
+            // against a depth of 500.
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 200).await;
+            let branch_merge =
+                write_merge_revision(&repository, branch_first, merged_in, 1501).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_merge,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_merge,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The revision the earlier merge carried across is the base, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The trunk merged the branch 1499 revisions below its tip, three times the
+    /// search depth. The base is the branch revision the trunk holds, reached through
+    /// the trunk's merge revision.
+    #[tokio::test]
+    async fn common_ancestor_is_what_the_trunk_already_merged_of_the_branch() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk_below = write_line(&repository, Hash::default(), 1, 1500).await;
+            let branch_point = trunk_below[999];
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 220).await;
+            let branch_merged = write_branch_revision(&repository, branch_first, 1002, 221).await;
+            // The branch carried on after the trunk took it, so its tip is not what
+            // the trunk holds.
+            let branch_tip = write_branch_revision(&repository, branch_merged, 1003, 222).await;
+
+            let trunk_merge = write_merge_revision(
+                &repository,
+                *trunk_below.last().expect("the trunk has revisions"),
+                branch_merged,
+                1501,
+            )
+            .await;
+            let trunk_above = write_line(&repository, trunk_merge, 1502, 1499).await;
+            let trunk_tip = *trunk_above.last().expect("the trunk has revisions");
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_merged),
+                "The base is the branch revision the trunk already merged, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The source carries the earlier merge, and the revision it took sits 1500
+    /// revisions below the target tip. Reaching it means walking the target's line
+    /// three times past the search depth, which the merge search is not bound by.
+    #[tokio::test]
+    async fn common_ancestor_finds_a_merge_the_source_took_far_below_the_target_tip() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let source_first = write_branch_revision(&repository, branch_point, 1001, 210).await;
+            let source_merge =
+                write_merge_revision(&repository, source_first, merged_in, 1501).await;
+
+            let source_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(1),
+                source_merge,
+                &source_stack,
+                branch_id(9),
+                trunk_tip,
+                &[],
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(1),
+                source_merge,
+                branch_id(9),
+                trunk_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The walk has to follow the target's line 1500 revisions down to the revision the source already took"
+            );
+        }))
+        .await;
+    }
+
+    /// A branch of two commits that never merged the trunk, with the trunk 1417
+    /// revisions further on. The branch point is the answer, and the merge search
+    /// confirms it rather than leaving it a guess.
+    #[tokio::test]
+    async fn common_ancestor_of_a_branch_that_never_merged_is_its_branch_point() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 2624).await;
+            let branch_point = trunk[1206];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1208, 201).await;
+            let branch_tip = write_branch_revision(&repository, branch_first, 1209, 202).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(from_points, Some(branch_point));
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_point),
+                "The walk reaches the branch point from both sides, which is what makes it the answer rather than a guess"
+            );
+        }))
+        .await;
+    }
+
     /// Stacks naming no branch in common are the one case with no answer, which
     /// the caller reports as an invalid branch configuration.
     #[tokio::test]
@@ -4521,6 +4842,106 @@ mod tests {
                 "There is nothing to extend an empty line from"
             );
             assert!(empty.is_empty());
+        }))
+        .await;
+    }
+
+    /// A change between two nodes of one kind, carrying the path a move or copy
+    /// came from.
+    fn node_change(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        action: FileAction,
+        flags: NodeFlags,
+        path: &str,
+        from_path: Option<&str>,
+    ) -> NodeChange {
+        let side = |node| change::NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node,
+            flags,
+            address: Address::default(),
+        };
+        NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(1),
+            to: side(2),
+            path: RelativePathBuf::new().push_and_freeze(path),
+            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+            observed: None,
+        }
+    }
+
+    /// Without the source path a receiver reads a move as an add at the new path
+    /// and cannot tell where the content came from.
+    #[tokio::test]
+    async fn diff_change_carries_the_move_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::File,
+                "new.txt",
+                Some("old.txt"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new.txt");
+            assert_eq!(data.from_path.as_str(), "old.txt");
+        }))
+        .await;
+    }
+
+    /// A change that moved nothing maps to the empty string the C API documents,
+    /// not to a dangling pointer a receiver would read past.
+    #[tokio::test]
+    async fn diff_change_without_a_move_reports_no_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Add,
+                NodeFlags::File,
+                "new.txt",
+                None,
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert!(data.from_path.is_empty());
+            assert_eq!(data.from_path.as_str(), "");
+        }))
+        .await;
+    }
+
+    /// Both paths of a moved directory get the trailing separator that tells a
+    /// directory from a file, so the two can be compared as they are reported.
+    #[tokio::test]
+    async fn diff_change_marks_a_moved_directory_on_both_paths() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::NoFlags,
+                "new",
+                Some("old"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new/");
+            assert_eq!(data.from_path.as_str(), "old/");
         }))
         .await;
     }

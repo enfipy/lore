@@ -23,6 +23,8 @@ use tracing::info_span;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::replication_store::copy;
+use crate::protocol::replication_store::copy::ImmutableCopyHandler;
 use crate::protocol::replication_store::get;
 use crate::protocol::replication_store::get::GetHandler;
 use crate::protocol::replication_store::get_metadata;
@@ -65,6 +67,7 @@ pub enum ParsedReplicationStoreRequest {
     Obliterate(ObliterateHandler),
     GetMetadata(GetMetadataHandler),
     Query(QueryHandler),
+    Copy(ImmutableCopyHandler),
 }
 
 pub fn command_name(command: &Command) -> &'static str {
@@ -78,6 +81,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::ImmutableLocalGetMetadata => "immutable_local_get_metadata",
         Command::ImmutableQuery => "immutable_query",
         Command::ImmutableLocalQuery => "immutable_local_query",
+        Command::ImmutableCopy => "immutable_copy",
     }
 }
 
@@ -149,6 +153,7 @@ impl QuicService for ReplicationStoreService {
             Command::ImmutableLocalQuery => {
                 query::create_handler(bytes, self.local_store.clone(), "local_query")?
             }
+            Command::ImmutableCopy => copy::create_handler(bytes, self.immutable_store.clone())?,
         };
 
         Ok(handler)
@@ -208,6 +213,7 @@ impl QuicService for ReplicationStoreService {
             ParsedReplicationStoreRequest::Obliterate(h) => &h.request.header,
             ParsedReplicationStoreRequest::GetMetadata(h) => &h.request.header,
             ParsedReplicationStoreRequest::Query(h) => &h.request.header,
+            ParsedReplicationStoreRequest::Copy(h) => &h.request.header,
         };
         let repository_id = replication_header.repository.to_string();
         let correlation_id = replication_header
@@ -314,6 +320,16 @@ impl QuicService for ReplicationStoreService {
                 parent: None,
                 "ReplicationLocalQueryTask",
                 { SAMPLING_TIER_LOW } = true,
+                { TRANSPORT } = %Transport::Quic,
+                { PROTOCOL } = %StorageProtocol::Replication,
+                { QUIC_OPCODE } = opcode_label,
+                { CONNECTION_ID } = connection_id,
+                { REPOSITORY_ID } = repository_id,
+                { CORRELATION_ID } = correlation_id,
+            ),
+            Ok(Command::ImmutableCopy) => info_span!(
+                parent: None,
+                "ReplicationCopyTask",
                 { TRANSPORT } = %Transport::Quic,
                 { PROTOCOL } = %StorageProtocol::Replication,
                 { QUIC_OPCODE } = opcode_label,
@@ -550,22 +566,7 @@ mod tests {
 
         let response = QueryResponse::parse(collapse_bytes(&handle_output))
             .expect("response parse should work");
-        let carried: Vec<StoreMatchResult> = direct_store_output
-            .iter()
-            .map(|result| StoreMatchResult {
-                context: Context::default(),
-                ..*result
-            })
-            .collect();
-        assert_eq!(response.results, carried);
-        assert!(
-            direct_store_output
-                .iter()
-                .take(3)
-                .all(|result| !result.context.is_zero()),
-            "the store names a context this wire then drops; without one the comparison above \
-             would hold for the wrong reason"
-        );
+        assert_eq!(response.results, direct_store_output);
     }
 
     #[tokio::test]

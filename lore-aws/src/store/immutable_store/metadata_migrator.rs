@@ -26,6 +26,7 @@ use crate::dynamodb::ScanConfig;
 use crate::dynamodb::ScanPage;
 use crate::store::immutable_store::AwsImmutableStore;
 use crate::store::immutable_store::FragmentMetadataEntry;
+use crate::store::object_metadata::from_object_metadata;
 
 const REWRITE_RETRY_DELAY_CAP: Duration = Duration::from_secs(5);
 
@@ -63,6 +64,9 @@ pub struct RewriteStats {
 
     // num payloads whose compression codec was not accurate and needed to be deduced
     pub payloads_deduced: AtomicU64,
+    // num fragments that have a State item but no S3 head - implying a race in writing the same
+    // fragment between an old legacy deployment and a new deployment writing to S3 at the same time
+    pub state_with_no_head: AtomicU64,
 }
 
 /// Logs every total the migrator keeps, labelled with the point in the run it was read at.
@@ -81,6 +85,7 @@ pub fn log_stats(phase: &str, stats: &RewriteStats) {
             .converted_compressed_to_uncompressed
             .load(Ordering::Relaxed),
         payloads_deduced = stats.payloads_deduced.load(Ordering::Relaxed),
+        state_with_no_head = stats.state_with_no_head.load(Ordering::Relaxed),
         already_migrated = stats.skipped_migrated.load(Ordering::Relaxed),
         obliterated = stats.skipped_obliterated.load(Ordering::Relaxed),
         oversized = stats.skipped_malicious.load(Ordering::Relaxed),
@@ -237,7 +242,12 @@ impl MetadataMigrator {
         stats: &RewriteStats,
     ) -> Result<ConvertOutcome, StoreError> {
         if self.store.load_state(hash).await?.is_some() {
-            return Ok(ConvertOutcome::SkippedMigrated);
+            if let Ok(s3_head) = self.store.s3_head_object(hash).await
+                && from_object_metadata(s3_head.metadata()).is_ok()
+            {
+                return Ok(ConvertOutcome::SkippedMigrated);
+            }
+            stats.state_with_no_head.fetch_add(1, Ordering::Relaxed);
         }
 
         // since the state retrieval failed above, this load will be reading from the metadata table
@@ -563,13 +573,44 @@ fn try_codec_probes(
     None
 }
 
+/// Starts the consumers, each drawing from the one receiver.
+///
+/// The receiver is left held by the consumers alone, so the channel closes as the last of them
+/// stops. Discovery waiting to hand over a hash then fails its send instead of waiting on consumers
+/// that have already gone — which is what an aborted run, and one whose consumers all failed,
+/// leaves behind.
+fn spawn_consumers(
+    migrator: &Arc<MetadataMigrator>,
+    rx: mpsc::Receiver<Hash>,
+    stats: &Arc<RewriteStats>,
+    aborted: &Arc<AtomicBool>,
+    orchestration_config: &OrchestrationConfig,
+) -> JoinSet<Result<(), StoreError>> {
+    let rx = Arc::new(Mutex::new(rx));
+    let mut consumers = JoinSet::new();
+
+    for _ in 0..orchestration_config.num_consumers {
+        // no execution context in migrator runtime
+        #[allow(clippy::disallowed_methods)]
+        consumers.spawn(migrator.clone().fragment_stream_consumer(
+            rx.clone(),
+            stats.clone(),
+            aborted.clone(),
+        ));
+    }
+
+    consumers
+}
+
 pub async fn run_migrator(
     migrator_config: MetadataMigratorConfig,
     orchestration_config: OrchestrationConfig,
     stats: Arc<RewriteStats>,
     aborted: Arc<AtomicBool>,
 ) -> bool {
+    let is_dry_run = migrator_config.is_dry_run;
     info!(
+        is_dry_run,
         num_consumers = orchestration_config.num_consumers,
         segment = migrator_config.scan_config.segment,
         total_segments = migrator_config.scan_config.total_segments,
@@ -579,7 +620,6 @@ pub async fn run_migrator(
     let migrator = Arc::new(MetadataMigrator::new(migrator_config));
 
     let (tx, rx) = mpsc::channel((orchestration_config.num_consumers * 2) as usize);
-    let rx = Arc::new(Mutex::new(rx));
 
     // no execution context in migrator runtime
     #[allow(clippy::disallowed_methods)]
@@ -589,16 +629,7 @@ pub async fn run_migrator(
         aborted.clone(),
     ));
 
-    let mut consumers: JoinSet<Result<(), StoreError>> = Default::default();
-    for _i in 0..orchestration_config.num_consumers {
-        // no execution context in migrator runtime
-        #[allow(clippy::disallowed_methods)]
-        consumers.spawn(migrator.clone().fragment_stream_consumer(
-            rx.clone(),
-            stats.clone(),
-            aborted.clone(),
-        ));
-    }
+    let mut consumers = spawn_consumers(&migrator, rx, &stats, &aborted, &orchestration_config);
 
     let mut num_consumer_errors = 0;
     while let Some(handle) = consumers.join_next().await {
@@ -621,10 +652,16 @@ pub async fn run_migrator(
         }
     }
 
+    // A scan that gave up short of the end leaves rows nobody looked at, so the segment did not
+    // complete however cleanly its consumers finished.
     let discovery_task_ok = match discover_task.await {
-        Ok(_) => {
+        Ok(Ok(())) => {
             info!("Discovery task completed");
             true
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "Discovery stopped short of the end of the metadata table");
+            false
         }
         Err(error) => {
             warn!(%error, "Discovery task failed");
@@ -635,6 +672,7 @@ pub async fn run_migrator(
     let num_error_stats = stats.errored.load(Ordering::Relaxed);
     let is_aborted = aborted.load(Ordering::Relaxed);
     info!(
+        is_dry_run,
         discovery_task_ok,
         num_consumer_errors,
         num_error_stats,
@@ -644,10 +682,10 @@ pub async fn run_migrator(
     );
 
     if !discovery_task_ok || num_consumer_errors > 0 || num_error_stats > 0 || is_aborted {
-        warn!("Migration segment incomplete");
+        warn!(is_dry_run, "Migration segment incomplete");
         false
     } else {
-        info!("Migration segment completed");
+        info!(is_dry_run, "Migration segment completed");
         true
     }
 }
@@ -1124,15 +1162,63 @@ mod tests {
 
         #[tokio::test]
         async fn skips_already_migrated() {
+            // A fully migrated fragment has both a state entry and a properly-headered S3 object.
+            // Migrate a legacy fragment first so both are set up correctly, then verify the
+            // second call skips cleanly without touching state_with_no_head.
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
-            let hash: Hash = rand::random();
-            fake.set_state(hash, FragmentState::Stored);
+            let content = vec![0x11u8; 100];
+            let hash = lore_storage::hash_slice(&content);
+            fake.put_object_without_metadata(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                },
+            );
+            migrator
+                .process_fragment(hash, &RewriteStats::default())
+                .await
+                .unwrap();
+
             let stats = RewriteStats::default();
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
                 ConvertOutcome::SkippedMigrated
             );
+            assert_eq!(stats.state_with_no_head.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn state_with_no_head_is_counted_and_fragment_is_reprocessed() {
+            // State entry exists but head_fragment returns 404 — a race between deployments.
+            // The stat is incremented and processing falls through to load the fragment from
+            // the legacy path and re-migrate it. publish_state handles the pre-existing Stored
+            // row via its RowAbsent conditional write, so the write succeeds without error.
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x42u8; 150];
+            let hash = lore_storage::hash_slice(&content);
+            fake.set_state(hash, FragmentState::Stored);
+            // put_object_once: visible to get_object (load) but not head_object (head_fragment)
+            fake.put_object_once(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::Maintained
+            );
+            assert_eq!(stats.state_with_no_head.load(Ordering::Relaxed), 1);
+            assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
 
         #[tokio::test]
@@ -1231,6 +1317,28 @@ mod tests {
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
                 ConvertOutcome::CouldNotDeducePayload
+            );
+        }
+
+        #[tokio::test]
+        async fn skips_malicious_when_size_content_exceeds_threshold() {
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x42u8; 64];
+            let hash: Hash = lore_storage::hash_slice(&content);
+            fake.put_object_without_metadata(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: FragmentFlags::PayloadCompressedZstd.bits(),
+                    size_payload: content.len() as u32,
+                    size_content: lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::SkippedMaliciousFragment
             );
         }
 
@@ -1337,9 +1445,23 @@ mod tests {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
 
-            // already migrated
-            let migrated: Hash = rand::random();
-            fake.set_state(migrated, FragmentState::Stored);
+            // already migrated: run process_fragment once so both state and a
+            // properly-headered S3 object exist, making head_fragment succeed on the second pass.
+            let migrated_content = vec![0x10u8; 100];
+            let migrated = lore_storage::hash_slice(&migrated_content);
+            fake.put_object_without_metadata(migrated, &migrated_content);
+            fake.set_legacy_metadata_row(
+                migrated,
+                Fragment {
+                    flags: 0,
+                    size_payload: migrated_content.len() as u32,
+                    size_content: migrated_content.len() as u64,
+                },
+            );
+            migrator
+                .process_fragment(migrated, &RewriteStats::default())
+                .await
+                .unwrap();
 
             // obliterated
             let obl_content = vec![0x20u8; 100];
@@ -1614,6 +1736,86 @@ mod tests {
             );
 
             assert_eq!(stats.errored.load(Ordering::Relaxed), 1);
+        }
+
+        /// A scan that keeps failing leaves most of the table unread, so the segment did not
+        /// complete — however cleanly the consumers that had nothing to do finished.
+        #[tokio::test]
+        async fn a_run_whose_scan_gave_up_reports_the_segment_incomplete() {
+            let fake = Fake::default();
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb.expect_scan_page().returning(|_, _, _| {
+                Err(crate::store::test_util::throughput_exceeded(
+                    aws_sdk_dynamodb::operation::scan::ScanError::ProvisionedThroughputExceededException(
+                        crate::store::test_util::throttling_exception(),
+                    ),
+                ))
+            });
+
+            let config = make_config(&fake, dynamodb).await;
+
+            assert!(
+                !run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    Arc::new(RewriteStats::default()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await,
+                "a segment whose scan gave up did not complete"
+            );
+        }
+
+        /// Discovery hands hashes over a bounded channel, so a page wider than that channel leaves
+        /// it waiting to send. Every consumer here fails on its first fragment and stops, which is
+        /// also the shape an interrupted run ends in: the run has to notice they have gone rather
+        /// than wait on them.
+        #[tokio::test]
+        async fn a_run_whose_consumers_have_all_stopped_ends_rather_than_waiting_on_them() {
+            let fake = Fake::default();
+
+            // Metadata rows with no S3 object behind them, so every fragment fails to load.
+            let items: Vec<_> = std::iter::repeat_with(|| {
+                let hash: Hash = rand::random();
+                HashMap::from([(
+                    "hash".to_owned(),
+                    AttributeValue::B(Blob::new(hash.data().to_vec())),
+                )])
+            })
+            .take(64)
+            .collect();
+
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_scan_page()
+                .returning(move |_, start_key, _| {
+                    if start_key.is_none() {
+                        Ok(ScanPage {
+                            items: items.clone(),
+                            last_evaluated_key: None,
+                        })
+                    } else {
+                        Ok(ScanPage {
+                            items: vec![],
+                            last_evaluated_key: None,
+                        })
+                    }
+                });
+
+            let config = make_config(&fake, dynamodb).await;
+            let run = run_migrator(
+                config,
+                OrchestrationConfig { num_consumers: 2 },
+                Arc::new(RewriteStats::default()),
+                Arc::new(AtomicBool::new(false)),
+            );
+
+            assert!(
+                !tokio::time::timeout(Duration::from_secs(30), run)
+                    .await
+                    .expect("the run should end rather than wait on a channel nothing drains"),
+                "a run every consumer stopped in did not complete"
+            );
         }
 
         #[tokio::test]

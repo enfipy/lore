@@ -19,8 +19,6 @@ use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::revision;
-use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
@@ -81,13 +79,15 @@ impl From<revision_diff_request::QueryTo> for RevisionSpec {
 ///
 /// Signature queries pass through; identifier queries with `number == 0`
 /// resolve to the branch's latest revision via `branch::load_latest`;
-/// non-zero numbers resolve via `revision::resolve("branch@N")`. The
-/// `is_not_found` / non-not-found split routes user-input misses to
-/// `Status::not_found` (quiet) and server-side faults to
-/// `Status::internal` (with structured warn).
+/// non-zero numbers resolve through the step acceleration structures,
+/// falling back to a full history walk. The `is_not_found` / non-not-found
+/// split routes user-input misses to `Status::not_found` (quiet) and
+/// server-side faults to `Status::internal` (with structured warn).
 pub(super) async fn resolve_signature(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Hash, Status> {
     match spec {
         RevisionSpec::Signature(signature) => Ok(Hash::from(signature)),
@@ -109,12 +109,12 @@ pub(super) async fn resolve_signature(
                         }
                     })
             } else {
-                let signature = format!("{branch_id}@{}", identifier.number);
-                revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
+                crate::cache::revision::resolve_revision_number(
+                    repository,
+                    branch_id,
+                    identifier.number,
+                    history_step_size,
+                    acceleration,
                 )
                 .await
                 .map_err(|err| {
@@ -147,8 +147,10 @@ pub(super) async fn resolve_signature(
 pub(super) async fn resolve_to_identifier(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<(Hash, model_v1::RevisionIdentifier), Status> {
-    let signature = resolve_signature(repository, spec).await?;
+    let signature = resolve_signature(repository, spec, history_step_size, acceleration).await?;
     debug!({REVISION} = %signature, "Loaded resolved signature");
     let identifier = identifier_for_signature(repository, signature).await?;
     Ok((signature, identifier))
@@ -246,7 +248,7 @@ fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
 ///
 /// `link_repository_index` is passed through verbatim; the handler
 /// resolves it, since the per-stream partition table lives there.
-pub(super) fn node_change_to_diff_change(
+pub(super) async fn node_change_to_diff_change(
     change: &NodeChange,
     link_repository_index: u32,
 ) -> thin_client_v1::DiffChange {
@@ -279,6 +281,7 @@ pub(super) fn node_change_to_diff_change(
         content_to,
         automerged: change.flags.is_conflict_automerged(),
         link_repository_index,
+        tracking: change.is_tracking_link().await,
     }
 }
 
@@ -297,6 +300,7 @@ pub(super) fn link_pin_change_to_diff_change(
         content_to: pin_change.revision_to.into(),
         automerged: false,
         link_repository_index,
+        tracking: pin_change.tracking_to,
     }
 }
 
@@ -305,20 +309,14 @@ pub(super) fn link_pin_change_to_diff_change(
 /// common-ancestor content for that path, so `change_from.content_from
 /// == change_to.content_from` per the proto contract. The two halves
 /// take separate indices: they can land in different partitions.
-pub(super) fn diff_conflict_from_pair(
+pub(super) async fn diff_conflict_from_pair(
     pair: &(NodeChange, NodeChange),
     link_repository_index_from: u32,
     link_repository_index_to: u32,
 ) -> thin_client_v1::DiffConflict {
     thin_client_v1::DiffConflict {
-        change_from: Some(node_change_to_diff_change(
-            &pair.0,
-            link_repository_index_from,
-        )),
-        change_to: Some(node_change_to_diff_change(
-            &pair.1,
-            link_repository_index_to,
-        )),
+        change_from: Some(node_change_to_diff_change(&pair.0, link_repository_index_from).await),
+        change_to: Some(node_change_to_diff_change(&pair.1, link_repository_index_to).await),
     }
 }
 
@@ -383,6 +381,7 @@ mod tests {
             action,
             path: RelativePath::from_str("dir/file.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -409,13 +408,22 @@ mod tests {
     async fn node_change_propagates_index_as_given() {
         let change = make_change(lore_revision::change::FileAction::Add);
 
-        let mapped = node_change_to_diff_change(&change, 0);
+        let mapped = node_change_to_diff_change(&change, 0).await;
         assert_eq!(mapped.link_repository_index, 0);
         assert_eq!(mapped.path, "dir/file.txt");
         assert_eq!(mapped.action, thin_client_v1::Action::Add as i32);
 
-        let mapped = node_change_to_diff_change(&change, 7);
+        let mapped = node_change_to_diff_change(&change, 7).await;
         assert_eq!(mapped.link_repository_index, 7);
+    }
+
+    /// Tracking is a link property: a file change reports it as false.
+    #[tokio::test]
+    async fn node_change_on_file_is_not_tracking() {
+        let change = make_change(lore_revision::change::FileAction::Add);
+
+        let mapped = node_change_to_diff_change(&change, 0).await;
+        assert!(!mapped.tracking);
     }
 
     /// `node_type` reflects the surviving side: `to.flags` for non-delete
@@ -427,7 +435,7 @@ mod tests {
         change.from.flags = NodeFlags::Link;
         change.to.flags = NodeFlags::NoFlags;
 
-        let mapped = node_change_to_diff_change(&change, 0);
+        let mapped = node_change_to_diff_change(&change, 0).await;
         assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
     }
 
@@ -436,7 +444,7 @@ mod tests {
         let from = make_change(lore_revision::change::FileAction::Keep);
         let to = make_change(lore_revision::change::FileAction::Keep);
 
-        let mapped = diff_conflict_from_pair(&(from, to), 0, 3);
+        let mapped = diff_conflict_from_pair(&(from, to), 0, 3).await;
         assert_eq!(
             mapped.change_from.as_ref().unwrap().link_repository_index,
             0,
@@ -474,5 +482,20 @@ mod tests {
         assert_eq!(mapped.content_to, Bytes::from(change.revision_to));
         assert_eq!(mapped.link_repository_index, 2);
         assert!(!mapped.automerged);
+    }
+
+    /// `tracking` describes the entry the change resolves to, so it mirrors
+    /// the pin's "to" side.
+    #[test]
+    fn pin_change_tracking_mirrors_to_side() {
+        let mut change = make_pin_change();
+
+        change.tracking_from = true;
+        change.tracking_to = false;
+        assert!(!link_pin_change_to_diff_change(&change, 0).tracking);
+
+        change.tracking_from = false;
+        change.tracking_to = true;
+        assert!(link_pin_change_to_diff_change(&change, 0).tracking);
     }
 }

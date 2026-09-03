@@ -246,10 +246,6 @@ mod storage_copy_on_write_tests {
             self.inner.clone().compact_resume_at().await
         }
 
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
-        }
-
         fn max_query_batch(&self) -> Option<usize> {
             self.inner.max_query_batch()
         }
@@ -287,7 +283,6 @@ mod storage_copy_on_write_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 isolate_partitions: true,
@@ -337,7 +332,7 @@ mod storage_copy_on_write_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )

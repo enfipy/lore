@@ -4,7 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -12,8 +11,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -44,6 +44,7 @@ use crate::lore_trace;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::metadata::MetadataInherit;
 use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -78,6 +79,7 @@ use crate::state::LinkMergeEntry;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
@@ -394,6 +396,8 @@ pub struct MergeStartOptions {
     pub no_commit: bool,
     /// Which repositories to include in the merge.
     pub scope: MergeScope,
+    /// Metadata keys carried from the source revision onto the merge revision.
+    pub inherit_metadata: MetadataInherit,
 }
 
 /// The revisions a merge's three-way diff ran between, other than the target.
@@ -431,6 +435,7 @@ pub struct ConflictRealizeContext {
     pub conflicts: Arc<Vec<(NodeChange, NodeChange)>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn merge_repository(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -438,6 +443,7 @@ async fn merge_repository(
     current_branch: BranchId,
     current_signature: Hash,
     state_current: Arc<State>,
+    inherit: &MetadataInherit,
 ) -> Result<MergeRepositoryResult, MergeError> {
     let latest_merge = branch::load_latest(repository.clone(), source_branch)
         .await
@@ -603,6 +609,7 @@ async fn merge_repository(
         // history line shows in CLI output and other places
         current_branch == source_branch,
         current_branch,
+        inherit,
     )
     .await?;
 
@@ -719,6 +726,7 @@ pub async fn merge_start(
                 current_branch,
                 state_current.revision(),
                 state_current,
+                &options.inherit_metadata,
             )
             .await?;
 
@@ -903,6 +911,7 @@ async fn merge_start_link(
         link_branch,
         link_reference.signature,
         link_state,
+        &options.inherit_metadata,
     )
     .await
     .forward_with::<MergeError, _>(|| format!("merging link {link_path}"))?;
@@ -967,7 +976,6 @@ async fn merge_start_link(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
         let signature = Box::pin(commit::commit(repository, token, commit_options))
             .await
@@ -1025,7 +1033,7 @@ async fn enumerate_eligible_links(
 
     // This loop is sequential. The per-link awaits (`node_path`, `node`,
     // `to_link_context`, `check_link_merge_eligible`) are independent and
-    // could fan out via `JoinSet`/`MAX_TASK_COUNT` for workspaces with many
+    // could fan out via `JoinSet`/`MAX_CONCURRENT_TREE_TASKS` for workspaces with many
     // links. Deferred — N is small in practice for current users.
     let mut eligible_links = Vec::new();
     for link_reference in &link_list {
@@ -1252,6 +1260,7 @@ async fn merge_start_all(
             eligible.resolved_branch,
             eligible.link_reference.signature,
             link_state,
+            &options.inherit_metadata,
         )
         .await
         .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
@@ -1495,6 +1504,7 @@ async fn finalize_main_merge(
         current_branch,
         state_current.revision(),
         state_current,
+        &options.inherit_metadata,
     )
     .await?;
 
@@ -1586,7 +1596,6 @@ async fn auto_commit_merge(
         link: None,
         layer_messages: std::collections::HashMap::new(),
         layer: None,
-        stats: false,
     };
     Box::pin(commit::commit(repository, token, commit_options))
         .await
@@ -1876,6 +1885,7 @@ async fn apply_graft_copy(
     Ok(counts.touched())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_diff(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1884,6 +1894,7 @@ pub async fn apply_diff(
     merge_type: MergeType,
     reverse_parents: bool,
     target_branch: BranchId,
+    inherit: &MetadataInherit,
 ) -> Result<ApplyDiffResults, MergeError> {
     lore_debug!(
         "Branch diff found {} changes and {} conflicts",
@@ -1942,8 +1953,6 @@ pub async fn apply_diff(
         .await
         .forward::<MergeError>("deserializing diff base state")?;
 
-    // Queue up to a given number of parallel tasks to verify filesystem
-    const MAX_TASK_COUNT: usize = 1000;
     let mut tasks = JoinSet::new();
     let mut failure = None;
     for change in diff.changes.iter() {
@@ -1968,7 +1977,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for change")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -2025,7 +2034,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for conflict")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -2153,13 +2162,10 @@ pub async fn apply_diff(
                     Arc::new(changes.to_vec()),
                     state_from.clone(),
                     state_staged.clone(),
+                    inherit,
                 )
                 .await?;
 
-                // Without overriding `branch`, the metadata inherits the
-                // source branch from `merge_revision_metadata`. Push gates
-                // `branch_push` on `state.branch() == target_branch` and
-                // would fail.
                 let metadata_hash = state_staged.metadata_hash();
                 let mut metadata = if metadata_hash.is_zero() {
                     Metadata::new()
@@ -2171,6 +2177,7 @@ pub async fn apply_diff(
                 metadata
                     .set_branch(target_branch)
                     .forward::<MergeError>("setting metadata branch")?;
+                stamp_merged_by(&mut metadata).await?;
                 let new_metadata_hash = metadata
                     .serialize(repository.clone())
                     .await
@@ -2186,6 +2193,7 @@ pub async fn apply_diff(
                     Arc::new(changes.to_vec()),
                     state_from.clone(),
                     state_staged.clone(),
+                    inherit,
                 )
                 .await?;
 
@@ -2220,6 +2228,7 @@ pub async fn apply_diff(
                     Arc::new(changes.to_vec()),
                     state_from.clone(),
                     state_staged.clone(),
+                    inherit,
                 )
                 .await?;
 
@@ -2350,7 +2359,7 @@ pub(crate) async fn check_and_capture_dirty_for_merge(
         state_staged.clone(),
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut paths,
     )
     .await
@@ -3700,6 +3709,9 @@ pub struct MergeIntoOptions {
     pub link: Option<String>,
     /// Skip link discovery entirely; merge only the main repository.
     pub ignore_links: bool,
+    /// Metadata keys carried from the current branch onto the revision created
+    /// on the target branch.
+    pub inherit_metadata: MetadataInherit,
 }
 
 async fn merge_metadata_task(
@@ -3809,18 +3821,38 @@ async fn merge_file_metadata(
     Ok(())
 }
 
-fn merge_revision_metadata(
+/// Carry the keys `inherit` permits from the source revision onto the staged
+/// state, and no others.
+///
+/// Runs before the operation writes the keys describing the revision it creates,
+/// so one it does not write is left absent rather than inherited.
+async fn merge_revision_metadata(
+    repository: Arc<RepositoryContext>,
     state_source: Arc<State>,
     state_staged: Arc<State>,
+    inherit: &MetadataInherit,
 ) -> Result<(), MergeError> {
-    // Common revision metadata fields will be overwritten later on.
-    // This is just to bring along the metadata attached via urc_revision_metadata_set.
-
     let metadata_hash = state_source.metadata_hash();
-    if !metadata_hash.is_zero() {
-        lore_debug!("Merged revision metadata");
+    if inherit.is_empty() || metadata_hash.is_zero() {
+        state_staged.set_metadata_hash(Hash::default());
+        return Ok(());
     }
-    state_staged.set_metadata_hash(metadata_hash);
+
+    let mut metadata = Metadata::deserialize(repository.clone(), metadata_hash)
+        .await
+        .forward::<MergeError>("deserializing source revision metadata")?;
+
+    if metadata.retain_inherited(inherit) == 0 {
+        state_staged.set_metadata_hash(metadata_hash);
+        return Ok(());
+    }
+
+    state_staged.set_metadata_hash(
+        metadata
+            .serialize(repository.clone())
+            .await
+            .forward::<MergeError>("serializing inherited revision metadata")?,
+    );
 
     Ok(())
 }
@@ -3830,6 +3862,7 @@ pub async fn merge_metadata(
     changes: Arc<Vec<NodeChange>>,
     state_source: Arc<State>,
     state_staged: Arc<State>,
+    inherit: &MetadataInherit,
 ) -> Result<(), MergeError> {
     merge_file_metadata(
         repository.clone(),
@@ -3839,8 +3872,28 @@ pub async fn merge_metadata(
     )
     .await?;
 
-    merge_revision_metadata(state_source.clone(), state_staged.clone())?;
+    merge_revision_metadata(
+        repository,
+        state_source.clone(),
+        state_staged.clone(),
+        inherit,
+    )
+    .await?;
 
+    Ok(())
+}
+
+/// Record who performed the merge, leaving the key unset without an identity.
+///
+/// Called only by the branch-merge paths; a cherry-pick performs no merge.
+async fn stamp_merged_by(metadata: &mut Metadata) -> Result<(), MergeError> {
+    let merge_user = execution_context().user_id().await;
+    if merge_user.is_empty() {
+        return Ok(());
+    }
+    metadata
+        .set_string(metadata::MERGED_BY, &merge_user)
+        .forward::<MergeError>("setting merged-by metadata")?;
     Ok(())
 }
 
@@ -3859,6 +3912,7 @@ async fn merge_into_link(
     state_branch: Arc<State>,
     branch_latest: Hash,
     link_path: &str,
+    inherit: &MetadataInherit,
 ) -> Result<(), MergeError> {
     // Resolve link in current state (source) to get the updated pin
     let link_path_owned = link_path.to_string();
@@ -3882,14 +3936,23 @@ async fn merge_into_link(
     .await
     .forward::<MergeError>("updating link pin")?;
 
-    // Get or create metadata chunk
+    merge_revision_metadata(
+        repository.clone(),
+        state_current.clone(),
+        state_staged.clone(),
+        inherit,
+    )
+    .await?;
+
     let metadata_hash = state_staged.metadata_hash();
-    if metadata_hash.is_zero() {
-        return Err(MergeError::internal("Failed to deserialize metadata"));
-    }
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<MergeError>("deserializing metadata")?;
+    let mut original_metadata = if metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), metadata_hash)
+            .await
+            .forward::<MergeError>("deserializing metadata")?
+    };
+    stamp_merged_by(&mut original_metadata).await?;
 
     let metadata = commit::prepare_commit_metadata(
         repository.clone(),
@@ -3907,6 +3970,7 @@ async fn merge_into_link(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -3917,10 +3981,14 @@ async fn merge_into_link(
         std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
 
     let state_new = state_staged;
@@ -3958,7 +4026,7 @@ async fn merge_into_link(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let storage_protocol = remote
             .session(repository.id, &correlation_id)
@@ -3973,6 +4041,7 @@ async fn merge_into_link(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4100,11 +4169,12 @@ pub async fn merge_into(
             repository,
             token,
             branch,
-            options.message,
+            options.message.clone(),
             state_current,
             state_branch,
             branch_latest,
             link_path,
+            &options.inherit_metadata,
         )
         .await;
     }
@@ -4228,18 +4298,20 @@ pub async fn merge_into(
         Arc::new(changes.clone()),
         state_current.clone(),
         state_staged.clone(),
+        &options.inherit_metadata,
     )
     .await?;
     lore_debug!("Merged metadata on state");
 
-    // Get or create metadata chunk
     let metadata_hash = state_staged.metadata_hash();
-    if metadata_hash.is_zero() {
-        return Err(MergeError::internal("Failed to deserialize metadata"));
-    }
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<MergeError>("deserializing metadata")?;
+    let mut original_metadata = if metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), metadata_hash)
+            .await
+            .forward::<MergeError>("deserializing metadata")?
+    };
+    stamp_merged_by(&mut original_metadata).await?;
 
     let metadata = commit::prepare_commit_metadata(
         repository.clone(),
@@ -4257,6 +4329,7 @@ pub async fn merge_into(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -4267,10 +4340,14 @@ pub async fn merge_into(
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
     lore_debug!("Rehashed state");
 
@@ -4314,7 +4391,7 @@ pub async fn merge_into(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::BranchMergeIntoFragmentBegin(LoreBranchMergeIntoFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -4335,6 +4412,7 @@ pub async fn merge_into(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4350,8 +4428,8 @@ pub async fn merge_into(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::BranchMergeIntoFragmentProgress(LoreBranchMergeIntoFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -4362,7 +4440,7 @@ pub async fn merge_into(
         result.forward::<MergeError>("pushing fragments")?;
 
         LoreEvent::BranchMergeIntoFragmentEnd(LoreBranchMergeIntoFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 

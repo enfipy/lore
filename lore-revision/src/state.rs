@@ -11,6 +11,7 @@ use std::mem::size_of;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -26,11 +27,14 @@ use serde::Serialize;
 pub use sink::ChangeSink;
 pub use sink::OwnedChangeSink;
 use tokio::join;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::bitflagsops;
 use crate::branch;
 use crate::change;
@@ -45,6 +49,7 @@ use crate::errors::Oversized;
 use crate::errors::StateErrors;
 use crate::filter::FilterMode;
 use crate::fragment::FragmentFlags;
+use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
@@ -357,6 +362,21 @@ impl StateNodeChildrenIterator {
     }
 }
 
+/// Number of permits gating block deserialization, taken modulo the block
+/// index.
+///
+/// A fixed set rather than one permit per block: the permits then cost no
+/// allocation, no lookup and no growth as a tree gets bigger, against two
+/// blocks whose indices collide deserializing one after the other instead of
+/// together.
+///
+/// The count trades that collision rate against the size of the array every
+/// state carries. A walk fans out to one task per processor, so a count below
+/// that collides on machines that wide; 256 covers the largest and costs ten
+/// kilobytes. A collision is never a correctness matter - the permits gate
+/// duplicate work, and the publish path re-checks residency whatever they do.
+const BLOCK_LOADING_PERMITS: usize = 256;
+
 /// Revision state control structure, internally mutable through r/w locks
 pub struct State {
     /// Serialized data
@@ -371,6 +391,9 @@ pub struct State {
     block_deserialize: tokio::sync::Semaphore,
     /// File metadata block deserialization semaphore
     metadata_deserialize: tokio::sync::Semaphore,
+    /// Permits held while a block is deserialized, shared by a node block and
+    /// its file metadata block
+    block_loading: [tokio::sync::Semaphore; BLOCK_LOADING_PERMITS],
 }
 
 impl std::fmt::Debug for State {
@@ -573,6 +596,7 @@ impl State {
             deserialize: tokio::sync::Semaphore::new(1),
             block_deserialize: tokio::sync::Semaphore::new(1),
             metadata_deserialize: tokio::sync::Semaphore::new(1),
+            block_loading: std::array::from_fn(|_| tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -582,7 +606,7 @@ impl State {
     ) -> Result<(Arc<Self>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         Ok((
             State::deserialize(repository.clone(), current_revision).await?,
             branch,
@@ -598,7 +622,7 @@ impl State {
     ) -> Result<(Arc<Self>, Option<Arc<Self>>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         let state_current = State::deserialize(repository.clone(), current_revision).await?;
 
         let state_staged = match crate::instance::load_staged_revision(&repository)
@@ -671,6 +695,7 @@ impl State {
                 deserialize: tokio::sync::Semaphore::new(1),
                 block_deserialize: tokio::sync::Semaphore::new(1),
                 metadata_deserialize: tokio::sync::Semaphore::new(1),
+                block_loading: std::array::from_fn(|_| tokio::sync::Semaphore::new(1)),
             }))
         }
     }
@@ -778,7 +803,7 @@ impl State {
                                         .with_max_size_chunk(),
                                 )
                                 .await
-                                .internal("Failed to serialize node block")?
+                                .forward::<StateError>("Failed to serialize node block")?
                             } else {
                                 Address::default()
                             };
@@ -799,7 +824,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize node block")?;
+                        .forward::<StateError>("Failed to serialize node block")?;
                     Ok((address, block_index))
                 });
             }
@@ -844,7 +869,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize node block list")?;
+            .forward::<StateError>("Failed to serialize node block list")?;
 
             // Update the tree node block list address
             {
@@ -891,7 +916,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize file metadata block")?;
+                        .forward::<StateError>("Failed to serialize file metadata block")?;
                     Ok((address, block_index))
                 });
             }
@@ -936,7 +961,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize file metadata block list")?;
+            .forward::<StateError>("Failed to serialize file metadata block list")?;
 
             // Update the tree file metadata node block list address
             {
@@ -973,7 +998,7 @@ impl State {
                             .with_max_size_chunk(),
                     )
                     .await
-                    .internal("Failed to serialize link list")?;
+                    .forward::<StateError>("Failed to serialize link list")?;
 
                     address.hash
                 };
@@ -998,7 +1023,7 @@ impl State {
                         .with_max_size_chunk(),
                 )
                 .await
-                .internal("Failed to serialize tree")?;
+                .forward::<StateError>("Failed to serialize tree")?;
             {
                 lore_trace!("Serialized tree to {}", address.hash);
                 lore_trace!("  node block {}", tree.hash_node);
@@ -1030,7 +1055,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize state")?
+            .forward::<StateError>("Failed to serialize state")?
         };
 
         {
@@ -1163,7 +1188,6 @@ impl State {
         let metadata = self.metadata_hash();
         let metadata = metadata::Metadata::deserialize(repository, metadata)
             .await
-            .internal("Failed to deserialize metadata")
             .unwrap_or_default();
         metadata.get_branch().unwrap_or_default()
     }
@@ -1197,14 +1221,14 @@ impl State {
         let options = immutable::read_options_from_repository(&repository)
             .with_cache()
             .with_priority();
-        Ok(immutable::read(
+        immutable::read(
             repository,
             Address::zero_context_hash(tree.hash_delta),
             None, /* Full range */
             options,
         )
         .await
-        .internal("Failed to deserialize delta block")?)
+        .forward::<StateError>("Failed to deserialize delta block")
     }
 
     pub async fn node_delta(
@@ -1302,6 +1326,21 @@ impl State {
             return Err(StateError::internal(format!(
                 "Invalid block index: {block_index}"
             )));
+        }
+
+        let loading_permit = self.block_loading[block_index % BLOCK_LOADING_PERMITS]
+            .acquire()
+            .await
+            .internal("Failed to deserialize node block")?;
+        // One permit covers many blocks, so the task that held it before this
+        // one may have published this block, or a different one.
+        {
+            let lock = self.runtime.read();
+            if lock.block.len() > block_index
+                && let Some(block) = lock.block[block_index].upgrade()
+            {
+                return Ok(block);
+            }
         }
 
         let (mut block_hash_bytes, rehash_node_names) = {
@@ -1450,6 +1489,10 @@ impl State {
             Err(err) => Err(err),
         };
 
+        // Waiters have what they came for; the prefetch below is not theirs to
+        // wait on.
+        drop(loading_permit);
+
         if let Some(cache_task) = metadata_block_cache {
             let _ = cache_task.await;
         }
@@ -1489,29 +1532,42 @@ impl State {
                 return None;
             }
 
-            // TODO(mjansson): To support huge trees we might want to selectively
-            // read the block addresses instead of all in one big buffer
-            let address = Address::zero_context_hash(tree.hash_file_metadata);
-            let Ok(hash_bytes) = immutable::read(
-                repository.clone(),
-                address,
-                None, /* Read the full array of block hashes */
-                immutable::read_options_from_repository(&repository)
-                    .with_cache()
-                    .with_priority(),
-            )
-            .await
-            else {
+            // One list covers every block, so the tasks prefetching for all the
+            // other blocks want it at the same moment and would each read it.
+            let Ok(_guard) = self.metadata_deserialize.acquire().await else {
                 return None;
             };
-            block_hash_bytes = hash_bytes;
-            if block_hash_bytes.count::<Hash>() < tree.block_count as usize {
-                block_hash_bytes = block_hash_bytes
-                    .clone_and_resize_zeroed::<Hash>(tree.block_count as usize)
-                    .freeze();
-            }
-            {
-                self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
+
+            block_hash_bytes = {
+                let lock = self.runtime.read();
+                lock.block_file_metadata_address.clone()
+            };
+
+            if block_index >= block_hash_bytes.count::<Hash>() {
+                // TODO(mjansson): To support huge trees we might want to selectively
+                // read the block addresses instead of all in one big buffer
+                let address = Address::zero_context_hash(tree.hash_file_metadata);
+                let Ok(hash_bytes) = immutable::read(
+                    repository.clone(),
+                    address,
+                    None, /* Read the full array of block hashes */
+                    immutable::read_options_from_repository(&repository)
+                        .with_cache()
+                        .with_priority(),
+                )
+                .await
+                else {
+                    return None;
+                };
+                block_hash_bytes = hash_bytes;
+                if block_hash_bytes.count::<Hash>() < tree.block_count as usize {
+                    block_hash_bytes = block_hash_bytes
+                        .clone_and_resize_zeroed::<Hash>(tree.block_count as usize)
+                        .freeze();
+                }
+                {
+                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
+                }
             }
         }
 
@@ -1613,20 +1669,29 @@ impl State {
         }
 
         let tree = self.tree(repository.clone()).await?;
+        if block_index >= tree.block_count as usize {
+            return Err(StateError::internal(format!(
+                "Invalid block index: {block_index}"
+            )));
+        }
 
-        let mut block_hash_bytes = {
-            let mut lock = self.runtime.write();
+        let _loading_permit = self.block_loading[block_index % BLOCK_LOADING_PERMITS]
+            .acquire()
+            .await
+            .internal("Failed to deserialize metadata")?;
+        // One permit covers many blocks, so the task that held it before this
+        // one may have published this block, or a different one.
+        {
+            let lock = self.runtime.read();
             if lock.block_file_metadata.len() > block_index
                 && let Some(block) = lock.block_file_metadata[block_index].upgrade()
             {
                 return Ok(block);
             }
+        }
 
-            if block_index >= tree.block_count as usize {
-                return Err(StateError::internal(format!(
-                    "Invalid block index: {block_index}"
-                )));
-            }
+        let mut block_hash_bytes = {
+            let mut lock = self.runtime.write();
             if block_index >= lock.block_file_metadata.len() {
                 lock.block_file_metadata
                     .resize(tree.block_count as usize, Weak::default());
@@ -1704,7 +1769,7 @@ impl State {
                 true,
             )
             .await
-            .internal("Failed to deserialize file metadata block")?;
+            .forward::<StateError>("Failed to deserialize file metadata block")?;
             NodeFileMetadataBlock::new(block_data)
         });
 
@@ -1775,6 +1840,18 @@ impl State {
         if data.revision_number != revision_number {
             data.revision_number = revision_number;
             data.flags |= StateFlags::Dirty;
+        }
+    }
+
+    pub fn reparent_onto(&self, current_revision: Hash) {
+        let based_on_current = self.revision() == current_revision;
+
+        self.set_revision_number(0);
+        self.set_parent_self(current_revision);
+
+        if based_on_current {
+            self.set_parent_other(Hash::default());
+            self.set_metadata_hash(Hash::default());
         }
     }
 
@@ -1889,10 +1966,18 @@ impl State {
     /// always-create, not get-or-add, so they produce duplicate siblings. The
     /// find-then-add is a check-then-act at the call site that this cannot close;
     /// callers fanning out across paths must ensure at most one add per
-    /// `(parent, name)` (e.g. pre-create shared ancestors sequentially).
+    /// `(parent, name)` (e.g. pre-create the ancestors two paths share, from a
+    /// path set holding one case variation of each entry).
     ///
     /// Slot allocation is serialized per tree by a single permit, so concurrent
     /// adds overlap only in the initialize and publish that follow it.
+    ///
+    /// The publish **prepends**, and that is relied on rather than incidental: a
+    /// caller holding a chain it walked earlier knows everything linked since
+    /// lies ahead of the head it saw, which is what
+    /// [`Self::find_subnode_added_since`] walks to. Appending instead would put
+    /// a new child past the end of what such a caller holds, and it would stop
+    /// finding them.
     pub async fn node_add(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2628,8 +2713,7 @@ impl State {
         let renamed = node.name_hash != name_hash
             || block
                 .node_name_clone(node_index)
-                .internal("Node name")
-                .map_err(StateError::from)?
+                .forward::<StateError>("Node name")?
                 != dst_name;
         let source_parent_id = node.parent;
         if !renamed && source_parent_id == destination_parent_id {
@@ -2843,32 +2927,137 @@ impl State {
         Ok(())
     }
 
-    pub async fn node_children(
+    /// The children of `parent`, in sibling order, until `step` answers for one
+    /// of them or `stop_at` heads what is left of the chain.
+    ///
+    /// A run of siblings sharing a block is walked under one lock on it, so
+    /// `step` must not read that block again: a second shared lock behind a
+    /// queued writer deadlocks. `None` where `step` answered for none of them.
+    async fn walk_children<T, F>(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        parent: &Node,
+        stop_at: Option<NodeID>,
+        mut step: F,
+    ) -> Result<Option<T>, StateError>
+    where
+        F: FnMut(NodeID, &Node) -> Option<T>,
+    {
+        let mut cycle = SiblingCycleGuard::new(parent_node);
+        let mut child_node = parent.child();
+        while let Some(first_in_block) = child_node {
+            if Some(first_in_block) == stop_at {
+                return Ok(None);
+            }
+            let iblock = NodeBlock::index(first_in_block);
+            let block = self.block(repository.clone(), iblock).await?;
+            let reader = block.read();
+            let mut next = Some(first_in_block);
+            while let Some(child_id) = next {
+                if Some(child_id) == stop_at || NodeBlock::index(child_id) != iblock {
+                    break;
+                }
+                let child = reader.node(Node::index(child_id));
+                child.walk_step(child_id, parent_node, &mut cycle)?;
+                if let Some(answer) = step(child_id, child) {
+                    return Ok(Some(answer));
+                }
+                next = child.sibling();
+            }
+            child_node = next;
+        }
+        Ok(None)
+    }
+
+    /// The children of a directory node in sibling order, each taken from the
+    /// record the walk read for it by `extract`.
+    ///
+    /// `extract` runs under the lock [`Self::walk_children`] holds, so the
+    /// constraint that carries is that it must not read the block again. A link
+    /// resolves to the children of the node it points at.
+    async fn node_children_map<T, F>(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
-    ) -> Result<Vec<NodeID>, StateError> {
+        extract: F,
+    ) -> Result<Vec<T>, StateError>
+    where
+        F: Fn(NodeID, &Node) -> T + Copy,
+    {
         let parent_id = node;
         let node = self.node(repository.clone(), node).await?;
         if node.is_directory() {
             let mut children = vec![];
-            let mut child_node = node.child();
-            let mut cycle = SiblingCycleGuard::new(parent_id);
-            while let Some(child_id) = child_node {
-                let child = self.node(repository.clone(), child_id).await?;
-                child.walk_step(child_id, parent_id, &mut cycle)?;
-                children.push(child_id);
-                child_node = child.sibling();
-            }
+            self.walk_children(repository, parent_id, &node, None, |child_id, child| {
+                children.push(extract(child_id, child));
+                None::<()>
+            })
+            .await?;
             Ok(children)
         } else if node.is_link() {
             let link = node.linked_node();
             let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
             let link_state = State::deserialize(linked_repository.clone(), link.revision).await?;
-            Box::pin(link_state.node_children(linked_repository.clone(), link.node)).await
+            Box::pin(link_state.node_children_map(linked_repository.clone(), link.node, extract))
+                .await
         } else {
             Ok(vec![])
         }
+    }
+
+    /// The children of a directory node in sibling order.
+    ///
+    /// A link resolves to the children of the node it points at; a node that
+    /// takes no children, such as a file, reports none.
+    pub async fn node_children(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Vec<NodeID>, StateError> {
+        self.node_children_map(repository, node, |child_id, _| child_id)
+            .await
+    }
+
+    /// The first child of `parent_node` carrying `name_hash` among those linked
+    /// into its chain since `known_head` headed it.
+    ///
+    /// A child is prepended, so everything linked since lies ahead of
+    /// `known_head` and the walk stops there rather than covering children the
+    /// caller already holds. `known_head` of `None` walks the whole chain, which
+    /// is what a caller holding no children has to do.
+    pub async fn find_subnode_added_since(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        known_head: Option<NodeID>,
+        name_hash: u64,
+    ) -> Result<Option<NodeID>, StateError> {
+        let parent = self.node(repository.clone(), parent_node).await?;
+        if !parent.is_directory() {
+            return Ok(None);
+        }
+        self.walk_children(
+            repository,
+            parent_node,
+            &parent,
+            known_head,
+            |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+        )
+        .await
+    }
+
+    /// [`Self::node_children`], and the name hash each of them carries, which
+    /// the walk has already read.
+    pub async fn node_children_with_name_hash(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Vec<(NodeID, u64)>, StateError> {
+        self.node_children_map(repository, node, |child_id, child| {
+            (child_id, child.name_hash)
+        })
+        .await
     }
 
     pub async fn node_name_clone(
@@ -2881,8 +3070,7 @@ impl State {
             .await?;
         block
             .node_name_clone(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_name_ref(
@@ -2895,8 +3083,7 @@ impl State {
             .await?;
         block
             .node_name_ref(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_mark(
@@ -2975,13 +3162,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_staged()
             {
                 lore_trace!("Child node {child} is staged");
@@ -3071,13 +3258,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_dirty()
             {
                 lore_trace!("Child node {child} is dirty");
@@ -3169,13 +3356,16 @@ impl State {
             let children = self
                 .node_children(repository.clone(), node_id)
                 .await
-                .internal("Failed to get children for dirty path collection")?;
+                .forward::<StateError>("Failed to get children for dirty path collection")?;
 
             if node_id == root_node && children.is_empty() && !path.is_empty() {
                 let node = self.node(repository.clone(), node_id).await?;
                 if node.is_dirty_add()
                     && node.is_directory()
-                    && (force || !repository.filter.excludes(&path, true, FilterMode::Full))
+                    && (force
+                        || !repository
+                            .filter
+                            .excludes_tree(&path, true, FilterMode::Full))
                 {
                     result.push(path);
                 }
@@ -3195,7 +3385,7 @@ impl State {
                 // excludes; they can't be replayed against a checkout that
                 // never materializes them. --force bypasses the filter.
                 if !force
-                    && repository.filter.excludes(
+                    && repository.filter.excludes_tree(
                         &child_path,
                         child.is_directory(),
                         FilterMode::Full,
@@ -3448,7 +3638,7 @@ impl State {
             let name = self
                 .node_name_ref(repository.clone(), *node)
                 .await
-                .internal("Node name")?;
+                .forward::<StateError>("Node name")?;
             path.push(name);
         }
 
@@ -3496,7 +3686,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_children_unsorted(
                 linked_repository.clone(),
@@ -3568,7 +3758,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_named_children_unsorted(
                 linked_repository.clone(),
@@ -3735,7 +3925,7 @@ impl State {
     ) -> Result<RevisionMetadata, StateError> {
         let metadata = Metadata::deserialize(repository, self.metadata_hash())
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         Ok(RevisionMetadata::from_metadata(metadata))
     }
@@ -3784,7 +3974,7 @@ impl State {
                 .with_max_size_chunk(),
         )
         .await
-        .internal("Failed to serialize link merge state")?;
+        .forward::<StateError>("Failed to serialize link merge state")?;
 
         self.set_link_merge_hash(address.hash);
         Ok(address.hash)
@@ -3807,7 +3997,7 @@ impl State {
             options,
         )
         .await
-        .internal("Failed to read link merge state")?;
+        .forward::<StateError>("Failed to read link merge state")?;
 
         let raw = data.as_ref();
         let header_size = std::mem::size_of::<LinkMergeState>();
@@ -3855,7 +4045,7 @@ impl State {
                 .with_priority(),
         )
         .await
-        .internal("Failed to read state data")?
+        .forward::<StateError>("Failed to read state data")?
         .to_aligned::<LinkReference>();
 
         Ok(data.as_type_slice::<LinkReference>().to_vec())
@@ -3930,7 +4120,7 @@ impl State {
                         .with_priority(),
                 )
                 .await
-                .internal("Failed to read state data")?
+                .forward::<StateError>("Failed to read state data")?
                 .to_aligned::<LinkReference>();
                 data.as_type_slice::<LinkReference>().to_vec()
             } else {
@@ -4059,7 +4249,7 @@ impl State {
             Arc::new(if !tree.hash_nametable_deprecated.is_zero() {
                 NameTable::deserialize(repository, tree.hash_nametable_deprecated)
                     .await
-                    .internal("Failed to deserialize name table")?
+                    .forward::<StateError>("Failed to deserialize name table")?
             } else {
                 NameTable::default()
             })
@@ -4155,7 +4345,7 @@ pub async fn rebase_staged_state(
         old_staged_state,
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut dirty_paths,
     )
     .await?;
@@ -4185,14 +4375,22 @@ pub async fn rebase_staged_state(
 /// boundaries (children live in another repository's state) and at
 /// `DirtyDelete`/`DirtyMove` subtrees (the parent action carries the whole
 /// subtree when re-applied).
-pub(crate) fn collect_dirty_paths(
+pub(crate) async fn collect_dirty_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
+    mut parent_path: RelativePathBuf,
     paths: &mut Vec<RelativePath>,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
-    collect_dirty_paths_inner(state, repository, parent_node, parent_path, paths, false)
+) -> Result<(), StateError> {
+    collect_dirty_paths_inner(
+        state,
+        repository,
+        parent_node,
+        &mut parent_path,
+        paths,
+        DirtyWalkOptions::from_context(false),
+    )
+    .await
 }
 
 /// Like [`collect_dirty_paths`] but skips nodes that are also staged.
@@ -4202,81 +4400,278 @@ pub(crate) fn collect_dirty_paths(
 /// revision — staged paths are already part of the new commit and would be
 /// incorrectly re-marked as `DirtyModify` by `file::dirty::dirty()` if
 /// included.
-pub(crate) fn collect_dirty_only_paths(
+pub(crate) async fn collect_dirty_only_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
+    mut parent_path: RelativePathBuf,
     paths: &mut Vec<RelativePath>,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
-    collect_dirty_paths_inner(state, repository, parent_node, parent_path, paths, true)
+) -> Result<(), StateError> {
+    collect_dirty_paths_inner(
+        state,
+        repository,
+        parent_node,
+        &mut parent_path,
+        paths,
+        DirtyWalkOptions::from_context(true),
+    )
+    .await
 }
 
-fn collect_dirty_paths_inner(
+/// What a dirty walk does with the nodes it meets.
+///
+/// A struct rather than two parameters, so a caller cannot transpose them.
+#[derive(Clone, Copy, Default)]
+struct DirtyWalkOptions {
+    /// Record no path for a node that is also staged.
+    skip_staged: bool,
+    /// Record paths the view/ignore filter excludes.
+    force: bool,
+}
+
+impl DirtyWalkOptions {
+    /// Options for a walk driven from the command line, taking `force` from the
+    /// execution context.
+    ///
+    /// Read where the walk is started rather than inside it, so the context is
+    /// read once per walk. Panics if no execution context is set, which makes
+    /// the caller's task, not the future's poller, the one that has to have one.
+    fn from_context(skip_staged: bool) -> Self {
+        Self {
+            skip_staged,
+            force: execution_context().globals().force(),
+        }
+    }
+}
+
+/// Whether a dirty node carries an action of its own to record.
+///
+/// `skip_staged` drops nodes that are also staged: their action belongs to the
+/// commit being written, and re-applying it would mark the committed content
+/// dirty again.
+fn dirty_path_contributes(child: &Node, skip_staged: bool) -> bool {
+    child.action_bits() != 0 && !(skip_staged && child.is_staged())
+}
+
+/// Whether a dirty node's children must be walked.
+///
+/// A `DirtyDelete` or `DirtyMove` directory carries its whole subtree when it is
+/// re-applied, so its descendants are covered by its own path. A directory that
+/// records no path of its own is still walked: staging a file stages the
+/// directories above it, so a staged directory is where a dirty-only file lives.
+fn dirty_path_descends(child: &Node) -> bool {
+    child.is_directory() && !child.is_dirty_delete() && !child.is_dirty_move()
+}
+
+/// The node block a sibling chain is being read from.
+///
+/// A chain is walked one node at a time, and [`State::node`] resolves each from
+/// its block: a lock on the block table, a bounds check and a weak upgrade, for
+/// what is usually the block just read. Nodes are allocated as a tree is built,
+/// so siblings and their children land together and a chain rarely leaves one
+/// block. Holding it makes the common step an index comparison.
+///
+/// A held block cannot be evicted, so [`State::block`] keeps returning the one
+/// held here and a node read through the cursor is the node [`State::node`]
+/// would return.
+struct BlockCursor {
+    index: usize,
+    block: Arc<NodeBlock>,
+}
+
+impl BlockCursor {
+    /// Opens a cursor on the block holding `node`.
+    async fn open(
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Self, StateError> {
+        if !node.is_valid_or_root_node_id() {
+            return Err(StateError::internal("Invalid node"));
+        }
+        let index = NodeBlock::index(node);
+        Ok(Self {
+            index,
+            block: state.block(repository.clone(), index).await?,
+        })
+    }
+
+    /// Reads `node`, fetching the block holding it unless that is the one held.
+    ///
+    /// Selecting the block and reading from it are one step, so a node is only
+    /// ever read out of its own block. Split apart they would let a read take a
+    /// node index against whichever block the cursor happened to hold, which
+    /// names an unrelated node rather than failing.
+    async fn node(
+        &mut self,
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Node, StateError> {
+        if !node.is_valid_or_root_node_id() {
+            return Err(StateError::internal("Invalid node"));
+        }
+        let index = NodeBlock::index(node);
+        if index != self.index {
+            self.block = state.block(repository.clone(), index).await?;
+            self.index = index;
+        }
+        Ok(*self.block.read().node(Node::index(node)))
+    }
+}
+
+/// Appends the name of `child_id` to `path`, reporting whether anything was added.
+///
+/// The name is a read lock on the block holding it, released as this returns and
+/// so before the caller descends. A walk that took a second shared lock on that
+/// block would deadlock behind a queued writer.
+///
+/// An empty name appends nothing, which [`RelativePathBuf::push`] already does and
+/// which the caller must not undo: a pop would take the parent's own last
+/// component off instead.
+async fn push_dirty_child_name(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    path: &mut RelativePathBuf,
+    child_id: NodeID,
+) -> Result<bool, StateError> {
+    let child_name = state.node_name_ref(repository, child_id).await?;
+    path.push(&*child_name);
+    Ok(!child_name.is_empty())
+}
+
+/// One directory on the way down, and where the walk left off in its children.
+///
+/// `appended` says whether this level's own name is on the path buffer, so the
+/// buffer is restored to its parent's path when the level is done. A level opened
+/// for a node with an empty name appended nothing and must take nothing off.
+///
+/// Each level carries its own [`BlockCursor`], because a level resumes its chain
+/// after its children are walked and the levels below will have moved their own
+/// cursors elsewhere.
+struct DirtyWalkLevel {
+    node: NodeID,
+    next_child: Option<NodeID>,
+    cycle: SiblingCycleGuard,
+    cursor: BlockCursor,
+    appended: bool,
+}
+
+/// Tree depth a dirty walk's stack is sized for. A deeper tree grows it.
+const DIRTY_WALK_LEVELS: usize = 32;
+
+/// The level walking `node_id`'s children, or nothing where there are none.
+///
+/// A file holds no children, and a link's children live in another repository's
+/// state, so neither is descended. [`Node::child`] means nothing on either.
+async fn dirty_walk_level(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    appended: bool,
+) -> Result<Option<DirtyWalkLevel>, StateError> {
+    let mut cursor = BlockCursor::open(state, repository, node_id).await?;
+    let node = cursor.node(state, repository, node_id).await?;
+    if node.is_link() || !node.is_directory() {
+        return Ok(None);
+    }
+    Ok(Some(DirtyWalkLevel {
+        node: node_id,
+        next_child: node.child(),
+        cycle: SiblingCycleGuard::new(node_id),
+        cursor,
+        appended,
+    }))
+}
+
+/// Walks the children of `parent_node`, recording dirty paths under `parent_path`.
+///
+/// A child is named only once [`dirty_path_contributes`] or [`dirty_path_descends`]
+/// says it is wanted. The ignore filter matches every one of its lines against a
+/// name, and under `skip_staged` most of a tree is wanted for neither: a commit
+/// stages what it writes.
+///
+/// `parent_node` is walked only if it is a directory. Nothing below a link is in
+/// this state, and [`Node::child`] means nothing on a file.
+///
+/// `parent_path` is the path of `parent_node` and the buffer every descendant is
+/// named into, so naming costs no allocation and a path is allocated only where one
+/// is recorded. A walk that records nothing allocates nothing. A name is taken off
+/// where the child that appended it is finished with: at the end of the loop body
+/// for a child that is only recorded, and when its level is exhausted for one that
+/// is descended. An error abandons the walk and the buffer with it, so it needs no
+/// unwinding.
+///
+/// Descent is an explicit stack of [`DirtyWalkLevel`], so the walk runs at a fixed
+/// call depth however deep the tree is. Depth-first order in the sibling chain is
+/// preserved by resuming a level where it left off rather than queueing subtrees: a
+/// directory's own path is recorded before its level is pushed, and its next
+/// sibling is visited once that level is exhausted.
+async fn collect_dirty_paths_inner(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
+    parent_path: &mut RelativePathBuf,
     paths: &mut Vec<RelativePath>,
-    skip_staged: bool,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
-    Box::pin(async move {
-        let node = state.node(repository.clone(), parent_node).await?;
-        if node.is_link() || !node.is_directory() {
-            return Ok(());
+    options: DirtyWalkOptions,
+) -> Result<(), StateError> {
+    let mut levels: Vec<DirtyWalkLevel> = Vec::with_capacity(DIRTY_WALK_LEVELS);
+    levels.extend(dirty_walk_level(&state, &repository, parent_node, false).await?);
+
+    while let Some(level) = levels.last_mut() {
+        let Some(child_id) = level.next_child else {
+            if levels.pop().is_some_and(|done| done.appended) {
+                parent_path.pop();
+            }
+            continue;
+        };
+
+        let child = level.cursor.node(&state, &repository, child_id).await?;
+        child.walk_step(child_id, level.node, &mut level.cycle)?;
+        level.next_child = child.sibling();
+
+        if !child.is_dirty() {
+            continue;
         }
 
-        let mut child_node_opt = node.child();
-        let mut cycle = SiblingCycleGuard::new(parent_node);
-        while let Some(child_id) = child_node_opt {
-            let child = state.node(repository.clone(), child_id).await?;
-            child.walk_step(child_id, parent_node, &mut cycle)?;
-
-            if !child.is_dirty() {
-                child_node_opt = child.sibling();
-                continue;
-            }
-
-            let child_name = state.node_name_clone(repository.clone(), child_id).await?;
-            let child_path = parent_path.push_into_buf(&child_name).freeze();
-
-            // Don't carry forward dirty paths that the view/ignore filter
-            // excludes — they cannot be re-applied against a checkout that
-            // never materializes them. --force bypasses the filter.
-            let force = execution_context().globals().force();
-            if !force
-                && repository
-                    .filter
-                    .excludes(&child_path, child.is_directory(), FilterMode::Full)
-            {
-                child_node_opt = child.sibling();
-                continue;
-            }
-
-            let action_bits = NodeFlags::from_bits_truncate(child.flags) & NodeFlags::ActionBits;
-            let skip_for_staged = skip_staged && child.is_staged();
-            if !action_bits.is_empty() && !skip_for_staged {
-                paths.push(child_path.clone());
-            }
-
-            let stop_subtree = child.is_dirty_delete() || child.is_dirty_move();
-            if child.is_directory() && !stop_subtree {
-                collect_dirty_paths_inner(
-                    state.clone(),
-                    repository.clone(),
-                    child_id,
-                    child_path,
-                    paths,
-                    skip_staged,
-                )
-                .await?;
-            }
-
-            child_node_opt = child.sibling();
+        let contributes = dirty_path_contributes(&child, options.skip_staged);
+        let descends = dirty_path_descends(&child);
+        if !contributes && !descends {
+            continue;
         }
 
-        Ok(())
-    })
+        let appended =
+            push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?;
+
+        // Don't carry forward dirty paths that the view/ignore filter
+        // excludes — they cannot be re-applied against a checkout that
+        // never materializes them. --force bypasses the filter.
+        let excluded = !options.force
+            && repository.filter.excludes_tree(
+                &*parent_path,
+                child.is_directory(),
+                FilterMode::Full,
+            );
+
+        let mut descended = false;
+        if !excluded {
+            if contributes {
+                paths.push(parent_path.clone().freeze());
+            }
+
+            if descends {
+                let opened = dirty_walk_level(&state, &repository, child_id, appended).await?;
+                descended = opened.is_some();
+                levels.extend(opened);
+            }
+        }
+
+        if appended && !descended {
+            parent_path.pop();
+        }
+    }
+
+    Ok(())
 }
 
 pub struct TreePath {
@@ -4429,7 +4824,9 @@ async fn gather_tree_paths_node(
     let node = block.node(node_index);
     node.walk_step(node_id, expected_parent, cycle)?;
 
-    let node_name = block.node_name_ref(node_index).internal("Node name")?;
+    let node_name = block
+        .node_name_ref(node_index)
+        .forward::<StateError>("Node name")?;
     let node_path = if parent_path.is_empty() {
         RelativePath::new_from_initial_path(node_name).unwrap_or_default()
     } else {
@@ -4772,60 +5169,24 @@ pub async fn node_discard_nopatch<F>(
 where
     F: Fn(NodeID, u16) + Clone + Send + 'static,
 {
-    let mut counts = DiscardCounts::default();
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
     let block = state.block(repository.clone(), block_index).await?;
     let node = block.node(node_index);
 
-    if recurse && node.is_directory() {
-        // Directory, discard all children recursively, but no need to patch up parent/child/sibling pointers
-        // as all the nodes are discarded anyway
-        lore_trace!("Recursively discarding directory node {node_id}",);
-        let mut tasks = JoinSet::new();
-        let mut child_node_ref = node.child();
-        let mut cycle = SiblingCycleGuard::new(node_id);
-        while let Some(child_node_id) = child_node_ref {
-            let child_block_index = NodeBlock::index(child_node_id);
-            let child_node_index = Node::index(child_node_id);
-
-            let child_block = state.block(repository.clone(), child_block_index).await?;
-            let child_node = child_block.node(child_node_index);
-
-            child_node.walk_step(child_node_id, node_id, &mut cycle)?;
-
-            lore_spawn!(tasks, {
-                let state = state.clone();
-                let repository = repository.clone();
-                let handler = handler.clone();
-                async move {
-                    node_discard_recurse(
-                        state,
-                        repository,
-                        child_node_id,
-                        recurse,
-                        discard,
-                        handler,
-                    )
-                    .await
-                }
-            });
-
-            child_node_ref = child_node.sibling();
-        }
-
-        let mut task_failure = Ok(());
-        while let Some(task) = tasks.join_next().await {
-            if let Ok(result) = task {
-                let child_counts = result?;
-                counts.file_count += child_counts.file_count;
-                counts.directory_count += child_counts.directory_count;
-            } else {
-                task_failure = Err(task.unwrap_err());
-            }
-        }
-        task_failure.internal("Discard node task")?;
-    }
+    let mut counts = if recurse && node.is_directory() {
+        node_discard_children(
+            state.clone(),
+            repository.clone(),
+            node_id,
+            node.child(),
+            discard,
+            handler.clone(),
+        )
+        .await?
+    } else {
+        DiscardCounts::default()
+    };
 
     handler(node_id, node.flags);
 
@@ -4847,6 +5208,66 @@ where
     } else {
         counts.file_count += 1;
     }
+    Ok(counts)
+}
+
+/// Discards every node below `parent_node_id`, whose child chain starts at
+/// `first_child`, leaving that node and its hierarchy links untouched. Children
+/// are discarded concurrently: nothing in the subtree patches a parent, child
+/// or sibling pointer, so no walk observes a partially relinked chain. Each
+/// child's sibling is read before that child is discarded, since discarding
+/// repurposes the pointer for the block's free list.
+///
+/// With `discard` false the subtree is walked and reported through `handler`
+/// without being discarded. The returned counts cover the subtree, excluding
+/// `parent_node_id` itself.
+async fn node_discard_children<F>(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    parent_node_id: NodeID,
+    first_child: Option<NodeID>,
+    discard: bool,
+    handler: F,
+) -> Result<DiscardCounts, StateError>
+where
+    F: Fn(NodeID, u16) + Clone + Send + 'static,
+{
+    lore_trace!("Recursively discarding children of directory node {parent_node_id}");
+    let mut counts = DiscardCounts::default();
+    let mut tasks = JoinSet::new();
+    let mut child_node_ref = first_child;
+    let mut cycle = SiblingCycleGuard::new(parent_node_id);
+    while let Some(child_node_id) = child_node_ref {
+        let child_block = state
+            .block(repository.clone(), NodeBlock::index(child_node_id))
+            .await?;
+        let child_node = child_block.node(Node::index(child_node_id));
+
+        child_node.walk_step(child_node_id, parent_node_id, &mut cycle)?;
+
+        lore_spawn!(tasks, {
+            let state = state.clone();
+            let repository = repository.clone();
+            let handler = handler.clone();
+            async move {
+                node_discard_recurse(state, repository, child_node_id, true, discard, handler).await
+            }
+        });
+
+        child_node_ref = child_node.sibling();
+    }
+
+    let mut task_failure = Ok(());
+    while let Some(task) = tasks.join_next().await {
+        if let Ok(result) = task {
+            let child_counts = result?;
+            counts.file_count += child_counts.file_count;
+            counts.directory_count += child_counts.directory_count;
+        } else {
+            task_failure = Err(task.unwrap_err());
+        }
+    }
+    task_failure.internal("Discard node task")?;
     Ok(counts)
 }
 
@@ -5052,6 +5473,7 @@ async fn add_change(
             to: to.clone(),
             path: path.clone(),
             from_path: from_path.cloned(),
+            observed: None,
         })
         .await?;
 
@@ -5453,6 +5875,10 @@ pub struct FilesystemDiffStats {
     pub file_delete: AtomicU64,
     pub file_retain: AtomicU64,
     pub file_replace: AtomicU64,
+    /// Files the answer required reading, including any that could not be read.
+    pub file_hash: AtomicU64,
+    /// Files a recorded modified time answered for, sparing them a hash check.
+    pub file_mtime_match: AtomicU64,
 }
 
 impl FilesystemDiffStats {
@@ -5467,6 +5893,25 @@ impl FilesystemDiffStats {
             stats.file_replace.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.file_hash
+            .fetch_add(stats.file_hash.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.file_mtime_match.fetch_add(
+            stats.file_mtime_match.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record what settled a file's comparison. A size mismatch counts as neither.
+    pub fn classify(&self, modification: &FileModification) {
+        match modification.answered_by() {
+            ComparisonAnswer::Mtime => {
+                self.file_mtime_match.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Hash => {
+                self.file_hash.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Size => {}
+        }
     }
 }
 
@@ -5647,13 +6092,15 @@ pub async fn diff_filesystem_ex(
     }
 }
 
-/// Patch-discard reverted-DirtyAdd nodes collected during the parallel
-/// filesystem walk and clear stale `Dirty` propagation on each ancestor
-/// chain. Must only be called after the corresponding walk's task set has
-/// drained — discarding mid-walk mutates `parent.child` / sibling chains
-/// under walks that are still reading them and races into
+/// Patch-discard the nodes a parallel filesystem walk collected — a
+/// reverted `DirtyAdd`, or an entry behind a nested-repository boundary — and
+/// clear stale `Dirty` propagation on each ancestor chain. A directory node goes
+/// with the whole subtree below it, so no slot is left holding an entry
+/// unreachable from the root. Must only be called after the corresponding walk's
+/// task set has drained — discarding mid-walk mutates `parent.child` / sibling
+/// chains under walks that are still reading them and races into
 /// `node_discard_patch`'s `"Discard hierarchy broken"`.
-async fn apply_pending_discards(
+pub(crate) async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     mut pending_discards: Vec<NodeID>,
@@ -5673,6 +6120,19 @@ async fn apply_pending_discards(
         }
 
         let initial_ancestor = discard_node.parent;
+
+        if discard_node.is_directory() {
+            node_discard_children(
+                state.clone(),
+                repository.clone(),
+                discard_node_id,
+                discard_node.child(),
+                true,
+                |_, _| {},
+            )
+            .await?;
+        }
+
         node_discard_patch(
             state.clone(),
             repository.clone(),
@@ -5712,13 +6172,6 @@ async fn apply_pending_discards(
         }
     }
     Ok(())
-}
-
-struct FilesystemTraversal {
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_path: RelativePath,
-    root_node: NodeID,
 }
 
 struct DiffFilesystemContext {
@@ -5889,6 +6342,7 @@ async fn compare_single_file_against_state(
     current_node: Option<&Node>,
     file_metadata: &std::fs::Metadata,
     file_path: &RelativePath,
+    stats: &FilesystemDiffStats,
 ) -> Result<SingleFileCompareResult, StateError> {
     let Some(from_node) = from_node else {
         // No state node - this is a new file
@@ -5920,17 +6374,19 @@ async fn compare_single_file_against_state(
             current_node.is_none_or(|n| n.address.hash != from_node.address.hash);
 
         let (file_mtime, file_size) = util::fs::file_mtime_and_size(file_metadata);
-        let (modified, _) = is_file_modified(
+        let modification = file_modified_against_node(
             repository,
             from_node,
             file_mtime,
             file_size,
             file_path,
-            force_hash_check,
+            !force_hash_check,
+            None,
         )
         .await?;
+        stats.classify(&modification);
 
-        if modified {
+        if modification.is_modified() {
             return Ok(SingleFileCompareResult::Modified);
         }
     }
@@ -6107,6 +6563,7 @@ async fn emit_dirty_add_node_single(
         },
         path: path.clone(),
         from_path: None,
+        observed: None,
     })
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
@@ -6479,6 +6936,7 @@ async fn emit_single_delete(
         to,
         path: path.clone(),
         from_path: None,
+        observed: None,
     })
     .await
 }
@@ -6566,7 +7024,7 @@ async fn emit_filesystem_subtree_deletes(
         drop(child_name);
         if repository
             .filter
-            .excludes(&child_path, child_node.is_directory(), filter_mode)
+            .excludes_tree(&child_path, child_node.is_directory(), filter_mode)
         {
             continue;
         }
@@ -6592,7 +7050,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !had_child && !repository.filter.excludes(path, true, filter_mode) {
+    if !had_child && !repository.filter.excludes_tree(path, true, filter_mode) {
         // Empty in-view directory: clone/checkout writes it, so its absence is a
         // real deletion. It is the materializing leaf here, and its own buffered
         // entry (pushed above) is flushed and marked along with its ancestors.
@@ -6605,6 +7063,45 @@ async fn emit_filesystem_subtree_deletes(
     Ok(false)
 }
 
+/// Returns whether the child `name` of the directory `parent` addresses holds
+/// its own `.lore/`, making it a nested working copy. Such a working copy
+/// bounds the parent's filesystem walk: its contents belong to it, not to the
+/// parent, the way a nested `.git` bounds git. A legacy `.urc/` working copy is
+/// not a boundary — the format predates nesting support and no client that
+/// creates one is still in use.
+///
+/// `parent` holds the absolute path of the directory being walked and is
+/// restored before returning, so building a candidate costs no allocation once
+/// the buffer has grown. The driver copies the path it is handed, so passing a
+/// borrow leaves one allocation per candidate — handing over an owned path
+/// built per candidate instead costs the same copy plus the build.
+pub(crate) async fn is_nested_repository_root(parent: &mut std::path::PathBuf, name: &str) -> bool {
+    parent.push(name);
+    parent.push(DOT_LORE);
+    let nested = lore_io::IoDriver::global()
+        .metadata(parent.as_path())
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
+    parent.pop();
+    parent.pop();
+    nested
+}
+
+/// Match each filesystem item from `file_receiver` against `node_list` (the
+/// `from` state's children) and `current_node_list` (the `current` state's
+/// children), emitting changes into `changes`, marking matched entries in
+/// `node_list_found`, spawning subtree-recursion tasks into `tasks`, and
+/// queueing stale directory nodes into `pending_discards`. Items with no
+/// match in `node_list` are buffered and processed as new adds once the
+/// receiver is drained. Must only be called from [`diff_filesystem_directory`],
+/// which sorts `node_list` and `current_node_list` by name beforehand — the
+/// binary searches here assume that ordering.
+///
+/// A scan reconciles a node the current revision does not hold and no walked
+/// entry matched — removed from disk, or a directory the walk declined as a
+/// nested working copy — by queueing it for discard rather than reporting a
+/// `Delete`: with no committed base there is nothing to delete from, and no
+/// mutation verb would clear the entry.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
@@ -6617,6 +7114,8 @@ async fn diff_filesystem_directory_walk(
     stats: &mut FilesystemDiffStats,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
+    let repository_root = ctx.from.repository.require_path()?;
+    let mut nested_probe: Option<std::path::PathBuf> = None;
     let mut new_file_list = vec![];
     while let Some(entry) = file_listing.next().await {
         let Some(item) = util::fs::file_list_item(entry) else {
@@ -6724,6 +7223,7 @@ async fn diff_filesystem_directory_walk(
                 current_node_ref,
                 &item.metadata,
                 &item_path,
+                stats,
             )
             .await?;
 
@@ -6770,11 +7270,8 @@ async fn diff_filesystem_directory_walk(
                 (link_from.clone(), state_from.clone(), subnode_from)
             };
             let subpath = item_path.clone();
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: link_from,
                         state: state_from,
@@ -6788,20 +7285,27 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     // Crossing into the linked state; parent's link mounts
                     // are paths in the parent tree and do not apply here.
                     link_mounts: Arc::new(vec![]),
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else if was_directory && is_directory {
             if ctx.scan_dirty && !current_node_id.is_valid_node_id() {
-                // Re-emit a staged dirty-add directory (in staged, absent from
-                // the current revision) as a single node so repeated scans stay
-                // idempotent; the recursion below surfaces its children.
+                let probe = nested_probe
+                    .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+                if is_nested_repository_root(probe, item.name.as_str()).await {
+                    lore_trace!("Discarding zombie entry for nested repository root {item_path}");
+                    node_list_found[current_index] = false;
+                    continue;
+                }
                 emit_dirty_add_node_single(
                     node_list.repository.clone(),
                     node_list.state.clone(),
@@ -6851,7 +7355,6 @@ async fn diff_filesystem_directory_walk(
             } else {
                 (repository_current, state_current.clone(), current_node_id)
             };
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
             // Stay in the parent's link mounts when recursing into a normal
             // sub-directory; reset when crossing into a linked state because
             // those mount paths are in the parent tree, not the linked tree.
@@ -6860,10 +7363,8 @@ async fn diff_filesystem_directory_walk(
             } else {
                 ctx.link_mounts.clone()
             };
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -6877,13 +7378,16 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     link_mounts: link_mounts_recurse,
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else {
             // Type change: file <-> directory
             let file_ctx = FileDiffContext {
@@ -6938,6 +7442,23 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
+
+        if ctx.scan_dirty && from_node.node.is_directory() {
+            let in_current = current_node_list
+                .children
+                .as_slice()
+                .binary_search_by(|child| child.name.cmp(&from_named_node.name))
+                .is_ok();
+            if !in_current {
+                lore_trace!(
+                    "Queueing reverted uncommitted directory node {} (no entry at {}, not in current)",
+                    from_named_node.node,
+                    from_node.path
+                );
+                pending_discards.push(from_named_node.node);
+                continue;
+            }
+        }
 
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
@@ -7082,9 +7603,8 @@ async fn diff_filesystem_directory_walk(
                 let layer_state = mount.state.clone();
                 let subpath = child_file_path.clone();
                 let layer_source_node = mount.source_node;
-                lore_spawn!(
-                    tasks,
-                    diff_filesystem_subtree_recurse(DiffFilesystemContext {
+                diff_filesystem_subtree_dispatch(
+                    DiffFilesystemContext {
                         from: FilesystemTraversal {
                             repository: layer_repository.clone(),
                             state: layer_state.clone(),
@@ -7105,8 +7625,18 @@ async fn diff_filesystem_directory_walk(
                         // Crossing into the layer state; parent's link mounts
                         // are paths in the parent tree and do not apply here.
                         link_mounts: Arc::new(vec![]),
-                    },)
-                );
+                    },
+                    tasks,
+                    changes,
+                    stats,
+                )
+                .await?;
+                continue 'new_file_iter;
+            }
+            let probe = nested_probe
+                .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+            if is_nested_repository_root(probe, file.name.as_str()).await {
+                lore_trace!("Skipping nested repository root {child_file_path}");
                 continue 'new_file_iter;
             }
             lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
@@ -7166,9 +7696,8 @@ async fn diff_filesystem_directory_walk(
             let repository_current = ctx.current.repository.clone();
             let state_current = ctx.current.state.clone();
             let subpath = child_file_path.clone();
-            lore_spawn!(
-                tasks,
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -7187,8 +7716,12 @@ async fn diff_filesystem_directory_walk(
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
-                })
-            );
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
 
             // The single Dirty+Add directory node emitted above is the scan's
             // report for this new directory; skip the transient change below.
@@ -7221,16 +7754,77 @@ async fn diff_filesystem_directory_walk(
         .await?;
     }
 
-    while let Some(task_result) = tasks.join_next().await {
-        let (mut task_changes, task_stats) = task_result
-            .internal("Task failure")
-            .map_err(StateError::from)
-            .flatten()?;
-        changes.append(&mut task_changes);
-        stats.append(task_stats);
+    while let Some(joined) = tasks.join_next().await {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
     }
 
     Ok(())
+}
+
+/// Budget for subtree tasks live at once. Process-wide because every directory in the walk
+/// owns its own [`JoinSet`].
+static DIFF_FILESYSTEM_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
+    DIFF_FILESYSTEM_TASK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
+}
+
+/// Diffs one subtree, spawned while the budget allows and inline once it does not, then folds
+/// back whatever has finished.
+///
+/// Inline rather than a blocking acquire: a parent holds its permit until its children finish,
+/// so waiting on one would wait on a descendant that cannot start.
+async fn diff_filesystem_subtree_dispatch(
+    subtree: DiffFilesystemContext,
+    tasks: &mut JoinSet<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
+        lore_spawn!(tasks, async move {
+            let _permit = permit;
+            diff_filesystem_subtree_recurse(subtree).await
+        });
+    } else {
+        diff_filesystem_subtree_merge(
+            diff_filesystem_subtree_recurse(subtree).await?,
+            changes,
+            stats,
+        );
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
+    }
+    Ok(())
+}
+
+/// Folds a joined subtree task into the parent directory's changes and stats.
+fn diff_filesystem_subtree_merge_task(
+    joined: Result<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>, JoinError>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    diff_filesystem_subtree_merge(
+        joined
+            .internal("Task failure")
+            .map_err(StateError::from)
+            .flatten()?,
+        changes,
+        stats,
+    );
+    Ok(())
+}
+
+/// Folds a finished subtree's changes and stats into the parent directory's.
+fn diff_filesystem_subtree_merge(
+    subtree: (Vec<NodeChange>, FilesystemDiffStats),
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) {
+    let (mut subtree_changes, subtree_stats) = subtree;
+    changes.append(&mut subtree_changes);
+    stats.append(subtree_stats);
 }
 
 /// Handle diff for a single file path.
@@ -7300,6 +7894,7 @@ async fn diff_filesystem_single_file(
         current_node.as_ref(),
         &file_item.metadata,
         &ctx.filesystem_path,
+        &stats,
     )
     .await?;
 
@@ -7440,28 +8035,150 @@ pub async fn count_staged_files(
 }
 
 // TODO(UCS-13059): Extend with file mode check
-/// Content comparison size limit: files larger than this skip the fallback
-/// content comparison when hash mismatches occur due to chunking strategy
-/// differences.
-pub const CONTENT_COMPARE_MAX_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Outcome of comparing a file on disk to the content a node addresses.
+pub enum NodeComparison {
+    /// The file holds the node's content.
+    Matches,
+    /// The file differs from the node, or the stored object could not be described or walked
+    /// well enough to tell. Nothing was established in the latter case, and treating it as a
+    /// match would let a real local change be overwritten.
+    Differs,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it.
+    Unreadable,
+}
 
-/// Content comparison streaming threshold: files larger than this use
-/// streaming comparison instead of loading entire content into memory.
-const CONTENT_COMPARE_STREAM_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
+/// Whether the file on disk holds the content `node` addresses.
+///
+/// The file is measured against the stored object's own fragmentation, which is the only
+/// comparison that holds: a commit may reuse a previous fragmentation, so the stored hash is
+/// a function of the content and of how it came to be chunked, and re-hashing the content
+/// from scratch does not reproduce it.
+///
+/// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
+/// however large the stored object is. Reads no recorded modification time and records none:
+/// a recorded time speaks for the current revision's node, and this answers about any node.
+pub async fn file_matches_node(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    file_size: u64,
+    file_path: &RelativePath,
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
+) -> Result<NodeComparison, StateError> {
+    if file_size != node.size {
+        lore_trace!("File {file_path} size differs from node, differs");
+        return Ok(NodeComparison::Differs);
+    }
 
-pub async fn is_file_modified(
+    let own_path;
+    let own_content;
+    let content = if let Some(content) = content {
+        debug_assert!(
+            repository
+                .require_path()
+                .is_ok_and(|root| file_path.to_absolute_path(root) == content.path()),
+            "a shared memo answers for another file"
+        );
+        content
+    } else {
+        own_path = file_path.to_absolute_path(repository.require_path()?);
+        own_content = lore_storage::ContentHashMemo::new(&own_path);
+        &own_content
+    };
+    let matches =
+        immutable::file_matches(repository, node.address, Some(node.size as usize), content).await;
+
+    match matches {
+        Ok(lore_storage::FileMatch::Match) => {
+            lore_trace!("File {file_path} matches stored content");
+            Ok(NodeComparison::Matches)
+        }
+        Ok(lore_storage::FileMatch::Differs) => {
+            lore_trace!("File {file_path} differs from stored content");
+            Ok(NodeComparison::Differs)
+        }
+        Ok(lore_storage::FileMatch::Indeterminate) => {
+            lore_trace!("File {file_path} could not be compared, treated as differing");
+            Ok(NodeComparison::Differs)
+        }
+        Err(_) => {
+            lore_trace!("File {file_path} could not be read");
+            Ok(NodeComparison::Unreadable)
+        }
+    }
+}
+
+/// How a file compared to the node it was measured against, and what answered it.
+pub enum FileModification {
+    /// The recorded modified time vouched for the file, which was never read.
+    UnmodifiedByMtime,
+    /// A hash check established that the file holds the node's content.
+    UnmodifiedByHash,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it. Reported unmodified so a routine deletion does not
+    /// look like a local change, and never recorded: nothing was established.
+    Unreadable,
+    /// The size differs from the node's, which settles it without a hash check.
+    ModifiedBySize,
+    /// A hash check established that the file differs from the node.
+    ModifiedByHash,
+}
+
+/// What settled a file comparison, which is what the size and hash counters report.
+pub enum ComparisonAnswer {
+    /// The size differed from the node's, settling it without reading either the recorded
+    /// time or the file.
+    Size,
+    /// A recorded modified time vouched for the file, which was never read.
+    Mtime,
+    /// The file had to be read to answer, whether or not the read succeeded.
+    Hash,
+}
+
+impl FileModification {
+    /// Whether the file differs from the node.
+    pub fn is_modified(&self) -> bool {
+        matches!(
+            self,
+            FileModification::ModifiedBySize | FileModification::ModifiedByHash
+        )
+    }
+
+    /// What settled the comparison.
+    pub fn answered_by(&self) -> ComparisonAnswer {
+        match self {
+            FileModification::ModifiedBySize => ComparisonAnswer::Size,
+            FileModification::UnmodifiedByMtime => ComparisonAnswer::Mtime,
+            FileModification::UnmodifiedByHash
+            | FileModification::ModifiedByHash
+            | FileModification::Unreadable => ComparisonAnswer::Hash,
+        }
+    }
+}
+
+/// How the file on disk compares to the content `node` addresses.
+///
+/// Size and the recorded modification time answer first where they can, and comparing the
+/// content answers the rest. A recorded time speaks for the node the current revision holds
+/// and no other, so a caller asking about a different node sets `force_check_hash`, or else
+/// knows that no time can have been recorded for the path.
+///
+/// Records nothing. Whether an observed match is worth recording depends on which node was
+/// asked about, which only the caller knows.
+pub async fn file_modification(
     repository: Arc<RepositoryContext>,
     node: &Node,
     file_mtime: u64,
     file_size: u64,
     file_path: &RelativePath,
     force_check_hash: bool,
-) -> Result<(bool, Hash), StateError> {
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
+) -> Result<FileModification, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
     if file_size != node_size {
         lore_trace!("File {file_path} size changed, modified");
-        return Ok((true, Hash::default()));
+        return Ok(FileModification::ModifiedBySize);
     }
 
     let node_mtime = if !force_check_hash {
@@ -7469,151 +8186,272 @@ pub async fn is_file_modified(
     } else {
         0
     };
-    let mtime_match = file_mtime == node_mtime;
-
-    if !mtime_match {
-        lore_trace!(
-            "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
-        );
-        let absolute_path = file_path.to_absolute_path(repository.require_path()?);
-        let file_hash = immutable::hash_file(
-            repository.clone(),
-            &absolute_path,
-            Some(node.address),
-            Some(node.size as usize),
-        )
-        .await
-        .internal("Failed to hash file")
-        .map_err(StateError::from);
-
-        if let Ok(file_hash) = file_hash {
-            if file_hash == node.address.hash {
-                lore_trace!("File {file_path} unmodified, content hash equal to node");
-                file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-                return Ok((false, file_hash));
-            } else if file_size <= CONTENT_COMPARE_MAX_SIZE
-                && is_file_content_equal(
-                    repository.clone(),
-                    node.address,
-                    &absolute_path,
-                    file_size,
-                )
-                .await
-            {
-                lore_trace!(
-                    "File {file_path} hash mismatch but content equal (chunking compatibility)"
-                );
-                file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-                return Ok((false, file_hash));
-            } else {
-                lore_trace!("File {file_path} hash mismatch, modified");
-                return Ok((true, file_hash));
-            }
-        } else {
-            lore_trace!("File {file_path} hash failed, consider unmodified");
-        }
-    } else {
+    if file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
+        return Ok(FileModification::UnmodifiedByMtime);
     }
 
-    Ok((false, Hash::default()))
+    lore_trace!(
+        "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
+    );
+
+    Ok(
+        match file_matches_node(repository, node, file_size, file_path, content).await? {
+            NodeComparison::Matches => FileModification::UnmodifiedByHash,
+            NodeComparison::Differs => FileModification::ModifiedByHash,
+            NodeComparison::Unreadable => FileModification::Unreadable,
+        },
+    )
 }
 
-/// Compare the actual content of a stored object with a file on disk.
+/// How the file on disk compares to `node`, recording the modified time when a hash check is
+/// what established the match.
 ///
-/// This handles cases where the hash representation differs due to chunking
-/// strategy changes (e.g. threshold change from 64 KiB to 256 KiB) but the
-/// underlying content is identical. Uses `immutable::read()` for files up to
-/// 4 MiB and streaming comparison for larger files.
-pub async fn is_file_content_equal(
+/// `node_is_current` states that `node` is the one the current revision holds at this path,
+/// and gates both halves: a recorded time speaks for that node alone, so it can neither
+/// answer for any other node nor be written from a match against one. Recording here is what
+/// spares the next scan the hash check this one just paid for.
+pub async fn file_modified_against_node(
     repository: Arc<RepositoryContext>,
-    address: Address,
-    absolute_path: &std::path::Path,
+    node: &Node,
+    file_mtime: u64,
     file_size: u64,
-) -> bool {
-    if address.is_zero() {
-        return false;
+    file_path: &RelativePath,
+    node_is_current: bool,
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
+) -> Result<FileModification, StateError> {
+    let modification = file_modification(
+        repository.clone(),
+        node,
+        file_mtime,
+        file_size,
+        file_path,
+        !node_is_current,
+        content,
+    )
+    .await?;
+
+    if node_is_current && matches!(modification, FileModification::UnmodifiedByHash) {
+        file_modified_time_store(repository, file_path, file_mtime).await;
     }
 
-    let options = read_options_from_repository(&repository);
-
-    if file_size <= CONTENT_COMPARE_STREAM_THRESHOLD {
-        // Small file: load both into memory and compare
-        let stored = immutable::read(repository, address, None, options).await;
-        let local = lore_io::IoDriver::global()
-            .read_file_bytes(absolute_path)
-            .await;
-        match (stored, local) {
-            (Ok(stored_bytes), Ok(local_bytes)) => stored_bytes == local_bytes,
-            _ => false,
-        }
-    } else {
-        // Large file: stream stored content and compare chunk-by-chunk against
-        // the file read in matching chunks
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(4);
-        let repo_clone = repository.clone();
-        let stream_handle = lore_spawn!(async move {
-            immutable::read_stream(repo_clone, address, None, options, sender).await
-        });
-
-        let file = match lore_io::IoDriver::global()
-            .open(absolute_path, &lore_io::OpenOptions::new().read(true))
-            .await
-        {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-
-        let matched = stream_matches_file(&mut receiver, &file, file_size).await;
-
-        // Verify the stream completed successfully and we compared the
-        // entire file. A failed or partial stream must not be treated as
-        // content equality.
-        let stream_ok = stream_handle.await.is_ok_and(|r| r.is_ok());
-        matched && stream_ok
-    }
+    Ok(modification)
 }
 
-/// Whether every streamed chunk matched the file at the offset it belongs at, and whether they
-/// together covered it.
+/// Modified times collected by an operation, to be recorded once it has completed.
 ///
-/// Each read is sized to the chunk that arrived rather than to a fixed window, since the stored
-/// chunking need not match anything about the file on disk — only the bytes have to agree. The
-/// byte count against `file_size` is what catches a local file *longer* than the stored content:
-/// every chunk matches and the loop still ends when the stream does, so the length is the only
-/// thing left that disagrees. A shorter local file fails earlier, on the read.
-async fn stream_matches_file(
-    receiver: &mut tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>>,
-    file: &lore_io::IoFile,
-    file_size: u64,
-) -> bool {
-    let mut bytes_compared: u64 = 0;
-    while let Some(chunk) = receiver.recv().await {
-        let Ok(chunk) = chunk else {
-            return false;
+/// An entry states that a path held the current revision's content at that time. Recording
+/// as each file is handled would publish that before it is true and, worse, would vouch for
+/// a time the next write can still share, so entries are collected and written at the end by
+/// [`store`](Self::store). An operation that leaves the current revision elsewhere calls
+/// [`discard`](Self::discard).
+#[must_use]
+#[derive(Default)]
+pub struct RecordedModifiedTimes(Box<crossbeam::queue::SegQueue<(Hash, u64)>>);
+
+impl RecordedModifiedTimes {
+    /// Collects the entry recording that `path` held `repository`'s current content at
+    /// `mtime`.
+    pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
+        self.0
+            .push(file_modified_time_entry(repository, path, mtime));
+    }
+
+    /// Writes the collected times into `repository`'s mutable store, one task per store group.
+    ///
+    /// The store takes its write lock within the group a key's first byte selects, so
+    /// splitting the times by that byte lets every task run without ever contending with
+    /// another.
+    ///
+    /// Waits for the filesystem to stamp later than every time written, so that none of them
+    /// can be shared by a write that follows — bounded, so a filesystem that does not appear to
+    /// move on is left with times a following write can still share rather than being waited on
+    /// forever. See [`wait_until_settled`].
+    pub async fn store(&self, repository: Arc<RepositoryContext>) {
+        let mut times = Vec::with_capacity(self.0.len());
+        let mut mtime_max = 0;
+        while let Some((key, mtime)) = self.0.pop() {
+            mtime_max = mtime_max.max(mtime);
+            times.push((key, mtime));
+        }
+        if times.is_empty() || execution_context().globals().dry_run() {
+            return;
+        }
+        let Some(store) = repository.try_mutable_store_arc() else {
+            return;
         };
-        match file.read_exact_at(chunk.len(), bytes_compared).await {
-            Ok(local) if local == chunk => {
-                bytes_compared += chunk.len() as u64;
+
+        let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
+        for (key, mtime) in times {
+            groups[key.data()[0] as usize].push((key, mtime));
+        }
+
+        let mut tasks = JoinSet::new();
+        for items in groups {
+            if items.is_empty() {
+                continue;
             }
-            _ => return false,
+            lore_spawn!(tasks, {
+                let store = store.clone();
+                let partition = repository.id;
+                async move {
+                    file_modified_time_store_group(store, partition, items).await;
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        wait_until_settled(&repository, mtime_max).await;
+    }
+
+    /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
+    /// the key where it had the path rather than where it records.
+    pub fn push(&self, entry: (Hash, u64)) {
+        self.0.push(entry);
+    }
+
+    /// Moves the times collected by `other` into this collector.
+    pub fn absorb(&self, other: Self) {
+        while let Some(entry) = other.0.pop() {
+            self.0.push(entry);
         }
     }
-    bytes_compared == file_size
+
+    /// Removes the times collected so far, leaving the collector empty.
+    pub fn take(&self) -> Self {
+        let taken = Self::default();
+        while let Some(entry) = self.0.pop() {
+            taken.0.push(entry);
+        }
+        taken
+    }
+
+    /// Drops the times, for an operation that leaves the current revision elsewhere.
+    pub fn discard(&self) {
+        while self.0.pop().is_some() {}
+    }
 }
 
-pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: impl AsRef<str>) -> Hash {
+/// Name of the file stamped to read the working copy's own clock.
+const MODIFIED_TIME_PROBE: &str = "mtime-probe";
+
+/// The whole time [`wait_until_settled`] may spend on the filesystem's clock.
+///
+/// A filesystem whose stamps do not advance — one keeping a clock coarser than the tick the
+/// wait assumes, one handing out a single time for the whole run, or one failing every probe —
+/// would otherwise hold the operation open indefinitely. Giving up leaves the recorded times
+/// unable to tell a following write apart, the same position a working copy that cannot be
+/// stamped at all is in.
+const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The path of the file stamped to read the working copy's clock, `None` when the working copy
+/// has no path to stamp.
+fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
+    Some(
+        repository
+            .require_path()
+            .ok()?
+            .join(repository.format.dot_dir())
+            .join(MODIFIED_TIME_PROBE),
+    )
+}
+
+/// Stamps the probe at `path` and reads back the time the filesystem gave it.
+///
+/// The metadata a write returns is taken while the file is still open, which on a filesystem
+/// that settles the stamp when the handle closes is not the time the file ends up carrying.
+/// The write closes the file before it completes, so reading the time back in a call of its
+/// own asks about the state a later scan will see.
+///
+/// `None` when either call fails: a probe that could not be written or read says nothing about
+/// the filesystem's clock, which is the same answer as a working copy that cannot be stamped.
+async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
+    let driver = lore_io::IoDriver::global();
+    driver
+        .write_file_bytes(path, bytes::Bytes::from_static(&[0u8]), false)
+        .await
+        .ok()?;
+    let metadata = driver.metadata(path).await.ok()?;
+    Some(crate::util::fs::file_mtime(&metadata))
+}
+
+/// The time the working copy's filesystem is currently stamping writes with.
+///
+/// A file's modified time comes from a clock the filesystem advances on its own schedule and
+/// at its own resolution, which the process clock runs ahead of. Comparing a recorded time
+/// against [`std::time::SystemTime::now`] therefore always finds it older, however recently
+/// the file was written. Stamping a file and reading it back asks the filesystem instead, so
+/// the answer is on the scale the comparison needs.
+///
+/// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
+/// settled time from one a further write can still share.
+pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
+    stamp_probe(&modified_time_probe_path(repository)?).await
+}
+
+/// Waits until the working copy's filesystem stamps later than `mtime_max`.
+///
+/// A file carrying the stamp the filesystem is still handing out can be written again without
+/// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
+/// the operation open until the filesystem has moved past every time it recorded leaves all
+/// of them able to, at the cost of at most the tick the filesystem is currently in — and never
+/// more than [`MODIFIED_TIME_SETTLE_LIMIT`], which is the ceiling on the whole wait rather than
+/// on the sleeps alone, so a probe that hangs cannot hold the operation either.
+///
+/// A probe that failed says nothing about the clock — least of all that it has moved on — so
+/// the wait asks again rather than reading the failure as settled, and the limit is what ends a
+/// wait that cannot get an answer.
+///
+/// The probe is removed on the way out however the wait ended, so a stamp file is not left
+/// behind in the dot directory.
+///
+/// Returns without waiting when the working copy cannot be stamped, which leaves no way to
+/// tell whether the times have settled.
+pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
+    let Some(path) = modified_time_probe_path(repository) else {
+        return;
+    };
+    let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
+        while !stamp_probe(&path)
+            .await
+            .is_some_and(|stamp| mtime_max < stamp)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let _ = lore_io::IoDriver::global().remove_file(&path).await;
+}
+
+/// The key a file's modification time is stored under.
+///
+/// The store is case-insensitive over paths, and [`RelativePath`] already carries
+/// the fold, so the key is taken from it rather than folded again. Folding here
+/// would allocate a `String` per file, half a million of them in one scan of a
+/// large tree.
+pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: &RelativePath) -> Hash {
     hash::hash_function_args_slice(
         salt,
         FILE_MTIME,
         instance.data(),
-        path.as_ref().to_lowercase().as_bytes(),
+        path.as_lowercase_str().as_bytes(),
     )
 }
 
-pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: impl AsRef<str>) -> u64 {
-    let path = path.as_ref();
+/// The entry recording that `path` held the current revision's content at `mtime`, for a
+/// caller collecting entries to write in one batch rather than one at a time.
+pub fn file_modified_time_entry(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    mtime: u64,
+) -> (Hash, u64) {
+    (
+        file_modified_time_key(repository.salt(), repository.instance_id, path),
+        mtime,
+    )
+}
+
+pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &RelativePath) -> u64 {
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
     let mtime = if let Ok(value) = repository
         .read_mutable_store()
@@ -7632,13 +8470,19 @@ pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: impl A
     mtime
 }
 
+/// Records that `path` held the current revision's content at `mtime`.
+///
+/// A dry run records nothing: it leaves the current revision where it was, so no time it
+/// takes describes the revision the working copy is on.
 pub async fn file_modified_time_store(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<str>,
+    path: &RelativePath,
     mtime: u64,
 ) {
-    let path = path.as_ref();
     lore_trace!("Store mtime {mtime} for {path}");
+    if execution_context().globals().dry_run() {
+        return;
+    }
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
     };
@@ -7648,11 +8492,10 @@ pub async fn file_modified_time_store(
         .await;
 }
 
-/// Batch-write a collection of pre-computed `(mtime_key, mtime)` pairs into the
-/// mutable store. Used by the clone hot path so each `clone_file` task can drop
-/// its mtime into a shared buffer and a single fire-and-forget task issues the
-/// store calls instead of every task awaiting its own bucket lock inline.
-pub async fn file_modified_time_store_batch(
+/// Writes one store group's worth of pre-computed `(mtime_key, mtime)` pairs.
+///
+/// Every entry belongs to the same group, so the calls contend with no other group's task.
+async fn file_modified_time_store_group(
     store: Arc<dyn crate::store::MutableStore>,
     partition: RepositoryId,
     items: Vec<(Hash, u64)>,
@@ -7665,8 +8508,7 @@ pub async fn file_modified_time_store_batch(
     }
 }
 
-pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: impl AsRef<str>) {
-    let path = path.as_ref();
+pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: &RelativePath) {
     lore_trace!("Clear mtime for {path}");
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
@@ -7822,7 +8664,7 @@ async fn verify_node_name_case_impl(
                 None, // No link tracking in state verification
             )
             .await
-            .internal("Verify delete")?;
+            .forward::<StateError>("Verify delete")?;
 
             if delete_node.node == current_named_node.node {
                 break;
@@ -7957,7 +8799,7 @@ async fn collect_name_fragments(
                     let _block_data =
                         NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true)
                             .await
-                            .internal("Failed to deserialize node block")?;
+                            .forward::<StateError>("Failed to deserialize node block")?;
                     Ok(Hash::default())
                 }
             }
@@ -8519,7 +9361,7 @@ async fn collect_new_node_metadata_fragments(
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
             .await
-            .internal("Failed to deserialize metadata")?
+            .forward::<StateError>("Failed to deserialize metadata")?
     } else {
         NodeFileMetadataBlockData::new_from_heap_zeroed()
     };
@@ -8530,7 +9372,7 @@ async fn collect_new_node_metadata_fragments(
         true,
     )
     .await
-    .internal("Failed to deserialize metadata")?;
+    .forward::<StateError>("Failed to deserialize metadata")?;
 
     let mut metadata_blobs = vec![];
     {
@@ -8557,7 +9399,7 @@ async fn collect_new_node_metadata_fragments(
     for metadata_blob in metadata_blobs.iter() {
         let metadata = Metadata::deserialize(repository.clone(), metadata_blob.hash)
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         metadata.walk(
             |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
@@ -8739,7 +9581,7 @@ pub async fn apply_tree_changes(
                 None,
             )
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
         }
     }
 
@@ -8772,7 +9614,7 @@ pub async fn apply_tree_changes(
                     None,
                 )
                 .await
-                .internal("Node not found")?;
+                .forward::<StateError>("Node not found")?;
             }
         }
 
@@ -8798,7 +9640,7 @@ pub async fn apply_tree_changes(
             crate::filter::FilterMode::Full,
         )
         .await
-        .internal("Node not found")?;
+        .forward::<StateError>("Node not found")?;
     }
 
     Ok(())
@@ -8808,93 +9650,83 @@ pub async fn apply_tree_changes(
 mod tests {
     use super::*;
 
-    /// A file holding `contents` plus a handle open on it, alive while the directory is.
-    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
-    async fn file_holding(contents: &[u8]) -> (tempfile::TempDir, lore_io::IoFile) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("local");
-        std::fs::write(&path, contents).expect("write local file");
-        let file = lore_io::IoDriver::global()
-            .open(&path, &lore_io::OpenOptions::new().read(true))
-            .await
-            .expect("open local file");
-        (dir, file)
+    /// The key every stored modification time is filed under. It has to stay the
+    /// digest over the path's own lowercase form, or a scan finds nothing it wrote
+    /// and rehashes every file in the repository.
+    fn mtime_key_reference(salt: &[u8], instance: InstanceId, path: &RelativePath) -> Hash {
+        hash::hash_function_args_slice(
+            salt,
+            FILE_MTIME,
+            instance.data(),
+            path.as_str().to_lowercase().as_bytes(),
+        )
     }
 
-    /// Feeds `chunks` through a channel the way the stored-content stream does.
-    fn stream_of(
-        chunks: &[&[u8]],
-    ) -> tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<
-            Result<Bytes, lore_storage::StorageError>,
-        >(chunks.len().max(1));
-        for chunk in chunks {
-            sender
-                .try_send(Ok(Bytes::copy_from_slice(chunk)))
-                .expect("channel sized for the chunks");
+    /// Taking the fold [`RelativePath`] carries is only the same key as folding the
+    /// path here where the two folds agree, which above ASCII is not free: the
+    /// mapping can change a component's length and can depend on where in a word a
+    /// character falls.
+    #[test]
+    fn the_mtime_key_is_the_digest_over_the_paths_own_lowercase_form() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        for name in [
+            "Rock.mesh",
+            "Assets/Meshes/ROCK.MESH",
+            "MIXED_Case-123/PATH/To.TXT",
+            // Above ASCII: a fold that changes the length, one that depends on
+            // position in a word, and one of each across a separator.
+            "\u{0130}stanbul/Map.umap",
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
+            "\u{039f}\u{0394}\u{039f}\u{03a3}/Stra\u{00df}e/\u{1e9e}.uasset",
+        ] {
+            let path = RelativePath::new_from_initial_path(name).expect("a clean relative path");
+            assert_eq!(
+                file_modified_time_key(salt, instance, &path),
+                mtime_key_reference(salt, instance, &path),
+                "{name:?}"
+            );
         }
-        receiver
     }
 
-    #[tokio::test]
-    async fn a_file_matching_every_chunk_is_equal() {
-        let (_dir, file) = file_holding(b"one-two-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(stream_matches_file(&mut stream, &file, 13).await);
+    /// A path built up a component at a time is what the clone and walk paths hand
+    /// in, and it folds each component as it is appended rather than the whole.
+    #[test]
+    fn a_pushed_path_keys_the_same_as_the_whole_of_it() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        let mut buf = RelativePathBuf::new();
+        buf.push("\u{039f}\u{0394}\u{039f}\u{03a3}");
+        buf.push("Stra\u{00df}E");
+        buf.push("\u{0130}.uasset");
+        let pushed = buf.freeze();
+        assert_eq!(
+            file_modified_time_key(salt, instance, &pushed),
+            mtime_key_reference(salt, instance, &pushed)
+        );
     }
 
-    /// The chunking of the stored content says nothing about the file, so a single chunk and
-    /// many chunks over the same bytes must agree.
-    #[tokio::test]
-    async fn chunk_boundaries_do_not_affect_the_result() {
-        let (_dir, file) = file_holding(b"one-two-three").await;
-        let mut stream = stream_of(&[b"one-two-three"]);
-        assert!(stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    /// Every chunk matches and the stream still describes less than the file holds. Nothing in
-    /// the loop can see that, which is why the byte count is checked after it.
-    #[tokio::test]
-    async fn a_local_file_longer_than_the_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-two-three-and-more").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 22).await);
-    }
-
-    /// A short file fails on the read rather than on the count, since the last chunk asks for
-    /// bytes past the end.
-    #[tokio::test]
-    async fn a_local_file_shorter_than_the_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-two").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 7).await);
-    }
-
-    #[tokio::test]
-    async fn a_chunk_differing_mid_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-XXX-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    /// The offsets are the running total of what came before, so a mismatch in the first chunk
-    /// is caught where a comparison anchored at zero would have missed it.
-    #[tokio::test]
-    async fn a_chunk_differing_at_the_start_is_not_equal() {
-        let (_dir, file) = file_holding(b"XXX-two-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    #[tokio::test]
-    async fn an_empty_stream_matches_only_an_empty_file() {
-        let (_dir, file) = file_holding(b"").await;
-        let mut stream = stream_of(&[]);
-        assert!(stream_matches_file(&mut stream, &file, 0).await);
-
-        let (_dir, file) = file_holding(b"content").await;
-        let mut stream = stream_of(&[]);
-        assert!(!stream_matches_file(&mut stream, &file, 7).await);
+    /// The lowercase form carries offsets of its own, since a fold can change a
+    /// component's byte length, so a path narrowed to a suffix has to key as that
+    /// suffix and not as a window into the wrong one.
+    #[test]
+    fn a_path_narrowed_to_a_suffix_keys_as_that_suffix() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        let mut narrowed = RelativePath::new_from_initial_path("\u{0130}\u{0130}/Assets/Rock.mesh")
+            .expect("a clean relative path");
+        narrowed.pop_root();
+        assert_eq!(narrowed.as_str(), "Assets/Rock.mesh");
+        let whole =
+            RelativePath::new_from_initial_path("Assets/Rock.mesh").expect("a clean relative path");
+        assert_eq!(
+            file_modified_time_key(salt, instance, &narrowed),
+            file_modified_time_key(salt, instance, &whole)
+        );
+        assert_eq!(
+            file_modified_time_key(salt, instance, &narrowed),
+            mtime_key_reference(salt, instance, &narrowed)
+        );
     }
 
     #[test]
@@ -8921,6 +9753,11 @@ mod tests {
     /// A state with no serialized link list, so the registry lives only in the runtime copy and
     /// every read has to come from there.
     async fn null_repository() -> Arc<RepositoryContext> {
+        null_repository_excluding(&[]).await
+    }
+
+    /// [`null_repository`] whose ignore filter excludes `globs`.
+    async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
         let immutable_store = lore_storage::local::immutable_store::create(
             None::<&str>,
             lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -8937,10 +9774,157 @@ mod tests {
         .await
         .expect("in-memory mutable store");
 
-        Arc::new(RepositoryContext::new_null_context(
-            immutable_store,
-            mutable_store,
-        ))
+        let mut filter = crate::filter::Filter::default();
+        for glob in globs {
+            filter.ignore.add_exclusion(glob).expect("filter exclusion");
+        }
+
+        let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+        context.filter = Arc::new(filter);
+        Arc::new(context)
+    }
+
+    /// A repository with a working tree, so a file on disk can be measured against a node.
+    async fn working_tree_repository(path: &std::path::Path) -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+        context.path = Some(path.to_path_buf());
+        Arc::new(context)
+    }
+
+    fn pseudo_random_bytes(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect()
+    }
+
+    fn content_node(content: &[u8]) -> Node {
+        let mut node = Node::new_zeroed();
+        node.address = Address::zero_context_hash(Hash::hash_buffer(content));
+        node.size = content.len() as u64;
+        node
+    }
+
+    /// A file written into the working tree, and the path it is known by.
+    async fn write_working_file(
+        repository: &Arc<RepositoryContext>,
+        name: &str,
+        content: &[u8],
+    ) -> RelativePath {
+        let path = crate::util::path::RelativePathBuf::new().push_and_freeze(name);
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                path.to_absolute_path(repository.require_path().expect("working tree")),
+                bytes::Bytes::copy_from_slice(content),
+                false,
+            )
+            .await
+            .expect("write working file");
+        path
+    }
+
+    /// A comparison that settles nothing has to read as modified. The address names a list
+    /// nothing stored, so neither the stored chunking nor a rehash can answer, and
+    /// overwriting a file that may hold local work is the one outcome there is no
+    /// recovering from.
+    #[tokio::test]
+    async fn a_comparison_that_settles_nothing_reads_as_modified() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(150 * 1024);
+        let path = write_working_file(&repository, "settles-nothing.bin", &content).await;
+
+        let mut node = content_node(&content);
+        node.address = Address::zero_context_hash(Hash::hash_buffer(b"a list nothing stored"));
+
+        assert!(matches!(
+            file_matches_node(repository.clone(), &node, node.size, &path, None,)
+                .await
+                .expect("comparing a readable file must not error"),
+            NodeComparison::Differs
+        ));
+        assert!(
+            file_modification(repository, &node, 1, node.size, &path, true, None,)
+                .await
+                .expect("comparing a readable file must not error")
+                .is_modified()
+        );
+    }
+
+    /// Content addressed by its own hash needs nothing from the store to be decided,
+    /// either way.
+    #[tokio::test]
+    async fn an_unfragmented_file_is_decided_by_its_own_hash() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024);
+        let path = write_working_file(&repository, "unfragmented.bin", &content).await;
+        let node = content_node(&content);
+
+        assert!(matches!(
+            file_matches_node(repository.clone(), &node, node.size, &path, None,)
+                .await
+                .expect("comparing a readable file must not error"),
+            NodeComparison::Matches
+        ));
+
+        let mut edited = content.clone();
+        edited[content.len() / 2] ^= 0xff;
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                path.to_absolute_path(repository.require_path().expect("working tree")),
+                bytes::Bytes::from(edited),
+                false,
+            )
+            .await
+            .expect("rewrite working file");
+
+        assert!(
+            file_modification(repository, &node, 1, node.size, &path, true, None,)
+                .await
+                .expect("comparing a readable file must not error")
+                .is_modified()
+        );
+    }
+
+    /// A file of another size is modified without the file being read at all.
+    #[tokio::test]
+    async fn a_file_of_another_size_is_modified_unread() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024);
+        let path = write_working_file(&repository, "resized.bin", &content).await;
+        let node = content_node(&content[..content.len() - 1]);
+
+        assert!(matches!(
+            file_modification(
+                repository,
+                &node,
+                1,
+                content.len() as u64,
+                &path,
+                false,
+                None,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
+            FileModification::ModifiedBySize
+        ));
     }
 
     fn link_id(byte: u8) -> RepositoryId {
@@ -9009,5 +9993,1031 @@ mod tests {
             Hash::from([2u8; 32]),
             "the untouched link must keep its signature"
         );
+    }
+
+    /// A node carrying `flags`, named for the name table by its hash.
+    fn dirty_node(name: &str, flags: NodeFlags) -> Node {
+        Node {
+            name_hash: lore_storage::hash::hash_string(name),
+            flags: flags.bits(),
+            ..Default::default()
+        }
+    }
+
+    /// Adds `name` under `parent` with `flags` and returns it.
+    async fn add_dirty_node(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        name: &str,
+        flags: NodeFlags,
+    ) -> NodeID {
+        state
+            .node_add(repository, parent, dirty_node(name, flags), name)
+            .await
+            .expect("adding a node to the walked tree")
+    }
+
+    /// The dirty paths of the whole tree, sorted, so the assertions do not depend
+    /// on the order the sibling chain happens to hold.
+    async fn walk_dirty_paths(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        options: DirtyWalkOptions,
+    ) -> Vec<String> {
+        let mut collected = walk_dirty_paths_in_order(state, repository, options).await;
+        collected.sort();
+        collected
+    }
+
+    /// An empty name on a directory, which is descended, so the name is taken off
+    /// where its level ends rather than where the loop body does.
+    ///
+    /// The directory appended nothing, so its level must take nothing off. A level
+    /// that popped unconditionally would remove its parent's own last component,
+    /// and the sibling walked next would be named against the wrong parent.
+    #[tokio::test]
+    async fn an_empty_directory_name_leaves_its_parent_on_the_path() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let outer = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "outer",
+            NodeFlags::Dirty,
+        )
+        .await;
+        // Added first so the prepending chain walks it last, after the empty name.
+        add_dirty_node(&state, repository.clone(), outer, "after.txt", file).await;
+        let unnamed = add_dirty_node(&state, repository.clone(), outer, "", NodeFlags::Dirty).await;
+        add_dirty_node(&state, repository.clone(), unnamed, "inner.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec!["outer/inner.txt", "outer/after.txt"],
+            "the sibling after an empty-named directory keeps its parent's prefix"
+        );
+    }
+
+    /// `U+0130` folds to two scalars, so the directory is one byte longer in the
+    /// buffer's lowercase form than in its written one. The walk pops the whole
+    /// component off both, or the sibling that follows inherits what is left.
+    #[tokio::test]
+    async fn a_component_whose_fold_is_longer_is_popped_off_both_forms() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let folded = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "MESH_\u{130}",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            folded,
+            "inner.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "after.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["MESH_\u{130}/inner.txt", "after.txt"],
+            "the sibling is named against the root, not against what the fold left"
+        );
+    }
+
+    /// A sibling chain longer than one node block, so the walk crosses a block
+    /// boundary part way along it.
+    ///
+    /// [`BlockCursor`] holds the block it last read and only fetches another when
+    /// the node it is asked for is not in that one. A cursor that never moved
+    /// would read the wrong nodes from the block it opened on, so every chain a
+    /// test walks has to be long enough to leave it.
+    #[tokio::test]
+    async fn a_sibling_chain_spanning_node_blocks_is_walked_whole() {
+        const CHILDREN: usize = crate::node::BLOCK_NODE_COUNT + 200;
+
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+        let directory = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "spanning",
+            NodeFlags::Dirty,
+        )
+        .await;
+        for index in 0..CHILDREN {
+            add_dirty_node(
+                &state,
+                repository.clone(),
+                directory,
+                &format!("file_{index:04}.txt"),
+                NodeFlags::DirtyModify | NodeFlags::File,
+            )
+            .await;
+        }
+
+        let walked = walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await;
+        let expected: Vec<String> = (0..CHILDREN)
+            .map(|index| format!("spanning/file_{index:04}.txt"))
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "every child is recorded once, whichever block it lives in"
+        );
+    }
+
+    /// Points `node`'s sibling link at `sibling`, forging a chain no tree edit
+    /// produces.
+    async fn forge_sibling(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        sibling: NodeID,
+    ) {
+        let block = state
+            .block(repository, NodeBlock::index(node))
+            .await
+            .expect("the block holding the node");
+        block.write().node(Node::index(node)).sibling = sibling;
+    }
+
+    /// The dirty paths under `parent_node`, in the order the walk records them.
+    async fn walk_dirty_paths_under(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        options: DirtyWalkOptions,
+    ) -> Result<Vec<String>, StateError> {
+        let mut paths = Vec::new();
+        collect_dirty_paths_inner(
+            state,
+            repository,
+            parent_node,
+            &mut RelativePathBuf::new(),
+            &mut paths,
+            options,
+        )
+        .await?;
+        Ok(paths.iter().map(|p| p.as_str().to_string()).collect())
+    }
+
+    /// The dirty paths of the whole tree, in the order the walk records them.
+    async fn walk_dirty_paths_in_order(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        options: DirtyWalkOptions,
+    ) -> Vec<String> {
+        walk_dirty_paths_under(state, repository, ROOT_NODE, options)
+            .await
+            .expect("walking the tree")
+    }
+
+    /// Adding a node prepends it, so each level's chain is the reverse of the
+    /// order its children were added in here.
+    #[tokio::test]
+    async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let gamma = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "gamma",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "beta.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let alpha = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "alpha",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+
+        let deep =
+            add_dirty_node(&state, repository.clone(), alpha, "deep", NodeFlags::Dirty).await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            alpha,
+            "one.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            deep,
+            "two.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            gamma,
+            "four.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            gamma,
+            "three.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "alpha",
+                "alpha/one.txt",
+                "alpha/deep/two.txt",
+                "beta.txt",
+                "gamma/three.txt",
+                "gamma/four.txt",
+            ],
+            "each subtree is recorded where its directory sits in its parent's chain"
+        );
+    }
+
+    /// A directory that carries an action of its own and is also descended is
+    /// recorded before anything below it: the action re-creates the directory the
+    /// paths under it are re-applied into.
+    #[tokio::test]
+    async fn a_directory_is_recorded_before_the_paths_under_it() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "later.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let added = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "added",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        let inner = add_dirty_node(
+            &state,
+            repository.clone(),
+            added,
+            "inner",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            inner,
+            "leaf.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec!["added", "added/inner", "added/inner/leaf.txt", "later.txt"],
+            "a directory precedes its descendants, and its whole subtree precedes its sibling"
+        );
+    }
+
+    /// A child the walk passes over — clean, staged where staged paths are
+    /// skipped, or a directory with nothing dirty under it — leaves its level
+    /// walking: the siblings behind it are still visited, in chain order.
+    #[tokio::test]
+    async fn a_passed_over_child_does_not_end_its_sibling_chain() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "last.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "empty",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "staged.txt",
+            NodeFlags::DirtyModify | NodeFlags::StagedModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "clean.txt",
+            NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "first.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_under(
+                state,
+                repository,
+                ROOT_NODE,
+                DirtyWalkOptions {
+                    skip_staged: true,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking the tree"),
+            vec!["first.txt", "last.txt"],
+            "the chain is walked past a clean child, a staged child and an empty directory"
+        );
+    }
+
+    /// Descent costs a stack entry, not a frame, so nesting past the depth the
+    /// stack is sized for is walked whole and in constant stack.
+    #[tokio::test]
+    async fn a_path_nested_deeper_than_the_walk_stack_is_recorded_in_full() {
+        const DEPTH: usize = 1024;
+
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let mut parent = ROOT_NODE;
+        for level in 0..DEPTH {
+            parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                parent,
+                &format!("d{level}"),
+                NodeFlags::Dirty,
+            )
+            .await;
+        }
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            parent,
+            "leaf.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let expected = (0..DEPTH)
+            .map(|level| format!("d{level}"))
+            .chain(std::iter::once("leaf.txt".to_string()))
+            .collect::<Vec<String>>()
+            .join("/");
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![expected],
+            "the only dirty node is the leaf, named under all {DEPTH} levels above it"
+        );
+    }
+
+    /// Every level guards its own sibling chain, so a cycle is reported against
+    /// the directory whose chain holds it and not against the walk's root.
+    #[tokio::test]
+    async fn a_sibling_cycle_below_the_root_is_reported_against_its_own_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let sub = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "sub",
+            NodeFlags::Dirty,
+        )
+        .await;
+        let second = add_dirty_node(
+            &state,
+            repository.clone(),
+            sub,
+            "second.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let first = add_dirty_node(
+            &state,
+            repository.clone(),
+            sub,
+            "first.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        forge_sibling(&state, repository.clone(), second, first).await;
+
+        let error = walk_dirty_paths_under(
+            state,
+            repository,
+            ROOT_NODE,
+            DirtyWalkOptions {
+                skip_staged: false,
+                force: false,
+            },
+        )
+        .await
+        .expect_err("a sibling chain that loops must be reported");
+        let hierarchy = error
+            .as_invalid_node_hierarchy()
+            .unwrap_or_else(|| panic!("a looping chain is an invalid hierarchy, got {error}"));
+        assert_eq!(
+            hierarchy.expected_parent, sub,
+            "the guard that tripped belongs to the level holding the cycle"
+        );
+    }
+
+    /// Only a directory holds a chain to walk. A link's children live in another
+    /// repository's state and a file has none, so a walk rooted at either records
+    /// nothing, and from above they are recorded without being descended.
+    #[tokio::test]
+    async fn a_link_or_file_walk_root_is_not_descended() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let link = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "link",
+            NodeFlags::DirtyModify | NodeFlags::Link,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            link,
+            "linked.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let file = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "file.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            file,
+            "under.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert!(
+            walk_dirty_paths_under(
+                state.clone(),
+                repository.clone(),
+                link,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking a link")
+            .is_empty(),
+            "a link is not descended"
+        );
+        assert!(
+            walk_dirty_paths_under(
+                state.clone(),
+                repository.clone(),
+                file,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking a file")
+            .is_empty(),
+            "a file is not descended"
+        );
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["file.txt", "link"],
+            "both are recorded from above, neither is descended"
+        );
+    }
+
+    /// A `DirtyDelete` or `DirtyMove` directory is re-applied whole, so the walk
+    /// records it and stops. Descending would collect descendants the parent
+    /// action already covers.
+    ///
+    /// A directory that is merely propagated-dirty is the opposite case and is in
+    /// the same tree: it carries no action of its own, contributes no path, and
+    /// must still be descended to reach the file that made it dirty.
+    #[tokio::test]
+    async fn a_deleted_or_moved_directory_is_recorded_without_descending() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let removed = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "removed",
+            NodeFlags::DirtyDelete,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            removed,
+            "inside.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let moved = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "moved",
+            NodeFlags::DirtyMove,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            moved,
+            "carried.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let touched = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "touched",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            touched,
+            "edited.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["moved", "removed", "touched/edited.txt"],
+            "a deleted or moved directory is recorded and not descended, \
+             and a propagated-dirty directory is descended and not recorded"
+        );
+    }
+
+    /// The buffer the walk names into carries the whole ancestry, and a sibling
+    /// visited after a descent is named against its own parent again.
+    ///
+    /// A child is prepended into the sibling chain, so the subdirectory added
+    /// last at each level is walked first and the file beside it is named once the
+    /// descent has returned.
+    #[tokio::test]
+    async fn a_nested_dirty_file_carries_the_whole_prefix() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let mut parent = ROOT_NODE;
+        for (directory, name) in [
+            ("assets", "a.txt"),
+            ("meshes", "b.txt"),
+            ("rock", "c.txt"),
+            ("detail", "d.txt"),
+        ] {
+            parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                parent,
+                directory,
+                NodeFlags::Dirty,
+            )
+            .await;
+            add_dirty_node(&state, repository.clone(), parent, name, file).await;
+        }
+        add_dirty_node(&state, repository.clone(), parent, "e.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "assets/a.txt",
+                "assets/meshes/b.txt",
+                "assets/meshes/rock/c.txt",
+                "assets/meshes/rock/detail/d.txt",
+                "assets/meshes/rock/detail/e.txt",
+            ],
+        );
+    }
+
+    /// Three subtrees under one parent, each of a different depth. Every path is
+    /// named against the parent and not against whatever the subtree walked
+    /// before it left behind.
+    #[tokio::test]
+    async fn sibling_subtrees_at_one_depth_are_named_against_their_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        for (subtree, depth) in [("left", 1usize), ("middle", 2), ("right", 3)] {
+            let mut parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                subtree,
+                NodeFlags::Dirty,
+            )
+            .await;
+            for level in 0..depth {
+                add_dirty_node(&state, repository.clone(), parent, "leaf.txt", file).await;
+                parent = add_dirty_node(
+                    &state,
+                    repository.clone(),
+                    parent,
+                    &format!("level_{level}"),
+                    NodeFlags::Dirty,
+                )
+                .await;
+            }
+            add_dirty_node(&state, repository.clone(), parent, "leaf.txt", file).await;
+        }
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "left/leaf.txt",
+                "left/level_0/leaf.txt",
+                "middle/leaf.txt",
+                "middle/level_0/leaf.txt",
+                "middle/level_0/level_1/leaf.txt",
+                "right/leaf.txt",
+                "right/level_0/leaf.txt",
+                "right/level_0/level_1/leaf.txt",
+                "right/level_0/level_1/level_2/leaf.txt",
+            ],
+        );
+    }
+
+    /// A directory carrying an action of its own is recorded and then descended,
+    /// and the path recorded for it is its own however deep its children go.
+    #[tokio::test]
+    async fn a_directory_is_recorded_before_it_is_descended() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        add_dirty_node(&state, repository.clone(), ROOT_NODE, "tail.txt", file).await;
+        let added = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "added",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), added, "leaf.txt", file).await;
+        let deeper = add_dirty_node(
+            &state,
+            repository.clone(),
+            added,
+            "deeper",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), deeper, "deep.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "added",
+                "added/deeper",
+                "added/deeper/deep.txt",
+                "added/leaf.txt",
+                "tail.txt",
+            ],
+            "a directory is recorded before it is descended, and its own path \
+             is not extended by what its children append"
+        );
+    }
+
+    /// A node the filter excludes is neither recorded nor descended, and the
+    /// siblings walked after it are still named against their own parent.
+    ///
+    /// The excluded node sits in the middle of the chain: children are prepended,
+    /// so `blocked` is walked between `gamma` and `alpha`.
+    #[tokio::test]
+    async fn siblings_after_a_filtered_node_keep_their_own_prefix() {
+        let repository = null_repository_excluding(&["blocked"]).await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let alpha = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "alpha",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), alpha, "one.txt", file).await;
+        let blocked = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "blocked",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), blocked, "hidden.txt", file).await;
+        let gamma = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "gamma",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), gamma, "two.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["alpha/one.txt", "gamma/two.txt"],
+            "the excluded subtree is pruned and the sibling after it is named \
+             against the root"
+        );
+    }
+
+    /// A node whose name is empty names its parent, since
+    /// [`RelativePathBuf::push`] ignores an empty component. The sibling after it
+    /// is still named against the parent, so nothing was taken off for a
+    /// component that was never appended.
+    #[tokio::test]
+    async fn an_empty_node_name_names_its_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let outer = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "outer",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), outer, "x.txt", file).await;
+        add_dirty_node(&state, repository.clone(), outer, "", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["outer", "outer/x.txt"],
+        );
+    }
+
+    /// The commit walk records nothing for a node that is also staged: its action
+    /// belongs to the revision being written. Every other caller wants both.
+    #[tokio::test]
+    async fn a_staged_node_is_recorded_only_when_staged_nodes_are_wanted() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "staged.txt",
+            NodeFlags::DirtyModify | NodeFlags::File | NodeFlags::StagedModify,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "dirty_only.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions {
+                    skip_staged: true,
+                    force: false,
+                },
+            )
+            .await,
+            vec!["dirty_only.txt"],
+            "a staged node is already in the commit and must not be re-applied"
+        );
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["dirty_only.txt", "staged.txt"],
+            "without skip_staged both carry an action to record"
+        );
+    }
+
+    /// A path the filter excludes cannot be re-applied against a checkout that
+    /// never materializes it, so it is not recorded. `force` records it anyway.
+    #[tokio::test]
+    async fn a_filtered_path_is_recorded_only_under_force() {
+        let repository = null_repository_excluding(&["ignored.txt"]).await;
+        let state = Arc::new(State::new());
+
+        for name in ["ignored.txt", "kept.txt"] {
+            add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                name,
+                NodeFlags::DirtyModify | NodeFlags::File,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions::default()
+            )
+            .await,
+            vec!["kept.txt"],
+            "an excluded path has no checkout to be re-applied against"
+        );
+        assert_eq!(
+            walk_dirty_paths(
+                state,
+                repository,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: true,
+                },
+            )
+            .await,
+            vec!["ignored.txt", "kept.txt"],
+            "force bypasses the filter"
+        );
+    }
+
+    /// Excluding a directory prunes its subtree: the filter is asked about the
+    /// directory before the walk descends into it, so a path below an excluded
+    /// directory is never reached.
+    #[tokio::test]
+    async fn an_excluded_directory_is_not_descended() {
+        let repository = null_repository_excluding(&["build"]).await;
+        let state = Arc::new(State::new());
+
+        let build = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "build",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            build,
+            "artifact.o",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "kept.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions::default()
+            )
+            .await,
+            vec!["kept.txt"],
+            "the subtree of an excluded directory is not walked"
+        );
+        assert_eq!(
+            walk_dirty_paths(
+                state,
+                repository,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: true,
+                },
+            )
+            .await,
+            vec!["build/artifact.o", "kept.txt"],
+            "force reaches what the exclusion pruned"
+        );
+    }
+
+    /// The walk descends only directories. Nothing below a link is in this state,
+    /// and `Node::child` means nothing on a file - it holds a modification time.
+    #[tokio::test]
+    async fn walking_from_anything_but_a_directory_records_nothing() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "file.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let link = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "link",
+            NodeFlags::Dirty | NodeFlags::Link,
+        )
+        .await;
+
+        for (label, node) in [("a file", file), ("a link", link)] {
+            let mut paths = Vec::new();
+            collect_dirty_paths_inner(
+                state.clone(),
+                repository.clone(),
+                node,
+                &mut RelativePathBuf::new(),
+                &mut paths,
+                DirtyWalkOptions::default(),
+            )
+            .await
+            .expect("walking from a non-directory");
+            assert!(paths.is_empty(), "walking from {label} records nothing");
+        }
     }
 }

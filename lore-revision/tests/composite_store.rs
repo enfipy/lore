@@ -307,8 +307,6 @@ mod tests {
             None
         }
 
-        async fn compact_stop(self: Arc<Self>) {}
-
         fn max_query_batch(&self) -> Option<usize> {
             self.max_query_batch
         }
@@ -2278,6 +2276,7 @@ mod tests {
         use lore_base::lore_spawn;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_base::types::Address;
+        use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_revision::fragment::generate_random;
@@ -2410,8 +2409,6 @@ mod tests {
                 None
             }
 
-            async fn compact_stop(self: Arc<Self>) {}
-
             fn max_query_batch(&self) -> Option<usize> {
                 None
             }
@@ -2422,6 +2419,17 @@ mod tests {
 
             async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
                 Ok(())
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                _source_partition: Partition,
+                _source_address: Address,
+                _destination_partition: Partition,
+                _destination_context: Context,
+                _durable: bool,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::internal("Copy not supported by this store"))
             }
         }
 
@@ -3135,6 +3143,7 @@ mod tests {
         use bytes::Bytes;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_base::types::Address;
+        use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_revision::fragment::generate_random;
@@ -3262,10 +3271,6 @@ mod tests {
                 self.inner.clone().compact_resume_at().await
             }
 
-            async fn compact_stop(self: Arc<Self>) {
-                self.inner.clone().compact_stop().await;
-            }
-
             fn max_query_batch(&self) -> Option<usize> {
                 self.inner.max_query_batch()
             }
@@ -3276,6 +3281,26 @@ mod tests {
 
             async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
                 self.inner.clone().verify(heal).await
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                source_partition: Partition,
+                source_address: Address,
+                destination_partition: Partition,
+                destination_context: Context,
+                durable: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .copy(
+                        source_partition,
+                        source_address,
+                        destination_partition,
+                        destination_context,
+                        durable,
+                    )
+                    .await
             }
         }
 

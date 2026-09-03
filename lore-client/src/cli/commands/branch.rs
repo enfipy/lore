@@ -50,6 +50,7 @@ use crate::println;
 use crate::progress_bar::ProgressBar;
 use crate::progress_bar::progress_debug;
 use crate::progress_bar::sync::apply_sync_progress_to_bar;
+use crate::stats_display;
 use crate::styling::BranchStyles;
 use crate::styling::CommonStyles;
 use crate::styling::FileActionStyle;
@@ -155,6 +156,12 @@ pub struct BranchMergeArgs {
     /// Change the message for committing when no conflicts arise from the merge
     #[clap(long, action)]
     message: Option<String>,
+
+    /// Carry this metadata key from the source revision onto the merge
+    /// revision. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the merge itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -182,6 +189,12 @@ pub struct BranchMergeStartArgs {
     /// Merge only the main repository, skipping all linked repositories
     #[clap(long, action, conflicts_with = "link")]
     ignore_links: bool,
+
+    /// Carry this metadata key from the source revision onto the merge
+    /// revision. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the merge itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -235,6 +248,13 @@ pub struct BranchMergeIntoArgs {
     /// Merge only the main repository, skipping all linked repositories
     #[clap(long, action, conflicts_with = "link")]
     ignore_links: bool,
+
+    /// Carry this metadata key from the current branch onto the revision
+    /// created on the target branch. Repeatable. Pass `*` to carry every key
+    /// that is not reserved to the merge itself. Carries nothing when not
+    /// given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -431,13 +451,13 @@ pub enum BranchCommands {
 
 #[derive(Args)]
 pub struct BranchLatestArgs {
-    /// List previous latest pointers of a branch
     #[command(subcommand)]
     subcommand: BranchLatestCommands,
 }
 
 #[derive(Subcommand)]
 pub enum BranchLatestCommands {
+    /// List previous latest pointers of a branch
     List(BranchLatestListArgs),
 }
 
@@ -886,6 +906,9 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         println!("Pushed {} fragment(s)", data.fragments);
                     }
                 }
+            LoreEvent::BranchPushStats(data) => {
+                stats_display::print_push_totals(data);
+            }
             LoreEvent::BranchPushBranchCreateBegin(data) => {
                 println!(
                     "Creating branch {} at {}",
@@ -1010,6 +1033,9 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
         message,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+            &args.inherit_metadata,
+        )),
     };
 
     let debug = progress_debug();
@@ -1076,6 +1102,9 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
         no_commit: args.no_commit as u8,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+            &args.inherit_metadata,
+        )),
     };
 
     let debug = progress_debug();
@@ -1317,6 +1346,7 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
             dry_run: false,
             link: None,
             ignore_links: false,
+            inherit_metadata: args.inherit_metadata.clone(),
         };
 
         return handle_branch_merge_start(globals, &sub_args);
@@ -1449,18 +1479,32 @@ pub fn handle_branch_diff(globals: LoreGlobalArgs, args: &BranchDiffArgs) -> u8 
                 );
             }
             LoreEvent::BranchDiffChange(data) => {
-                println!(
-                    "{}{}{} {}{}",
-                    FileActionStyle::from_action(data.change.action),
-                    data.change.action.as_string_short(),
-                    anstyle::Reset,
-                    data.change.path.as_str(),
-                    if data.change.automerged != 0 {
-                        " (automerged)"
-                    } else {
-                        ""
-                    }
-                );
+                let automerged = if data.change.automerged != 0 {
+                    " (automerged)"
+                } else {
+                    ""
+                };
+
+                if data.change.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}{}",
+                        FileActionStyle::from_action(data.change.action),
+                        data.change.action.as_string_short(),
+                        anstyle::Reset,
+                        data.change.path.as_str(),
+                        automerged
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}{}",
+                        FileActionStyle::from_action(data.change.action),
+                        data.change.action.as_string_short(),
+                        anstyle::Reset,
+                        data.change.from_path.as_str(),
+                        data.change.path.as_str(),
+                        automerged
+                    );
+                }
             }
             LoreEvent::BranchDiffChangeEnd(_data) => {}
             LoreEvent::BranchDiffConflictBegin(data) if data.conflicts_count > 0 => {

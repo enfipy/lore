@@ -32,12 +32,14 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
+use crate::repository::clone::CloneContext;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -191,9 +193,9 @@ struct LayerConfig {
 }
 
 async fn load_config(config_path: impl AsRef<Path>) -> Result<LayerConfig, LayerError> {
-    Ok(crate::util::config::load(config_path)
+    crate::util::config::load(config_path)
         .await
-        .internal("Failed to load configuration")?)
+        .forward::<LayerError>("Failed to load configuration")
 }
 
 async fn save_config(
@@ -201,9 +203,9 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
-    Ok(crate::util::config::save(config, config_path)
+    crate::util::config::save(config, config_path)
         .await
-        .internal("Failed to save configuration")?)
+        .forward::<LayerError>("Failed to save configuration")
 }
 
 pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {
@@ -406,7 +408,7 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let absolute_path = target_path.to_absolute_path(repository.require_path()?);
+    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
 
     // Materialize layer
     lore_debug!("Connecting remote storage");
@@ -420,7 +422,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(&target_path),
+        target_path: LoreString::from(target_path.relative().clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -430,25 +432,33 @@ pub async fn add(
 
     // Ensure the target path exist to clone into
     lore_io::IoDriver::global()
-        .create_dir_all(&absolute_path)
+        .create_dir_all(target_path.absolute())
         .await
         .internal("Failed to create the target directory for layer")?;
 
-    clone::clone_node(
-        layer_repository.clone(),
-        layer_storage,
-        layer_state,
-        absolute_path,
-        source_path,
-        layer_node_link.node,
-        Arc::new(clone::CloneOptions {
+    let layer_operation = layer_repository
+        .file_system()
+        .begin_operation()
+        .await
+        .forward::<LayerError>("Failed to start operation")?;
+    let clone_ctx = CloneContext {
+        repository: layer_repository.clone(),
+        state: layer_state,
+        operation: layer_operation.clone(),
+        options: Arc::new(clone::CloneOptions {
             ignore_existing: false,
             ..Default::default()
         }),
-        Arc::default(), /* Default stats */
-    )
-    .await
-    .forward::<LayerError>("Failed cloning target layer")?;
+        stats: Arc::default(),
+        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+    };
+    clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
+        .await
+        .forward::<LayerError>("Failed cloning target layer")?;
+    layer_operation
+        .finalize(true)
+        .await
+        .forward::<LayerError>("Failed to finalize operation")?;
 
     save_config(
         token,
@@ -687,16 +697,17 @@ fn walk_layer_subtree<'a>(
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&metadata);
                         if !child_node.is_staged() {
-                            let is_modified = state::is_file_modified(
+                            let is_modified = state::file_modification(
                                 layer_repository.clone(),
                                 &child_node,
                                 file_mtime,
                                 file_size,
                                 &child_path,
                                 true,
+                                None,
                             )
                             .await
-                            .map_or(true, |(m, _)| m);
+                            .map_or(true, |modification| modification.is_modified());
                             if is_modified {
                                 modified.push(child_path.as_str().to_string());
                             }
@@ -724,6 +735,18 @@ fn walk_layer_subtree<'a>(
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, LayerError> {
     let config = load_config(layer_config_path(repository.require_path()?)).await?;
     Ok(config.layers)
+}
+
+/// The mount paths of `layers`, for routing a path to the layer that owns it and
+/// for masking those subtrees out of a parent-repository walk.
+///
+/// Takes an iterator so callers holding `Layer` alongside its state or context
+/// can project without rebuilding a `Vec<Layer>` first.
+pub fn target_paths<'a>(layers: impl IntoIterator<Item = &'a Layer>) -> Vec<String> {
+    layers
+        .into_iter()
+        .map(|layer| layer.target_path.clone())
+        .collect()
 }
 
 /// For operations that cascade into every configured layer.

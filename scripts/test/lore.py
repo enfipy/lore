@@ -11,6 +11,7 @@ import random
 import shutil
 import string
 import subprocess
+import sys
 import typing
 import uuid
 from collections.abc import Iterable
@@ -45,6 +46,8 @@ from lore_parsers import (
     parse_file_info,
     parse_shared_store_info,
     SharedStoreInfo,
+    parse_shared_store_list,
+    SharedStoreList,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,6 +149,11 @@ def verify_signatures(revision_list: list[RevisionInfo], expected_count):
     )
 
 
+def _inherit_metadata_args(keys: list[str] | None) -> list[str]:
+    """Repeat --inherit-metadata once per key, as the flag takes one key each."""
+    return [arg for key in keys or [] for arg in ("--inherit-metadata", key)]
+
+
 class Lore:
     def __init__(
         self,
@@ -200,6 +208,17 @@ class Lore:
             return ".urcignore"
         return ".loreignore"
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for any subprocess this repository drives."""
+        env = os.environ.copy()
+        for k, v in self.environment_vars.items():
+            env[k] = v
+        env["LORE_GLOBAL_PATH"] = self.global_dir
+        # Isolate the auth token store per test so a developer's
+        # locally cached credentials don't leak into smoke runs.
+        env.setdefault("LORE_AUTH_PATH", self.global_dir)
+        return env
+
     def run(
         self,
         urc_args: list[str] | None = None,
@@ -225,6 +244,8 @@ class Lore:
         search_nearest: bool = False,
         no_gc: bool = False,
         non_interactive: bool = False,
+        stats: int | None = None,
+        event_interval: int | None = None,
     ):
         if urc_args is None:
             urc_args = []
@@ -259,6 +280,12 @@ class Lore:
             + (["--search-nearest"] if search_nearest else [])
             + (["--no-gc"] if no_gc else [])
             + (["--non-interactive"] if non_interactive else [])
+            + ([f"--stats={stats}"] if stats is not None else [])
+            + (
+                ["--event-interval", str(event_interval)]
+                if event_interval is not None
+                else []
+            )
             + urc_args
         )
         command_string = " ".join(command_args)
@@ -278,13 +305,7 @@ class Lore:
         max_attempts = 3
         while True:
             try:
-                env = os.environ.copy()
-                for k, v in self.environment_vars.items():
-                    env[k] = v
-                env["LORE_GLOBAL_PATH"] = self.global_dir
-                # Isolate the auth token store per test so a developer's
-                # locally cached credentials don't leak into smoke runs.
-                env.setdefault("LORE_AUTH_PATH", self.global_dir)
+                env = self._subprocess_env()
                 output = subprocess.run(
                     command_args,
                     capture_output=True,
@@ -547,12 +568,16 @@ class Lore:
         self,
         name: str | None = None,
         repo_id: str | None = None,
+        message: str | None = None,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["branch", "merge"]
             + ([name] if name else [])
-            + (["--id", repo_id] if repo_id else []),
+            + (["--id", repo_id] if repo_id else [])
+            + (["--message", message] if message else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -577,6 +602,7 @@ class Lore:
         repo_id: str | None = None,
         link: str | None = None,
         ignore_links: bool = False,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -589,7 +615,8 @@ class Lore:
             ]
             + (["--id", repo_id] if repo_id else [])
             + (["--link", link] if link else [])
-            + (["--ignore-links"] if ignore_links else []),
+            + (["--ignore-links"] if ignore_links else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -1019,13 +1046,15 @@ class Lore:
         revision: str | None = None,
         message: str | None = None,
         no_commit: bool = False,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["revision", "cherry-pick"]
             + ([revision] if revision else [])
             + (["--message", message] if message else [])
-            + (["--no-commit"] if no_commit else []),
+            + (["--no-commit"] if no_commit else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -1627,14 +1656,49 @@ class Lore:
             **kwargs,
         )
 
-    def auth_user_info(
-        self, remote_url: str | None = None, **kwargs: Unpack[GlobalOptions]
-    ):
-        return self.run(
-            ["auth", "user-info"]
-            + (["--remote-url", remote_url] if remote_url else []),
-            **kwargs,
+    def auth_user_info_capi(
+        self, library_path: str, user_ids: str | list[str] | None = None
+    ) -> int:
+        """Resolve user IDs through the public C API, returning the FFI code.
+
+        `authUserInfo` has no CLI surface — the commands that resolve display
+        names discard failures — so this drives `liblore` directly, the same
+        entry point the SDK binds. The call runs in a subprocess so it reads
+        this repository's isolated auth and global directories, and so a crash
+        in the library fails this test rather than the whole pytest worker.
+        """
+        if user_ids is None:
+            user_ids = []
+        elif isinstance(user_ids, str):
+            user_ids = [user_ids]
+
+        command_args = [
+            sys.executable,
+            str(Path(__file__).with_name("lore_ffi.py")),
+            library_path,
+            self.path,
+            *user_ids,
+        ]
+        command_string = " ".join(command_args)
+        logger.info("Executing Lore C API driver: %s", command_string)
+        # Run from the repository, as `run()` does: repository discovery falls
+        # back to the working directory, and the checkout pytest runs from is
+        # itself a repository — inheriting that cwd would let a bad repository
+        # path silently resolve somewhere else.
+        result = subprocess.run(
+            command_args,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            cwd=self.path if os.path.isdir(self.path) else None,
         )
+        logger.info(
+            "Lore C API driver (%s) exited %s, output:\n%s",
+            command_string,
+            result.returncode,
+            result.stdout + result.stderr,
+        )
+        return result.returncode
 
     def layer_add(
         self,
@@ -1915,13 +1979,25 @@ class Lore:
 
     def dirty_move(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "move", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "move",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
     def dirty_copy(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "copy", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "copy",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
@@ -2025,7 +2101,6 @@ class Lore:
     def commit(
         self,
         message: str | None = None,
-        stats: bool = False,
         link: str | None = None,
         link_messages: dict[str, str] | None = None,
         layer: str | None = None,
@@ -2045,7 +2120,6 @@ class Lore:
                 layer_args.extend(["--layer-message", path, msg])
         return self.run(
             ["commit", message if message else ""]
-            + (["--stats"] if stats else [])
             + (["--link", link] if link else [])
             + link_args
             + (["--layer", layer] if layer else [])
@@ -2267,6 +2341,32 @@ class Lore:
         output = self.run(["shared-store", "info"])
         if can_parse_output(kwargs):
             return parse_shared_store_info(output)
+        return output
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptionsParseable]
+    ) -> SharedStoreList: ...
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None: ...
+
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None:
+        output = self.run(
+            [
+                "shared-store",
+                "list",
+                "--include-instances",
+                "true" if include_instances else "false",
+            ],
+            **kwargs,
+        )
+        if can_parse_output(kwargs):
+            return parse_shared_store_list(output)
         return output
 
     def shared_store_set_use_automatically(self, enabled: bool):
