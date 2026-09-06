@@ -21,7 +21,9 @@ use crate::errors::LocalModifications;
 use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemPath;
+use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::MeasuredNode;
@@ -138,21 +140,31 @@ pub async fn realize_state(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let (mut changes, _stats) = operation
-            .changes_from_filesystem_to_state(
-                repository.clone(),
-                state_target.clone(),
-                repository.clone(),
-                state_current.clone(),
-                RelativePath::new(),
-                ROOT_NODE,
-                ROOT_NODE,
-                options.filter_mode | FilterMode::Ignore,
-            )
-            .await
-            .forward::<SyncError>(
-                "Failed to calculate delta changes between file system and target state",
-            )?;
+        let mut changes = Vec::new();
+        state::diff_filesystem_subtree(
+            &operation,
+            FilesystemTraversal {
+                repository: repository.clone(),
+                state: state_target.clone(),
+                node_path: RelativePath::new(),
+                root_node: ROOT_NODE,
+            },
+            FilesystemTraversal {
+                repository: repository.clone(),
+                state: state_current.clone(),
+                node_path: RelativePath::new(),
+                root_node: ROOT_NODE,
+            },
+            RelativePath::new(),
+            options.filter_mode | FilterMode::Ignore,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+            &mut changes,
+        )
+        .await
+        .forward::<SyncError>(
+            "Failed to calculate delta changes between file system and target state",
+        )?;
         /*
         stats.change.file_retain.fetch_add(
             diff_stats.file_retain.load(Ordering::Relaxed) as usize,
@@ -715,21 +727,31 @@ pub async fn verify_filesystem(
                 })?;
             let subnode_current = current_node_link.node;
             let state_from = change.from.state.clone();
-            let (directory_changes, _) = operation
-                .changes_from_filesystem_to_state(
-                    change.from.repository.clone(),
-                    state_from.clone(),
-                    repository_current,
-                    state_current.clone(),
-                    change.path.clone(),
-                    change.from.node,
-                    subnode_current,
-                    filter_mode,
-                )
-                .await
-                .forward::<SyncError>(
-                    "Failed to calculate delta changes between file system and target state",
-                )?;
+            let mut directory_changes = Vec::new();
+            state::diff_filesystem_subtree(
+                &operation,
+                FilesystemTraversal {
+                    repository: change.from.repository.clone(),
+                    state: state_from.clone(),
+                    node_path: change.path.clone(),
+                    root_node: change.from.node,
+                },
+                FilesystemTraversal {
+                    repository: repository_current,
+                    state: state_current.clone(),
+                    node_path: change.path.clone(),
+                    root_node: subnode_current,
+                },
+                change.path.clone(),
+                filter_mode,
+                FilesystemDiffIntent::Report,
+                Arc::new(Vec::new()),
+                &mut directory_changes,
+            )
+            .await
+            .forward::<SyncError>(
+                "Failed to calculate delta changes between file system and target state",
+            )?;
             if !directory_changes.is_empty() {
                 let mut has_modified_file = false;
                 for subchange in directory_changes {
@@ -1699,9 +1721,16 @@ async fn realize_change_modify_add(
                 stats: Arc::default(),
                 modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
             };
-            clone::clone_node(clone_ctx, link_storage, clone_path, node.child)
-                .await
-                .forward::<SyncError>("Failed to sync link")?;
+            let clone_states = link.filter.mount_states(clone_path.relative());
+            clone::clone_node(
+                clone_ctx,
+                link_storage,
+                clone_path,
+                node.child,
+                clone_states,
+            )
+            .await
+            .forward::<SyncError>("Failed to sync link")?;
         }
     } else if node.is_file() && !dry_run && write_to_disk {
         // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.

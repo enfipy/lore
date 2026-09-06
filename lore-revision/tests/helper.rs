@@ -38,7 +38,7 @@ pub fn default_repository_creation_args(
     mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
 ) -> lore_revision::repository::RepositoryContextCreationArgs {
     lore_revision::repository::RepositoryContextCreationArgs {
-        path: None,
+        paths: None,
         immutable_store,
         mutable_store,
         id: lore_base::types::Context::from(uuid::Uuid::now_v7()).into(),
@@ -47,7 +47,6 @@ pub fn default_repository_creation_args(
             lore_base::error::NoRemote,
         )),
         filter: std::sync::Arc::default(),
-        format: lore_revision::repository::RepositoryFormat::Lore,
         filesystem_provider: None,
     }
 }
@@ -62,7 +61,6 @@ pub trait RepositoryContextCreationArgsExt {
         remote: Result<std::sync::Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
     ) -> Self;
     fn with_filter(self, filter: std::sync::Arc<lore_revision::filter::Filter>) -> Self;
-    fn with_format(self, format: lore_revision::repository::RepositoryFormat) -> Self;
     fn with_filesystem_provider(
         self,
         filesystem_provider: std::sync::Arc<
@@ -73,7 +71,10 @@ pub trait RepositoryContextCreationArgsExt {
 
 impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryContextCreationArgs {
     fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        self.path = Some(path.as_ref().to_owned());
+        self.paths = Some(lore_revision::repository::RepositoryPaths::new(
+            path.as_ref().to_path_buf(),
+            path.as_ref().join(lore_revision::repository::DOT_LORE),
+        ));
         self
     }
 
@@ -97,11 +98,6 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
 
     fn with_filter(mut self, filter: std::sync::Arc<lore_revision::filter::Filter>) -> Self {
         self.filter = filter;
-        self
-    }
-
-    fn with_format(mut self, format: lore_revision::repository::RepositoryFormat) -> Self {
-        self.format = format;
         self
     }
 
@@ -247,18 +243,33 @@ pub async fn test_scan(
     state_staged: std::sync::Arc<lore_revision::state::State>,
     state_current: std::sync::Arc<lore_revision::state::State>,
 ) -> Vec<lore_revision::change::NodeChange> {
-    let (changes, _stats) = lore_revision::state::diff_filesystem_ex(
-        repository.clone(),
-        state_staged,
-        repository,
-        state_current,
+    let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+        repository.file_system().as_ref(),
+    )
+    .await
+    .expect("Failed to start filesystem operation");
+    let mut changes = Vec::new();
+    lore_revision::state::diff_filesystem(
+        &operation,
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
         None, /* full tree */
         lore_revision::filter::FilterMode::Full,
-        true, /* scan_dirty */
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
         std::sync::Arc::new(Vec::new()),
+        &mut changes,
     )
     .await
     .expect("Failed to diff filesystem");
+    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+        .await
+        .expect("Failed to finish filesystem operation");
     changes
 }
 

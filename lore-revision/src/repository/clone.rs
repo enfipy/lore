@@ -27,9 +27,10 @@ use tokio_util::task::AbortOnDropHandle;
 use super::RepositoryAccess;
 use super::RepositoryContext;
 use super::RepositoryContextCreationArgs;
-use super::RepositoryFormat;
 use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
+use super::VfsConfig;
+use super::get_dot_lore_path;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::dependency;
@@ -38,11 +39,13 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::hash::hash_string_bytes;
+use crate::instance::InstanceId;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -152,26 +155,20 @@ impl EventError for CloneError {
 
 struct RepositoryCloneGuard {
     pub path: PathBuf,
-    pub dotpath: PathBuf,
     pub clean_path_on_drop: bool,
-    pub clean_dotpath_on_drop: bool,
 }
 
-fn initialize_guard(path: &Path, dotpath: &Path, dry_run: bool) -> RepositoryCloneGuard {
-    RepositoryCloneGuard {
-        path: path.to_path_buf(),
-        dotpath: dotpath.to_path_buf(),
-        clean_path_on_drop: dry_run && !path.exists(),
-        clean_dotpath_on_drop: dry_run && !dotpath.exists(),
+impl RepositoryCloneGuard {
+    pub fn new(path: &Path, dry_run: bool) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            clean_path_on_drop: dry_run && !path.exists(),
+        }
     }
 }
 
 impl Drop for RepositoryCloneGuard {
     fn drop(&mut self) {
-        if self.clean_dotpath_on_drop {
-            #[allow(clippy::disallowed_methods)] // Authorized clone-failure cleanup.
-            let _ = std::fs::remove_dir_all(self.dotpath.as_path());
-        }
         if self.clean_path_on_drop {
             #[allow(clippy::disallowed_methods)] // Authorized clone-failure cleanup.
             let _ = std::fs::remove_dir_all(self.path.as_path());
@@ -306,14 +303,14 @@ pub struct CloneOptions {
     pub bare: bool,
     /// Ignore existing files
     pub ignore_existing: bool,
-    /// Clone virtually using split-write filesystem
-    pub virtually: bool,
     /// Use direct file write
     pub direct_file_write: bool,
     /// File containing list of files to prefetch
     pub prefetch: Option<String>,
     /// Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
+    /// Whether to use VFS
+    pub vfs_options: Option<VfsConfig>,
     /// Clone without local repository tracking (memory-only stores)
     pub no_tracking: bool,
     /// Root files for dependency-based selective clone.
@@ -355,6 +352,10 @@ struct BlockDiscoverItem {
     /// In tree walk mode: the parent directory's path.
     /// In dependency mode: the file's own path.
     repository_path: RepositoryPath,
+    /// The view filter's verdict for `repository_path`, which each node reached
+    /// from this item steps from rather than folding its whole path.
+    /// Unused in dependency mode, where each path arrives whole.
+    states: FilterStates,
     /// When Some, this item is part of a dependency-driven discovery walk.
     /// When None, the existing tree walk (child/sibling iteration) is used.
     dep_context: Option<Arc<DependencyDiscoverContext>>,
@@ -583,11 +584,13 @@ async fn process_block_item(
 
         let node_path = item.repository_path.get_child(&node_name);
 
-        if !dispatcher.repository.filter.emit_excludes(
+        let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
+            item.states,
             node_path.relative(),
             node.is_directory(),
             FilterMode::View,
-        ) {
+        );
+        if !excluded {
             visited_child = true;
             if node.is_file() {
                 dispatcher
@@ -649,6 +652,7 @@ async fn process_block_item(
                         node_id: first_child,
                         expected_parent: current_node_id,
                         repository_path: node_path,
+                        states: node_states,
                         dep_context: None,
                         follow_deps: false,
                         depth: 0,
@@ -672,6 +676,8 @@ async fn process_block_item(
                     node_id: sibling_id,
                     expected_parent,
                     repository_path: item.repository_path,
+                    // Siblings share the parent this item walks under.
+                    states: item.states,
                     dep_context: None,
                     follow_deps: false,
                     depth: 0,
@@ -807,6 +813,8 @@ async fn process_block_item_dependency(
                 node_id: entry.node,
                 expected_parent: INVALID_NODE,
                 repository_path: dep_path,
+                // Dependency mode asks about a whole path, not a walk step.
+                states: FilterStates::ROOT,
                 dep_context: Some(dep_ctx.clone()),
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
@@ -855,13 +863,27 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    let existing_dot_dir = get_dot_lore_path(path)?;
+    if existing_dot_dir.exists() {
+        if call.force() {
+            lore_io::IoDriver::global()
+                .remove_dir_all(existing_dot_dir.as_path())
+                .await
+                .internal_with(|| {
+                    format!("removing previous repository in path {}", path.display())
+                })?;
+        } else {
+            return Err(CloneError::from(RepositoryAlreadyExists {
+                path: path.display().to_string(),
+            }));
+        }
+    }
+
     // Parse the URL
     let (remote_url, name) = repository::parse_url(repository_url, false)
         .forward::<CloneError>("Invalid repository URL")?;
 
-    let mut dotpath = path.to_path_buf();
-    dotpath.push(repository::DOT_LORE);
-    let mut guard = initialize_guard(path, dotpath.as_path(), call.dry_run());
+    let mut repository_path_guard = RepositoryCloneGuard::new(path, call.dry_run());
 
     // Resolve the repository name
     let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
@@ -894,6 +916,7 @@ pub async fn clone(
         shared_store_to_use: options.shared_store_options.clone(),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
+        vfs: options.vfs_options.clone(),
     };
 
     let repository_metadata = {
@@ -906,14 +929,13 @@ pub async fn clone(
                 .forward::<CloneError>("Failed to initialize repository on disk")?;
 
         let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: Some(path.to_path_buf()),
+            paths: None,
             immutable_store,
             mutable_store,
             id: repository_data.id,
-            instance_id: crate::instance::InstanceId::default(),
+            instance_id: InstanceId::default(),
             remote: Ok(remote.clone()),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }));
 
@@ -988,9 +1010,12 @@ pub async fn clone(
 
     let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
 
+    let mut dot_directory_guard =
+        RepositoryCloneGuard::new(repository.dot_dir_path()?, call.dry_run());
+
     // Copy the view definition if given
     let filter_view = if let Some(view) = view {
-        let mut view_target = dotpath.clone();
+        let mut view_target = repository.dot_dir_path()?.to_path_buf();
         view_target.push(repository::VIEW_FILTER);
         lore_io::IoDriver::global()
             .copy(view, &view_target)
@@ -1093,7 +1118,6 @@ pub async fn clone(
     };
 
     // Resolve layers
-    let mut layers = None;
     if let Some(layer) = layer {
         // Try resolving using repository service
         let repository_id = {
@@ -1142,23 +1166,6 @@ pub async fn clone(
                 layer.metadata.as_deref().unwrap_or_default()
             );
         }
-
-        let layer_path =
-            RelativePath::new_from_initial_path(layer.layer_path.to_lowercase().as_str())
-                .unwrap_or_default();
-        let module_path =
-            RelativePath::new_from_initial_path(layer.module_path.as_str()).unwrap_or_default();
-
-        let state = State::deserialize(module.clone(), layer_revision)
-            .await
-            .forward::<CloneError>("Failed to load revision state")?;
-
-        layers = Some(VirtualLayer {
-            module,
-            module_path,
-            layer_path,
-            state,
-        });
     }
 
     let (state, metadata) = tokio::try_join!(
@@ -1233,7 +1240,6 @@ pub async fn clone(
             options: Arc::new(options),
             modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
         },
-        layers,
         remote.clone(),
         revision,
         branch_id,
@@ -1249,8 +1255,8 @@ pub async fn clone(
     let _ = repository.flush(call.sync_data()).await;
 
     if !call.dry_run() {
-        guard.clean_path_on_drop = false;
-        guard.clean_dotpath_on_drop = false;
+        repository_path_guard.clean_path_on_drop = false;
+        dot_directory_guard.clean_path_on_drop = false;
     }
 
     if let Some(task) = prune_task {
@@ -1285,7 +1291,6 @@ pub struct CloneContext {
 
 async fn clone_materialize(
     ctx: CloneContext,
-    layers: Option<VirtualLayer>,
     remote: Arc<lore_transport::Connection>,
     revision: Hash,
     branch_id: crate::lore::BranchId,
@@ -1297,42 +1302,18 @@ async fn clone_materialize(
         stats,
         ..
     } = ctx.clone();
-    if options.virtually {
-        lore_info!("Serving virtualized filesystem at state {revision}");
-        if let Some(layer) = layers.as_ref() {
-            lore_info!(
-                "Experimental support for virtualized layer at state {}",
-                layer.state.revision()
-            );
+    if options
+        .vfs_options
+        .as_ref()
+        .is_some_and(|config| config.vfs_type.is_swfs())
+    {
+        let path = repository.require_path()?;
+        if path.exists() {
+            Err(InvalidPath {
+                path: format!("{}", path.display()),
+            })?;
         }
-
-        #[cfg(all(target_family = "windows", feature = "vfs"))]
-        {
-            crate::projfs::serve::serve(
-                _path,
-                repository.clone(),
-                state,
-                layers,
-                options.prefetch.as_deref(),
-            );
-        }
-        #[cfg(target_family = "windows")]
-        {
-            lore_error!("Virtual repositories not supported, build with \"--features=vfs\"");
-            return Err(NotSupported {
-                operation: "Virtual repositories not supported, build with \"--features=vfs\""
-                    .to_string(),
-            }
-            .into());
-        }
-        #[cfg(not(target_family = "windows"))]
-        {
-            lore_error!("Virtual repositories not yet supported on this platform");
-            return Err(NotSupported {
-                operation: "Virtual repositories not yet supported on this platform".to_string(),
-            }
-            .into());
-        }
+        return Ok(());
     }
 
     let mut clone_result = Ok(());
@@ -1416,6 +1397,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 node_id: first_child,
                 expected_parent: ROOT_NODE,
                 repository_path: RepositoryPath::from_relative(&repository, RelativePath::new())?,
+                states: FilterStates::ROOT,
                 dep_context: None,
                 follow_deps: false,
                 depth: 0,
@@ -1463,6 +1445,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 node_id,
                 expected_parent: INVALID_NODE,
                 repository_path,
+                // Dependency mode asks about a whole path, not a walk step.
+                states: FilterStates::ROOT,
                 dep_context: Some(dep_ctx.clone()),
                 follow_deps: true,
                 depth: 0,
@@ -1564,10 +1548,12 @@ async fn clone_discover_link(
                 .forward::<CloneError>("Failed to deserialize revision state node block")?;
 
             if let Some(first_child) = root_node.child() {
+                let link_states = linked_repository.filter.mount_states(link_path.relative());
                 link_dispatcher.dispatch(BlockDiscoverItem {
                     node_id: first_child,
                     expected_parent: link_node,
                     repository_path: link_path,
+                    states: link_states,
                     dep_context: None,
                     follow_deps: false,
                     depth: 0,
@@ -1669,12 +1655,15 @@ pub async fn clone_execute(
     }
 }
 
+/// `states` is the view filter's verdict for `repository_path`, which each child
+/// steps from rather than folding its whole path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn clone_node(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
     repository_path: RepositoryPath,
     node: NodeID,
+    states: FilterStates,
 ) -> Result<(), CloneError> {
     let repository = ctx.repository.clone();
     let state = ctx.state.clone();
@@ -1696,11 +1685,13 @@ pub(crate) async fn clone_node(
         }
         let child_repository_path = repository_path.get_child(&child_name);
 
-        if !repository.filter.emit_excludes(
+        let (child_states, excluded) = repository.filter.child_emit_excludes(
+            states,
             child_repository_path.relative(),
             child_node.is_directory(),
             FilterMode::View,
-        ) {
+        );
+        if !excluded {
             if child_node.is_file() {
                 spawn_clone_file(&mut tasks, ctx.clone(), child_node, child_repository_path).await;
             } else if child_node.is_link() {
@@ -1712,6 +1703,7 @@ pub(crate) async fn clone_node(
                     storage.clone(),
                     child_id,
                     child_repository_path,
+                    child_states,
                 )
                 .await;
                 failure = failure.or(result.err());
@@ -1749,8 +1741,9 @@ fn clone_child_node(
     storage: Arc<lore_transport::StorageSession>,
     repository_path: RepositoryPath,
     node: NodeID,
+    states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), CloneError>> + Send>> {
-    Box::pin(clone_node(ctx, storage, repository_path, node))
+    Box::pin(clone_node(ctx, storage, repository_path, node, states))
 }
 
 /// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
@@ -2057,6 +2050,10 @@ fn spawn_clone_link(
                         )
                     })?;
 
+                let link_states = linked_repository
+                    .filter
+                    .mount_states(repository_path.relative());
+
                 clone_child_node(
                     CloneContext {
                         repository: linked_repository,
@@ -2066,6 +2063,7 @@ fn spawn_clone_link(
                     link_storage,
                     repository_path,
                     link_node,
+                    link_states,
                 )
                 .await?;
             } else {
@@ -2085,6 +2083,7 @@ async fn spawn_clone_directory(
     storage: Arc<lore_transport::StorageSession>,
     node: NodeID,
     repository_path: RepositoryPath,
+    states: FilterStates,
 ) -> Result<(), CloneError> {
     let stats = ctx.stats.clone();
     let inflight = stats
@@ -2110,7 +2109,7 @@ async fn spawn_clone_directory(
             lore_info!("{}", repository_path.absolute().display());
         }
 
-        let result = clone_child_node(ctx, storage, repository_path, node).await;
+        let result = clone_child_node(ctx, storage, repository_path, node, states).await;
 
         stats
             .directory_inflight

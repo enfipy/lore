@@ -97,6 +97,7 @@ pub(super) async fn resolve_signature(
                 debug!({BRANCH_ID} = %branch_id, "Resolving branch latest");
                 branch::load_latest(repository.clone(), branch_id)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         if err.is_branch_not_found() {
                             Status::not_found(format!("Branch {branch_id} not found"))
@@ -117,6 +118,7 @@ pub(super) async fn resolve_signature(
                     acceleration,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     if err.is_not_found() || err.is_revision_not_found() {
                         Status::not_found(format!(
@@ -188,6 +190,7 @@ pub(super) async fn identifier_for_signature(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
@@ -331,7 +334,6 @@ mod tests {
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
     use lore_storage::Address;
@@ -358,14 +360,13 @@ mod tests {
             .expect("mutable store"),
         );
         Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: immutable,
             mutable_store: mutable,
             id: Context::from(uuid::Uuid::now_v7()).into(),
             instance_id: lore_revision::instance::InstanceId::generate(),
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }))
     }
