@@ -47,7 +47,6 @@ use crate::state::State;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 pub mod add;
@@ -133,6 +132,10 @@ impl EventError for LinkError {
 }
 
 /// Context information for discovered links during tree traversal
+///
+/// A link is named by the repository holding it, the node it sits at there, and the
+/// repository it mounts. That triple is its identity, so a walk reaching the same link twice
+/// registers it once whatever path it arrived by.
 #[derive(Debug, Clone)]
 pub struct LinkContext {
     /// The repository ID that the link points to
@@ -141,8 +144,6 @@ pub struct LinkContext {
     pub link_node_id: NodeID,
     /// The repository ID where the link resides
     pub parent_repository_id: RepositoryId,
-    /// Path to the link from the parent repository root
-    pub link_path: RelativePathBuf,
     /// The state of the linked repository
     pub link_state: Arc<State>,
 }
@@ -152,7 +153,6 @@ impl PartialEq for LinkContext {
         self.link_repository_id == other.link_repository_id
             && self.link_node_id == other.link_node_id
             && self.parent_repository_id == other.parent_repository_id
-            && self.link_path == other.link_path
     }
 }
 
@@ -163,7 +163,6 @@ impl std::hash::Hash for LinkContext {
         self.link_repository_id.hash(state);
         self.link_node_id.hash(state);
         self.parent_repository_id.hash(state);
-        self.link_path.hash(state);
     }
 }
 
@@ -488,14 +487,15 @@ async fn collect_with_context(
                 .await
                 .unwrap_or_default();
 
+            let full_path = if path_prefix.is_empty() {
+                local_path.clone()
+            } else {
+                format!("{path_prefix}/{local_path}")
+            };
             let target = LinkTarget {
-                path: if path_prefix.is_empty() {
-                    local_path
-                } else {
-                    format!("{path_prefix}/{local_path}")
-                },
+                path: full_path,
                 repository: link_id,
-                context: Arc::new(repository.to_link_context(link_id).await),
+                context: repository.to_link_context(link_id).await,
             };
 
             (target, mounts[0].signature)
@@ -598,29 +598,32 @@ pub async fn resolve_pin(
     Ok((pin_signature, pin_metadata.branch))
 }
 
-/// Remaps change paths from the linked repository's source subtree to the
-/// local link mount point. Strips the `source_path` prefix from each change
-/// and replaces it with `link_path`.
-pub fn remap_changes(
-    link_path: RelativePath,
-    source_path: RelativePath,
-    changes: Vec<NodeChange>,
-) -> Arc<Vec<NodeChange>> {
-    let mut changes = changes;
-    let prefix_len = source_path.len();
+/// The node the subtree a link exposes sits at in each of two revisions it pins.
+///
+/// A link names that subtree by the path it exposes, which is the one thing the linked
+/// repository's own spelling of a path is read for: a revision numbers its nodes as it pleases,
+/// so the same subtree is a different node in each. The path reaches no further, and what the
+/// diff of the two reports is spelled from the mount.
+async fn pinned_subtree_nodes(
+    link_context: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_target: &Arc<State>,
+    linked_node: NodeID,
+) -> Result<(NodeID, NodeID), LinkError> {
+    let source_path = state_current
+        .node_path(link_context.clone(), linked_node)
+        .await
+        .forward::<LinkError>("Failed resolving link node")?;
 
-    let remap = |path: &RelativePath| -> RelativePath {
-        RelativePath::new_from_clean_parts(link_path.as_str(), &path.as_str()[prefix_len..])
+    let node_of = async |state: &Arc<State>| -> Result<NodeID, LinkError> {
+        state
+            .find_node_link(link_context.clone(), source_path.as_str())
+            .await
+            .map(|node_link| node_link.node)
+            .forward::<LinkError>("Failed resolving the subtree a link exposes")
     };
 
-    for change in changes.iter_mut() {
-        change.path = remap(&change.path);
-        if let Some(from_path) = change.from_path.as_mut() {
-            *from_path = remap(from_path);
-        }
-    }
-
-    Arc::new(changes)
+    Ok((node_of(state_current).await?, node_of(state_target).await?))
 }
 
 /// Updates a link pin in the block tree and link registry for a pre-resolved node.
@@ -685,11 +688,9 @@ pub async fn reserialize_tracked_link(
     parent_signature: Hash,
     branch: BranchId,
 ) -> Result<Hash, StateError> {
-    let linked_repository = Arc::new(
-        repository
-            .to_link_context(link_context.link_repository_id)
-            .await,
-    );
+    let linked_repository = repository
+        .to_link_context(link_context.link_repository_id)
+        .await;
 
     let linked_state = link_context.link_state.clone();
     linked_state.set_parent_self(parent_signature);
@@ -723,6 +724,27 @@ pub struct LinkChainLevel {
     pub old_signature: Hash,
 }
 
+/// A node a link-chain walk descends from, and the working-tree path that node sits at.
+///
+/// Both ends of [`resolve_link_chain`] take this shape: it consumes a base and the remainder below
+/// it, and answers with the deepest base it reached and the remainder below that one. A base plus
+/// its remainder is the working-tree path throughout, so a walk starting below the repository root
+/// answers with the same paths one starting at it does.
+pub struct LinkChainBase {
+    pub node: NodeID,
+    pub path: RelativePath,
+}
+
+impl LinkChainBase {
+    /// The repository root, for a caller holding a path spelled from it.
+    pub fn root() -> Self {
+        LinkChainBase {
+            node: crate::node::ROOT_NODE,
+            path: RelativePath::new(),
+        }
+    }
+}
+
 /// A link path resolved through zero or more link boundaries. `levels` is empty
 /// for a plain top-level path, in which case `innermost_state` is the caller's
 /// top-level staged state.
@@ -734,23 +756,25 @@ pub struct ResolvedLinkChain {
     /// The innermost repository's committed state. Carries registry entries that
     /// the staged state has already dropped, such as a link staged for removal.
     pub innermost_current_state: Arc<State>,
-    /// Node the `remainder_path` is rooted at in the innermost repository.
-    pub innermost_base_node: NodeID,
-    /// `link_path` minus `remainder_path`; empty for the top level.
-    pub innermost_mount_path: RelativePathBuf,
-    /// Target path within the innermost repository.
+    /// The deepest base reached: the innermost mount crossed, or the base the walk started from
+    /// where it crossed none.
+    pub innermost_base: LinkChainBase,
+    /// What the walk did not consume, named from `innermost_base`. The path asked for where no
+    /// link was crossed, and what stands below the innermost mount where one was.
     pub remainder_path: RelativePathBuf,
 }
 
-/// Resolve `link_path` down through any link boundaries into the crossed links
-/// and the innermost containing repo, state and remainder path. Like
-/// `find_relative_node_link` but records each crossed link. Bounded by
-/// `MAX_LINK_DEPTH` and a visited-repository set.
+/// Resolve `remainder_path`, which names a path below `base`, down through any
+/// link boundaries into the crossed links and the innermost containing repo,
+/// state and what is left unconsumed there. Like `find_relative_node_link` but
+/// records each crossed link. Bounded by `MAX_LINK_DEPTH` and a visited-repository
+/// set.
 pub async fn resolve_link_chain(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
     state_current: Arc<State>,
-    link_path: RelativePath,
+    base: LinkChainBase,
+    mut remainder_path: RelativePath,
     parent_branch: BranchId,
 ) -> Result<ResolvedLinkChain, LinkError> {
     let mut levels: Vec<LinkChainLevel> = Vec::new();
@@ -761,18 +785,15 @@ pub async fn resolve_link_chain(
     let mut cur_state = state_staged;
     let mut cur_current_state = state_current;
     let mut cur_branch = parent_branch;
-    let mut remaining = RelativePath::from_str(link_path.as_str()).unwrap_or_default();
-    let mut cur_node = crate::node::ROOT_NODE;
-    let mut base_node = crate::node::ROOT_NODE;
-    let mut mount_prefix = RelativePathBuf::new();
-    let mut consumed = RelativePathBuf::new();
-    let mut remainder = RelativePathBuf::new();
+    let mut cur_node = base.node;
+    let mut base_node = base.node;
+    let mut mount_path = base.path.into_buf();
+    let mut below_mount = RelativePathBuf::new();
 
-    while !remaining.is_empty() {
-        let name = remaining.pop_root();
+    while !remainder_path.is_empty() {
+        let name = remainder_path.pop_root();
         let name_hash = crate::hash::hash_string(name);
-        remainder.push(name);
-        consumed.push(name);
+        below_mount.push(name);
 
         // A segment that does not resolve is the boundary of what exists: the
         // current level is innermost and the rest is the target to create. This
@@ -783,13 +804,13 @@ pub async fn resolve_link_chain(
         {
             cur_node = node_id;
         } else {
-            while !remaining.is_empty() {
-                remainder.push(remaining.pop_root());
+            while !remainder_path.is_empty() {
+                below_mount.push(remainder_path.pop_root());
             }
             break;
         }
 
-        if remaining.is_empty() {
+        if remainder_path.is_empty() {
             break;
         }
 
@@ -826,8 +847,7 @@ pub async fn resolve_link_chain(
                 Err(_) => link_reference.signature,
             };
 
-            let child_repository =
-                Arc::new(cur_repository.to_link_context(child_repository_id).await);
+            let child_repository = cur_repository.to_link_context(child_repository_id).await;
             let child_state = State::deserialize(child_repository.clone(), link.revision)
                 .await
                 .forward::<LinkError>("Failed deserializing state")?;
@@ -850,8 +870,8 @@ pub async fn resolve_link_chain(
             cur_branch = resolved_branch;
             cur_node = link.node;
             base_node = link.node;
-            mount_prefix = consumed.clone();
-            remainder = RelativePathBuf::new();
+            mount_path.push(below_mount.as_str());
+            below_mount.clear();
         }
     }
 
@@ -860,9 +880,11 @@ pub async fn resolve_link_chain(
         innermost_repository: cur_repository,
         innermost_state: cur_state,
         innermost_current_state: cur_current_state,
-        innermost_base_node: base_node,
-        innermost_mount_path: mount_prefix,
-        remainder_path: remainder,
+        innermost_base: LinkChainBase {
+            node: base_node,
+            path: mount_path.freeze(),
+        },
+        remainder_path: below_mount,
     })
 }
 
@@ -887,36 +909,22 @@ impl ResolvedLinkChain {
     /// Register a `LinkContext` in `tracker` for every link crossed by this
     /// chain, so a filesystem-walk operation (stage / unstage) folds a nested
     /// change up through all intermediate links. Each level's child state is
-    /// the next level's parent state, or `innermost_state` for the last level;
-    /// `link_path` is the link node's path within its own parent repository
-    /// (its `node_path` there, falling back to `fallback_path`).
+    /// the next level's parent state, or `innermost_state` for the last level.
     ///
     /// `innermost_state` must be the exact state instance the caller mutates
     /// (the one the deep change is staged into), so the tracker reserializes
     /// the changes rather than a fresh deserialization of the same revision.
-    pub async fn record_tracker_contexts(
-        &self,
-        tracker: &LinkTracker,
-        innermost_state: &Arc<State>,
-        fallback_path: &str,
-    ) {
+    pub fn record_tracker_contexts(&self, tracker: &LinkTracker, innermost_state: &Arc<State>) {
         for (index, level) in self.levels.iter().enumerate() {
             let child_state = if index + 1 < self.levels.len() {
                 self.levels[index + 1].state.clone()
             } else {
                 innermost_state.clone()
             };
-            let level_path = level
-                .state
-                .node_path(level.repository.clone(), level.link_node_id)
-                .await
-                .unwrap_or_else(|_| fallback_path.to_string());
             tracker.add_link(LinkContext {
                 link_repository_id: level.child_repository_id,
                 link_node_id: level.link_node_id,
                 parent_repository_id: level.repository.id,
-                link_path: RelativePathBuf::new_from_initial_path(level_path.as_str())
-                    .unwrap_or_default(),
                 link_state: child_state,
             });
         }
@@ -1009,10 +1017,8 @@ pub async fn drain_link_tracker(
     let mut contexts = selected;
 
     // Order deepest-nested first so each child is reserialized before the
-    // parent whose pin folds it in. Depth is the length of the ancestor chain
-    // (following `parent_repository_id` up to the top-level repo), NOT a
-    // proxy like the mount path's slash count — the two tracker-population
-    // sites store different path semantics, so the path length is unreliable.
+    // parent whose pin folds it in. Depth is the length of the ancestor chain,
+    // following `parent_repository_id` up to the top-level repo.
     let depth_of = |ctx: &LinkContext| -> usize {
         let mut depth = 0usize;
         let mut parent_id = ctx.parent_repository_id;
@@ -1042,11 +1048,9 @@ pub async fn drain_link_tracker(
                 .iter()
                 .find(|other| other.link_repository_id == link_context.parent_repository_id)
             {
-                let parent_repository = Arc::new(
-                    repository
-                        .to_link_context(parent_ctx.link_repository_id)
-                        .await,
-                );
+                let parent_repository = repository
+                    .to_link_context(parent_ctx.link_repository_id)
+                    .await;
                 (parent_ctx.link_state.clone(), parent_repository)
             } else {
                 (state.clone(), repository.clone())
@@ -1140,9 +1144,11 @@ pub async fn restore_link_paths_from_state(
         .forward::<LinkError>("Failed starting filesystem operation")?;
 
     for link_relative in paths {
-        let mount_path =
-            RepositoryPath::from_relative(&repository, link_path.join(link_relative.as_str()))?;
-        sync::unlink_merge_mine_theirs_base(mount_path.absolute()).await;
+        let mount_path = link_path.join(link_relative.as_str());
+        sync::unlink_merge_mine_theirs_base(
+            mount_path.to_absolute_path(repository.require_path()?),
+        )
+        .await;
 
         let node_link = link_state
             .find_node_link(link_context.clone(), link_relative.as_str())
@@ -1320,7 +1326,7 @@ pub async fn is_staged_pin_change(
     }
 
     let link = staged_node.linked_node();
-    let linked_repository = Arc::new(parent_repository.to_link_context(link.repository).await);
+    let linked_repository = parent_repository.to_link_context(link.repository).await;
     let linked_state = State::deserialize(linked_repository.clone(), link.revision)
         .await
         .forward::<LinkError>("Failed deserializing linked state")?;
@@ -1334,8 +1340,8 @@ pub async fn is_staged_pin_change(
 /// Realizes on-disk content changes when a link pin changes.
 ///
 /// Deserializes the old and new link states, computes a 2-way diff scoped to
-/// the linked node, remaps change paths to the mount point, verifies filesystem
-/// consistency, and realizes the changes on disk.
+/// the linked node and spelled from the mount, verifies filesystem consistency,
+/// and realizes the changes on disk.
 pub async fn realize_link_pin_change(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
@@ -1354,26 +1360,23 @@ pub async fn realize_link_pin_change(
         .forward::<LinkError>("Failed deserializing state")?;
 
     lore_debug!("Find link target node");
-    let linked_node_path = link_state_current
-        .node_path(link_context.clone(), linked_node)
-        .await
-        .forward::<LinkError>("Failed resolving link node")?;
+    let (node_current, node_target) = pinned_subtree_nodes(
+        &link_context,
+        &link_state_current,
+        &link_state_target,
+        linked_node,
+    )
+    .await?;
 
-    let Ok(linked_node_path) = RelativePath::from_str(&linked_node_path);
-
-    let changes = state::diff_collect(
-        link_context.clone(),
-        link_state_current.clone(),
-        link_context.clone(),
-        link_state_target.clone(),
-        Some(linked_node_path.clone()),
+    let changes = state::diff_collect_subtree(
+        state::node_change_state(&link_context, &link_state_current, node_current).await,
+        state::node_change_state(&link_context, &link_state_target, node_target).await,
+        link_path,
         FilterMode::View,
     )
     .await
     .forward::<LinkError>("Failed syncing target link")?;
-
-    lore_debug!("Remap changes to link path {}", link_path.as_str());
-    let changes = remap_changes(link_path, linked_node_path, changes);
+    let changes = Arc::new(changes);
 
     let operation = repository
         .file_system()
@@ -1543,7 +1546,7 @@ pub async fn check_incoming_mount_overlaps(
         }
 
         let link_id: RepositoryId = node.address.context.into();
-        let link_context = Arc::new(repository.to_link_context(link_id).await);
+        let link_context = repository.to_link_context(link_id).await;
         let source_path = pinned_source_path(link_context.clone(), &node).await?;
 
         check_source_path_overlap(
@@ -1675,7 +1678,7 @@ async fn resolve_link_node_at_path(
     let (parent_repository, parent_state) = if node_link.repository == repository.id {
         (repository.clone(), state.clone())
     } else {
-        let owning = Arc::new(repository.to_link_context(node_link.repository).await);
+        let owning = repository.to_link_context(node_link.repository).await;
         let owning_state = State::deserialize(owning.clone(), node_link.revision)
             .await
             .forward::<LinkError>("Failed deserializing state")?;
@@ -1694,11 +1697,9 @@ async fn resolve_link_node_at_path(
         .into());
     }
 
-    let link_context = Arc::new(
-        parent_repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link_context = parent_repository
+        .to_link_context(link_node.address.context.into())
+        .await;
 
     Ok(LinkNodeAtPath {
         parent_repository,
@@ -2070,14 +2071,12 @@ pub async fn apply_link_pins(
             branch,
         } = planned_pin;
 
-        let link_context = Arc::new(
-            repository
-                .to_link_context(link_node.address.context.into())
-                .await,
-        );
-
         let link_path_rel = RelativePath::from_str(&link_path)
             .internal_with(|| format!("Invalid link path {link_path}"))?;
+
+        let link_context = repository
+            .to_link_context(link_node.address.context.into())
+            .await;
 
         lore_info!("Link {link_path} pin {target_pin} -> {incoming_pin} from merged branch");
 

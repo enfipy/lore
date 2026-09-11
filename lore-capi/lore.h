@@ -634,8 +634,20 @@ typedef struct lore_branch_info_event_data_t {
 
 // Event data reported at the start of a branch diff.
 typedef struct lore_branch_diff_begin_event_data_t {
-  // Unused placeholder field.
-  uint32_t _unused;
+  // Identifier of the source branch of the diff.
+  lore_branch_id_t source_branch;
+  // Name of the source branch.
+  struct lore_string_t source_branch_name;
+  // Revision of the source branch used in the diff.
+  struct lore_hash_t source_revision;
+  // Identifier of the target branch of the diff.
+  lore_branch_id_t target_branch;
+  // Name of the target branch.
+  struct lore_string_t target_branch_name;
+  // Revision of the target branch used in the diff.
+  struct lore_hash_t target_revision;
+  // Base revision the 3-way diff was resolved against.
+  struct lore_hash_t base_revision;
 } lore_branch_diff_begin_event_data_t;
 
 // Event data reported at the start of the change section of a branch diff.
@@ -1469,9 +1481,9 @@ typedef struct lore_file_stage_revision_event_data_t {
 
 // Data for the event emitted for each file affected by a stage operation.
 typedef struct lore_file_stage_file_event_data_t {
-  // Previous path of the file, when it was moved.
+  // Previous path of the file, when it was moved, relative to the root of the working tree.
   struct lore_string_t from_path;
-  // Path of the file.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;
@@ -1519,7 +1531,7 @@ typedef struct lore_file_unstage_revision_event_data_t {
 
 // Data for the event emitted for each file affected by an unstage operation.
 typedef struct lore_file_unstage_file_event_data_t {
-  // Path of the file.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;
@@ -1903,7 +1915,11 @@ typedef struct lore_repository_instance_event_data_t {
   lore_branch_id_t branch;
   // Current revision hash for the instance
   struct lore_hash_t revision;
-  // Non-zero if the instance path no longer exists on disk
+  // Non-zero if the registration no longer describes a live checkout: 1 when
+  // the path no longer exists on disk, 2 when the path holds a repository
+  // whose `.lore/instance` names a different instance (superseded by a
+  // re-create or re-clone), 3 when the path holds no readable
+  // `.lore/instance` at all
   uint8_t stale;
 } lore_repository_instance_event_data_t;
 
@@ -2063,7 +2079,7 @@ typedef struct lore_repository_status_revision_event_data_t {
 
 // Status of a single file or node reported by a repository status operation.
 typedef struct lore_repository_status_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Size of the file in bytes.
   uint64_t size;
@@ -2237,7 +2253,7 @@ typedef struct lore_revision_info_delta_event_data_t {
 
 // Details of a single file that differs between two revisions.
 typedef struct lore_revision_diff_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;
@@ -2249,7 +2265,8 @@ typedef struct lore_revision_diff_file_event_data_t {
   struct lore_address_t old_address;
   // Address of the file content on the target side.
   struct lore_address_t new_address;
-  // Previous path of the file when it was moved or copied. Empty otherwise.
+  // Previous path of the file when it was moved or copied, relative to the root of the
+  // working tree. Empty otherwise.
   struct lore_string_t from_path;
 } lore_revision_diff_file_event_data_t;
 
@@ -2384,11 +2401,15 @@ typedef struct lore_revision_sync_target_event_data_t {
   uint8_t is_latest;
   // Flag indicating revision was from local revision history, not remote
   uint8_t local;
+  // Remote configured for the repository.
+  uint8_t remote_available;
+  // Remote branch query returned an authoritative answer, identity is authorized to access the repository.
+  uint8_t remote_authorized;
 } lore_revision_sync_target_event_data_t;
 
 // Details of a single file changed by a sync.
 typedef struct lore_revision_sync_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Size of the file in bytes.
   uint64_t size;
@@ -4077,8 +4098,11 @@ typedef struct lore_auth_local_user_info_args_t {
   struct lore_string_t auth_endpoint;
   // User identities to resolve; empty resolves the current user
   struct lore_string_array_t user_ids;
-  // Emit cached token details for identities with a local token
-  uint8_t with_token;
+  // Emit cached identity token details for identities with a local token
+  uint8_t with_identity_token;
+  // Emit the repository's authorization (access) token. Requires running
+  // inside a repository
+  uint8_t with_access_token;
 } lore_auth_local_user_info_args_t;
 
 // Arguments for authenticating interactively via browser-based login flow.
@@ -4663,9 +4687,11 @@ typedef struct lore_repository_dump_args_t {
   uintptr_t max_depth;
 } lore_repository_dump_args_t;
 
-// Arguments for creating a new repository at the specified URL.
+// Arguments for creating a new repository.
 typedef struct lore_repository_create_args_t {
-  // URL to the repository
+  // URL to the repository. Treated as the repository name instead when the call is
+  // offline or local, where an empty value names it after the directory it is
+  // created in. A URL naming no host is an error otherwise.
   struct lore_string_t repository_url;
   // Optional repository description
   struct lore_string_t description;
@@ -5977,10 +6003,6 @@ typedef struct lore_revision_tree_commit_args_t {
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
 
-
-
-
-
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
 
@@ -6129,10 +6151,20 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 
 // Resolve user identities to display names from locally stored JWT tokens.
 //
-// Does not contact the auth service. Decodes cached JWT tokens to extract
-// display names. For user IDs without a local token, returns the raw user
+// Decodes cached JWT tokens to extract display names without contacting the
+// auth service. For user IDs without a local token, returns the raw user
 // ID. For remote resolution with proper authorization, use
 // `lore_auth_user_info` which queries the remote authentication service.
+//
+// When `with_identity_token` is set, identities with a locally stored token
+// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
+// token instead of `AUTH_USER_INFO`.
+//
+// When `with_access_token` is set, the call requires a repository and
+// additionally emits one `AUTH_IDENTITY` event carrying the
+// repository-scoped authorization (access) token for the current user. A
+// valid cached token is reused. Otherwise a token exchange is performed
+// against the auth service, so this variant can contact the network.
 //
 // # Events
 //
@@ -6154,6 +6186,8 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
+// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 int32_t lore_auth_local_user_info(const struct lore_global_args_t *globals,
                                   const struct lore_auth_local_user_info_args_t *args,
                                   struct lore_event_callback_config_t callback);
@@ -6354,7 +6388,7 @@ void lore_branch_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |
@@ -6387,7 +6421,7 @@ int32_t lore_branch_diff(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming; carries the resolved branch names and revisions being compared |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |
@@ -10007,7 +10041,7 @@ void lore_revision_find_async(const struct lore_global_args_t *globals,
                               const struct lore_revision_find_args_t *args,
                               struct lore_event_callback_config_t callback);
 
-// Retrieve the commit history of the current branch.
+// Retrieve the revision history of the current branch.
 //
 // # Events
 //
@@ -11704,7 +11738,11 @@ void lore_repository_instance_list_async(const struct lore_global_args_t *global
                                          const struct lore_repository_instance_list_args_t *args,
                                          struct lore_event_callback_config_t callback);
 
-// Remove stale instances of the repository that are no longer present.
+// Remove stale instances of the repository: those whose path no longer
+// exists, those whose path holds no checkout, and those whose path now holds
+// a repository naming a different current instance. Each removed instance is
+// reported through a `RepositoryInstance` event whose `stale` field gives the
+// reason.
 int32_t lore_repository_instance_prune(const struct lore_global_args_t *globals,
                                        const struct lore_repository_instance_prune_args_t *args,
                                        struct lore_event_callback_config_t callback);

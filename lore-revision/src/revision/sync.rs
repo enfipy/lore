@@ -53,7 +53,6 @@ use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Source and target revisions selected for a sync.
@@ -81,6 +80,10 @@ pub struct LoreRevisionSyncTargetEventData {
     pub is_latest: u8,
     /// Flag indicating revision was from local revision history, not remote
     pub local: u8,
+    /// Remote configured for the repository.
+    pub remote_available: u8,
+    /// Remote branch query returned an authoritative answer, identity is authorized to access the repository.
+    pub remote_authorized: u8,
 }
 
 /// Progress counters reported while a sync updates the working files.
@@ -197,7 +200,7 @@ impl From<FsError> for SyncError {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionSyncFileEventData {
-    /// Path of the file relative to the repository root.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Size of the file in bytes.
     pub size: u64,
@@ -310,10 +313,38 @@ pub async fn sync(
         .await
         .unwrap_or_default();
     let mut remote_latest = Hash::default();
+    let mut remote_available = false;
+    let mut remote_authorized = false;
 
     let mut local_latest_diverged = branch::load_latest_divergent(repository.clone(), branch_id)
         .await
         .unwrap_or_default();
+
+    match repository.remote().await {
+        Ok(remote) => {
+            remote_available = true;
+            match branch::load_remote(remote.clone(), repository.id, branch_id).await {
+                Ok(status) => {
+                    remote_latest = status.latest;
+                    remote_authorized = true;
+                }
+                Err(err) if err.is_branch_not_found() => {
+                    remote_authorized = true;
+                }
+                Err(err) => {
+                    lore_debug!("Remote branch query failed: {err}");
+                }
+            }
+            lore_debug!("Remote latest revision is {remote_latest}");
+        }
+        // No remote configured for this repository, nothing to report
+        Err(err) if err.is_no_remote() => {}
+        // Remote is configured but the connection failed
+        Err(err) => {
+            lore_debug!("Remote connection failed: {err}");
+            remote_available = true;
+        }
+    }
 
     let mut revision;
     if let Some(revision_string) = options.revision.as_ref() {
@@ -346,13 +377,6 @@ pub async fn sync(
         // BranchLatestStatus remains Divergent until the user pushes, which is
         // correct — the divergence is between local and remote.
         lore_debug!("Local latest revision is {local_latest}");
-
-        if let Ok(remote) = repository.remote().await {
-            remote_latest = branch::load_remote_latest(remote.clone(), repository.id, branch_id)
-                .await
-                .unwrap_or_default();
-            lore_debug!("Remote latest revision is {remote_latest}");
-        }
 
         if !local_latest_diverged && !remote_latest.is_zero() {
             lore_debug!("Local latest is synchronized with remote, pick remote latest as target");
@@ -491,6 +515,8 @@ pub async fn sync(
         target_revision_number: state_target.revision_number(),
         is_latest: at_latest.into(),
         local: (location == LoreBranchLocation::Local).into(),
+        remote_available: remote_available.into(),
+        remote_authorized: remote_authorized.into(),
     })
     .send();
 
@@ -783,12 +809,11 @@ async fn sync_layers(
 ) -> Result<(), SyncError> {
     for (layer, layer_revision) in layer_revisions {
         lore_debug!("Synchronizing layer {layer:?}");
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-
         let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
         let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
+        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
 
         // TODO(mjansson): Emit as events
         lore_info!("Sync layer {} in {}", layer_repository.id, target_path);
@@ -871,6 +896,9 @@ fn discard_modified_times<T>((result, modified_times): (T, RecordedModifiedTimes
 /// The times are only true once the revision the operation realized is the current one, so a
 /// caller that advances the current revision stores them and every other caller discards
 /// them.
+///
+/// `changes_made` is the caller's: every realize wrapper here writes the working copy, and
+/// a dry run reports the write it would have made rather than skipping the operation.
 async fn shim_with_operation<T>(
     filesystem: Arc<dyn FilesystemProvider>,
     changes_made: bool,
@@ -892,7 +920,7 @@ async fn sync_realize(
     options: SyncOptions,
 ) -> Result<RecordedModifiedTimes, SyncError> {
     let (result, modified_times) =
-        shim_with_operation(repository.file_system(), false, async |operation| {
+        shim_with_operation(repository.file_system(), true, async |operation| {
             Box::pin(crate::fs::realize::realize_state(
                 repository,
                 operation,
@@ -928,32 +956,6 @@ pub struct SyncVerifyStats {
     pub file_conflict: AtomicUsize,
     pub file_retain: AtomicUsize,
     pub file_replace: AtomicUsize,
-}
-
-pub async fn verify_filesystem(
-    change: NodeChange,
-    repository_current: Arc<RepositoryContext>,
-    state_current: Arc<State>,
-    forward_changes: bool,
-    force_hash_check: bool,
-    stats: Arc<SyncVerifyStats>,
-    filter_mode: FilterMode,
-) -> Result<Option<NodeChange>, SyncError> {
-    shim_with_operation(repository_current.file_system(), false, async |operation| {
-        Box::pin(crate::fs::realize::verify_filesystem(
-            change,
-            repository_current,
-            operation,
-            state_current,
-            forward_changes,
-            force_hash_check,
-            stats,
-            filter_mode,
-        ))
-        .await
-    })
-    .await
-    .map(discard_modified_times)?
 }
 
 #[derive(Default)]
@@ -1001,7 +1003,7 @@ pub async fn realize_changes(
     is_merge: bool,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
+    shim_with_operation(repository.file_system(), true, async |operation| {
         crate::fs::realize::realize_changes(
             repository,
             operation,
@@ -1029,7 +1031,7 @@ pub async fn realize_conflicts(
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
+    shim_with_operation(repository.file_system(), true, async |operation| {
         crate::fs::realize::realize_conflicts(
             repository,
             operation,
@@ -1057,9 +1059,8 @@ pub async fn realize_file(
     stats: Arc<SyncRealizeStats>,
     modified_times: &RecordedModifiedTimes,
 ) -> Result<(), SyncError> {
-    let path = RepositoryPath::from_relative(&repository, path)?;
     let (result, realized_times) =
-        shim_with_operation(repository.file_system(), false, async |operation| {
+        shim_with_operation(repository.file_system(), true, async |operation| {
             crate::fs::realize::realize_file(repository, operation, &path, node, stats).await
         })
         .await?;
@@ -1073,11 +1074,7 @@ pub async fn realize_scratch_file(
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
-        crate::fs::realize::realize_scratch_file(repository, operation, path, node, stats).await
-    })
-    .await
-    .map(discard_modified_times)?
+    crate::fs::realize::realize_scratch_file(repository, path, node, stats).await
 }
 
 pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bool {

@@ -112,48 +112,8 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
     }
 }
 
-pub struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    #[allow(dead_code)]
-    pub fn new(prefix: &str) -> Self {
-        use rand::distr::SampleString;
-        let name = format!(
-            "{prefix}{}",
-            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&path).expect("Failed to create temp directory");
-        let path = std::fs::canonicalize(path).expect("Canonicalize temporary test dir");
-        Self(path)
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = std::path::Path;
-    fn deref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl AsRef<std::path::Path> for TempDir {
-    fn as_ref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // Test fixture cleanup; not subject to repository write-token discipline.
-        #[allow(clippy::disallowed_methods)]
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+#[allow(unused_imports)]
+pub use lore_base::test_util::TempDir;
 
 #[allow(dead_code)]
 pub fn generate_tempdir() -> TempDir {
@@ -243,6 +203,36 @@ pub async fn test_scan(
     state_staged: std::sync::Arc<lore_revision::state::State>,
     state_current: std::sync::Arc<lore_revision::state::State>,
 ) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_with_intent(
+        repository,
+        state_staged,
+        state_current,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+    )
+    .await
+}
+
+/// [`test_scan`] under the given intent, for a walk that stages rather than marks.
+#[allow(dead_code)]
+pub async fn test_scan_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_path_with_intent(repository, state_staged, state_current, None, intent).await
+}
+
+/// [`test_scan_with_intent`] scoped to `path`, which is what makes the walk resolve the
+/// ancestors of a path the tree does not hold.
+#[allow(dead_code)]
+pub async fn test_scan_path_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
@@ -259,9 +249,9 @@ pub async fn test_scan(
             repository,
             state: state_current,
         },
-        None, /* full tree */
+        path,
         lore_revision::filter::FilterMode::Full,
-        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+        intent,
         std::sync::Arc::new(Vec::new()),
         &mut changes,
     )

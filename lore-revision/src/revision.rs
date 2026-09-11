@@ -38,7 +38,6 @@ use crate::history::find_branch_point;
 use crate::interface::LoreString;
 use crate::lore::*;
 use crate::lore_debug;
-use crate::lore_info;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
@@ -196,6 +195,33 @@ pub struct Diff3Summary {
 /// the caller to fall back to the unfiltered walk. The pre-streaming
 /// implementation absorbed these errors silently into a boolean —
 /// the explicit `Option` keeps that fallback path observable.
+/// The metadata `metadata_hash` names, or `None` where there is none to read.
+///
+/// That blob carries the branch, date and message of the revision naming it, so a report
+/// without it is a report without those, and the warning is what says so. A zero hash names
+/// none, and a blob that cannot be read is warned about rather than failing the caller: a
+/// revision list leaves the states of a segment in the local store without the metadata they
+/// name, so a revision read out of that cache offline has nothing to take those fields from,
+/// which is ordinary rather than damage.
+pub(crate) async fn reported_metadata(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> Option<Metadata> {
+    if metadata_hash.is_zero() {
+        return None;
+    }
+
+    match Metadata::deserialize(repository, metadata_hash).await {
+        Ok(metadata) => Some(metadata),
+        Err(err) => {
+            lore_warn!(
+                "Reporting revision without branch, date and message, metadata {metadata_hash} could not be read: {err}"
+            );
+            None
+        }
+    }
+}
+
 fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
     let mut filter = Filter::default();
     if let Err(err) = filter.view.add_exclusion("**") {
@@ -324,7 +350,7 @@ pub async fn diff3_with_source_cap(
         .await?
         .branch;
 
-    lore_info!(
+    lore_debug!(
         "Calculating 3-way diff between\n  base {} -> {}\n  source {} -> {}\n  target {} -> {}",
         state_base.revision_number(),
         state_base.revision(),
@@ -340,7 +366,7 @@ pub async fn diff3_with_source_cap(
     // `StateError::Oversized` so callers can map to
     // `Status::resource_exhausted` via `is_oversized()` without
     // string-matching across crates.
-    lore_info!("Diff source branch revisions (streaming)");
+    lore_debug!("Diff source branch revisions (streaming)");
     let (source_tx, mut source_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
@@ -421,7 +447,7 @@ pub async fn diff3_with_source_cap(
     }
     state::detect_and_coalesce_moves(&mut source_changes);
 
-    lore_info!("Sorting {} source changes", source_changes.len());
+    lore_debug!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
 
     let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
@@ -433,7 +459,7 @@ pub async fn diff3_with_source_cap(
     };
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
-    lore_info!("Diff target branch revisions (streaming)");
+    lore_debug!("Diff target branch revisions (streaming)");
     let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();

@@ -45,6 +45,7 @@ pub async fn update(
         repository.clone(),
         state_staged.clone(),
         state_current.clone(),
+        link::LinkChainBase::root(),
         link_path.clone(),
         parent_branch,
     )
@@ -55,7 +56,7 @@ pub async fn update(
     let node_link = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -123,11 +124,9 @@ pub async fn update(
         }
     }
 
-    let link = Arc::new(
-        repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link = repository
+        .to_link_context(link_node.address.context.into())
+        .await;
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
     let link_reference = inner_state
         .link_find(inner_repository.clone(), link.id, node_link.node)

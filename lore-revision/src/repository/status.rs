@@ -27,7 +27,6 @@ use crate::filter::FilterStates;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -39,6 +38,7 @@ use crate::layer;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
@@ -50,7 +50,6 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Revision status of a repository, describing the current, local, and remote
@@ -144,7 +143,7 @@ impl LoreRepositoryStatusRevisionEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusFileEventData {
-    /// Path of the file relative to the repository root.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Size of the file in bytes.
     pub size: u64,
@@ -479,7 +478,7 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
 /// walk and here — is size 0, matching a delete.
 async fn file_size_from_node_change_path(
     operation: &InstanceOperationImpl,
-    repository: &Arc<RepositoryContext>,
+    _repository: &Arc<RepositoryContext>,
     change: &NodeChange,
 ) -> Result<u64, StatusError> {
     if change.action == FileAction::Delete {
@@ -488,9 +487,9 @@ async fn file_size_from_node_change_path(
     if let Some(observed) = &change.observed {
         return Ok(observed.size);
     }
-    let repository_path = RepositoryPath::from_relative(repository, change.path.clone())?;
+    let repository_path = change.path.clone();
     let info = operation
-        .file_info(FilesystemPath::Repository(&repository_path))
+        .file_info(&repository_path)
         .await
         .forward::<StatusError>("accessing metadata for file")?;
     Ok(info.size)
@@ -597,6 +596,133 @@ struct CountShared {
     files: AtomicU64,
     error: OnceLock<StatusError>,
     notify: Notify,
+}
+
+/// Whether the diff against the staged state is what reports `change`.
+///
+/// A change that is neither staged nor dirty is not a working-tree change. One a scan will
+/// re-detect from the filesystem, settling its flags inline, is left to the scan rather than
+/// reported twice — except a move, which only this diff pairs by file identity to recover the
+/// path it came from.
+fn reported_by_state_diff(change: &NodeChange, show_scan: bool) -> bool {
+    if !(change.flags.is_stage() || change.flags.is_dirty()) {
+        return false;
+    }
+    !(show_scan
+        && change.flags.is_dirty()
+        && !change.flags.is_stage()
+        && change.action != FileAction::Move)
+}
+
+/// Report every change the diff against the staged state answers for.
+///
+/// A dirty node is verified against the file on disk when asked for, and one that turns out
+/// unmodified has its flag cleared and is reported without it — or dropped, where the flag was
+/// all it had. A node still dirty once verified counts toward `summary`; a purely staged one
+/// does not.
+///
+/// `repository` is the one holding the nodes, which for a layer is the layer's own. The working
+/// tree is the parent's either way, since a layer context keeps it.
+async fn report_staged_changes(
+    repository: &Arc<RepositoryContext>,
+    changes: &[NodeChange],
+    summary: &StatusSummaryStats,
+    show_scan: bool,
+    check_dirty: bool,
+) -> Result<(), StatusError> {
+    for change in changes {
+        if !reported_by_state_diff(change, show_scan) {
+            continue;
+        }
+
+        let mut cleared_dirty = false;
+        if check_dirty
+            && change.flags.is_dirty()
+            && !dirty_change_is_modified(repository.clone(), change, summary).await?
+        {
+            if !change.flags.is_stage() {
+                continue;
+            }
+            cleared_dirty = true;
+        }
+
+        if change.flags.is_dirty() && !cleared_dirty {
+            summary.classify(change);
+        }
+
+        let size = file_size_from_node_change_id(change).await?;
+        let mut data = LoreRepositoryStatusFileEventData::from_node_change(change, size);
+        if cleared_dirty {
+            data.flag_dirty = 0;
+        }
+        event::LoreEvent::RepositoryStatusFile(data).send();
+    }
+    Ok(())
+}
+
+/// Whether a layer's staged state still holds anything worth pinning: a dirty marker or a staged
+/// node anywhere in the subtree the layer draws.
+///
+/// Asked of the drawn subtree rather than the whole state, the same way `layer::list_staged`
+/// counts, because everything outside it belongs to the drawn-from repository and not the layer.
+/// Dirty flags propagate to a node's parents and clearing one propagates the clear back up, so
+/// the source node's children answer for the whole subtree. On any error the answer is "holds
+/// staging": dropping a pin on a question that could not be answered loses staged work.
+async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerState) -> bool {
+    let state = &layer_state.state_staged;
+    let repository = &layer_state.repository;
+
+    let Ok(source_node_link) = state
+        .find_node_link(repository.clone(), &layer.source_path)
+        .await
+    else {
+        return true;
+    };
+    let source_node = source_node_link.node;
+    if !source_node.is_valid_or_root_node_id() {
+        return true;
+    }
+
+    if state
+        .node_has_dirty_children(repository.clone(), source_node)
+        .await
+        .unwrap_or(true)
+    {
+        return true;
+    }
+
+    state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
+}
+
+/// What a request for a path selects of a layer: where the selection sits in the working tree,
+/// and the path the layer draws it from.
+struct LayerSelection {
+    /// Where the selection is materialized, which every path reported for it is spelled from.
+    mount_path: RelativePath,
+    /// The path the drawn-from repository spells the selection at, read only to name its node.
+    source_path: RelativePath,
+}
+
+/// What `path` selects of `layer`, or `None` where it names nothing the mount holds.
+///
+/// A request naming nothing, or naming an ancestor of the mount, selects the whole of what the
+/// layer draws. One naming a path below the mount selects what lies at the same offset below the
+/// layer's source.
+fn layer_selection(layer: &layer::Layer, path: Option<&RelativePath>) -> Option<LayerSelection> {
+    let target_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
+    let selected = path.cloned().unwrap_or_else(|| target_path.clone());
+    if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
+        return None;
+    }
+
+    let sub_path = selected
+        .as_str()
+        .get(target_path.len()..)
+        .unwrap_or_default();
+    Some(LayerSelection {
+        mount_path: RelativePath::new_from_clean_parts(&layer.target_path, sub_path),
+        source_path: RelativePath::new_from_clean_parts(&layer.source_path, sub_path),
+    })
 }
 
 /// Resolve `source_path` to the work needed to count its subtree, labelling
@@ -922,9 +1048,9 @@ async fn scan_paths(
             if node_link.is_valid() {
                 exists_in_state = true;
             } else {
-                let repository_path = RepositoryPath::from_relative(&repository, path.clone())?;
+                let repository_path = path.clone();
                 exists_in_filesystem = operation
-                    .file_info(FilesystemPath::Repository(&repository_path))
+                    .file_info(&repository_path)
                     .await
                     .is_ok_and(|info| info.exists);
             }
@@ -1202,7 +1328,7 @@ pub async fn status(
         .await
         .unwrap_or_default();
 
-    // Authoritative answer to "does local have commits not on remote history?":
+    // Authoritative answer to "does local have revisions not on remote history?":
     // the LATEST_STATUS flag set by commit/push/sync/clone/restore. When
     // Convergent, local_latest is guaranteed to be on the remote history line —
     // any difference can only mean remote moved past us.
@@ -1224,7 +1350,7 @@ pub async fn status(
         } else if local_n > remote_n {
             local_ahead = true;
             // Refine with last_sync: if remote has moved beyond the last
-            // recorded sync point, it has commits we don't have.
+            // recorded sync point, it has revisions we don't have.
             if last_sync != remote_latest.unwrap_or_default() {
                 remote_ahead = true;
             }
@@ -1316,26 +1442,14 @@ pub async fn status(
             };
 
             for (layer, layer_state) in layers.iter() {
-                let target_path =
-                    RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-                let selected = path.clone().unwrap_or_else(|| target_path.clone());
-                if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
+                let Some(selection) = layer_selection(layer, path.as_ref()) else {
                     continue;
-                }
-                let sub_path = if selected.as_str().len() > target_path.len() {
-                    &selected.as_str()[target_path.len()..]
-                } else {
-                    ""
                 };
-                let source_subpath =
-                    RelativePath::new_from_clean_parts(&layer.source_path, sub_path);
-                let target_subpath =
-                    RelativePath::new_from_clean_parts(&layer.target_path, sub_path);
                 let (layer_directories, layer_files, work) = count_at_path_root(
                     layer_state.state_staged.clone(),
                     layer_state.repository.clone(),
-                    &source_subpath,
-                    &target_subpath,
+                    &selection.source_path,
+                    &selection.mount_path,
                 )
                 .await?;
                 directories += layer_directories;
@@ -1385,110 +1499,55 @@ pub async fn status(
                     .forward::<StatusError>("computing diff against staged state")?;
                     lore_debug!("Found {} changes in staged revision", changes.len());
 
-                    for change in changes.iter() {
-                        // When scanning, skip dirty-only changes from the
-                        // state diff — the scan section re-detects them from
-                        // the filesystem and handles set/clear inline. Moves
-                        // are exempt: only this diff pairs the add and delete
-                        // by file context to recover the source path.
-                        let dominated_by_scan = show_scan
-                            && change.flags.is_dirty()
-                            && !change.flags.is_stage()
-                            && change.action != FileAction::Move;
-                        if dominated_by_scan
-                            || !(change.flags.is_stage() || change.flags.is_dirty())
-                        {
-                            continue;
-                        }
-
-                        let mut cleared_dirty = false;
-                        if check_dirty
-                            && change.flags.is_dirty()
-                            && !dirty_change_is_modified(repository.clone(), change, &summary)
-                                .await?
-                        {
-                            if !change.flags.is_stage() {
-                                continue;
-                            }
-                            cleared_dirty = true;
-                        }
-
-                        // Count nodes that remain dirty (verify did not clear
-                        // them) toward the summary; purely-staged changes are
-                        // not part of the dirty tracking count.
-                        if change.flags.is_dirty() && !cleared_dirty {
-                            summary.classify(change);
-                        }
-
-                        let size = file_size_from_node_change_id(change).await?;
-                        let mut data =
-                            LoreRepositoryStatusFileEventData::from_node_change(change, size);
-                        if cleared_dirty {
-                            data.flag_dirty = 0;
-                        }
-                        event::LoreEvent::RepositoryStatusFile(data).send();
-                    }
-
-                    Ok(())
+                    report_staged_changes(&repository, &changes, &summary, show_scan, check_dirty)
+                        .await
                 }
             });
 
             for (layer, layer_state) in layers.iter() {
-                let target_path =
-                    RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-                let path = path.clone().unwrap_or_else(|| target_path.clone());
-                if path.is_empty() || path.overlaps(&layer.target_path) {
-                    lore_spawn!(tasks, {
-                        let repository = layer_state.repository.clone();
-                        let state_current = layer_state.state_current.clone();
-                        let state_staged = layer_state.state_staged.clone();
-                        let source_path = layer.source_path.clone();
-                        let sub_path = if path.as_str().len() > target_path.len() {
-                            &path.as_str()[target_path.len()..]
-                        } else {
-                            ""
-                        };
-                        let path = RelativePath::new_from_clean_parts(&source_path, sub_path);
-                        let path = if !path.is_empty() { Some(path) } else { None };
-                        async move {
-                            let mut changes = state::diff_collect(
-                                repository.clone(),
-                                state_current,
-                                repository.clone(),
-                                state_staged.clone(),
-                                path,
-                                FilterMode::Full,
+                let Some(selection) = layer_selection(layer, path.as_ref()) else {
+                    continue;
+                };
+                lore_spawn!(tasks, {
+                    let repository = layer_state.repository.clone();
+                    let state_current = layer_state.state_current.clone();
+                    let state_staged = layer_state.state_staged.clone();
+                    let summary = summary.clone();
+                    async move {
+                        let changes = state::diff_collect_subtree(
+                            layer::drawn_subtree_state(
+                                &repository,
+                                &state_current,
+                                &selection.source_path,
                             )
-                            .await
-                            .forward::<StatusError>("computing diff against staged state")?;
-                            lore_debug!(
-                                "Found {} changes in layer \"{}\" staged revision",
-                                target_path,
-                                changes.len()
-                            );
+                            .await,
+                            layer::drawn_subtree_state(
+                                &repository,
+                                &state_staged,
+                                &selection.source_path,
+                            )
+                            .await,
+                            selection.mount_path.clone(),
+                            FilterMode::Full,
+                        )
+                        .await
+                        .forward::<StatusError>("computing diff against staged state")?;
+                        lore_debug!(
+                            "Found {} changes in layer at \"{}\" staged revision",
+                            changes.len(),
+                            selection.mount_path,
+                        );
 
-                            for change in changes.iter_mut() {
-                                // TODO(mjansson): Translate paths for file size
-                                let size = 0;
-                                /*
-                                let size = file_size_from_node_change_id(change).await?;
-                                */
-
-                                change
-                                    .translate_from_layer_path(&source_path, target_path.as_str());
-
-                                event::LoreEvent::RepositoryStatusFile(
-                                    LoreRepositoryStatusFileEventData::from_node_change(
-                                        change, size,
-                                    ),
-                                )
-                                .send();
-                            }
-
-                            Ok(())
-                        }
-                    });
-                }
+                        report_staged_changes(
+                            &repository,
+                            &changes,
+                            &summary,
+                            show_scan,
+                            check_dirty,
+                        )
+                        .await
+                    }
+                });
             }
         }
 
@@ -1562,6 +1621,67 @@ pub async fn status(
         crate::instance::store_staged_anchor(&repository, signature)
             .await
             .forward::<StatusError>("serializing staged revision anchor")?;
+    }
+
+    // A layer's nodes live in the layer's own staged state, so a reconciling status mutates that
+    // state and not the parent's: `--check-dirty` clears a marker verification found stale, and
+    // `--scan` sets and clears markers as it walks across a mount. The parent's anchor names the
+    // parent's revision alone, so neither mutation survives the call unless the layer's state is
+    // serialized and its own pin moved to it — a marker cleared without that is reported again by
+    // every later status. Opportunistic in the same way as the parent's flush above: a read-only
+    // invocation leaves the state for the next write command.
+    if let Some(token) = repository.try_write_token() {
+        let dry_run = execution_context().globals().dry_run();
+        for (layer, layer_state) in layers.iter() {
+            let state_staged = &layer_state.state_staged;
+            if !state_staged.is_dirty() {
+                continue;
+            }
+
+            if !layer_holds_staging(layer, layer_state).await {
+                if layer.staged_revision().is_some() && !dry_run {
+                    layer::store_layer_staged(
+                        repository.clone(),
+                        token,
+                        layer.target_path.as_str(),
+                        layer.repository,
+                        Hash::default(),
+                    )
+                    .await
+                    .forward::<StatusError>("clearing layer staged revision pin")?;
+
+                    lore_debug!(
+                        "Cleared staged pin for emptied layer at {}",
+                        layer.target_path
+                    );
+                }
+                continue;
+            }
+
+            state_staged.reparent_onto(layer_state.state_current.revision());
+
+            let signature = state_staged
+                .serialize(layer_state.repository.clone(), token)
+                .await
+                .forward::<StatusError>("serializing layer staged revision state")?;
+
+            if signature != layer.current && !dry_run {
+                layer::store_layer_staged(
+                    repository.clone(),
+                    token,
+                    layer.target_path.as_str(),
+                    layer.repository,
+                    signature,
+                )
+                .await
+                .forward::<StatusError>("storing layer staged revision pin")?;
+
+                lore_debug!(
+                    "Stored staged state {signature} for layer at {}",
+                    layer.target_path
+                );
+            }
+        }
     }
 
     Ok(())

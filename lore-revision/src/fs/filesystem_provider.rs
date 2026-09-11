@@ -6,7 +6,6 @@
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
 use std::fs::Metadata;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -22,9 +21,11 @@ use crate::change::NodeChange;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
+use crate::lore::Context;
 use crate::lore::Hash;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
@@ -34,7 +35,6 @@ use crate::state::NodeComparison;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum FsError {
@@ -66,9 +66,20 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
-    pub fn from_metadata(metadata: Metadata) -> Self {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
-        let executable = crate::util::fs::file_executable_observed(&metadata);
+    /// A directory, as every component a walk resolved a path through must be. Carries
+    /// no size, mtime or mode, none of which a directory node stores.
+    pub const DIRECTORY: Self = FileInfo {
+        exists: true,
+        is_file: false,
+        is_dir: true,
+        executable: None,
+        size: 0,
+        mtime: 0,
+    };
+
+    pub fn from_metadata(metadata: &Metadata) -> Self {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
+        let executable = crate::util::fs::file_executable_observed(metadata);
         FileInfo {
             exists: true,
             is_file: metadata.is_file(),
@@ -87,9 +98,9 @@ impl FileInfo {
     }
 }
 
-/// One side of a filesystem diff: which tree, rooted where. `node_path` is where
-/// `root_node` sits in its own tree, which differs from the path being walked once a
-/// link or layer mount has been crossed.
+/// One side of a filesystem diff: which tree, rooted where. `node_path` is the working-tree path
+/// of `root_node`, as the tree spells it — which differs from `filesystem_path` only where the two
+/// spell a name with different case.
 pub struct FilesystemTraversal {
     pub repository: Arc<RepositoryContext>,
     pub state: Arc<State>,
@@ -104,6 +115,20 @@ pub struct FilesystemDiffTree {
     pub state: Arc<State>,
 }
 
+/// What a staging walk records beyond the dirty flags every marking walk sets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageIntent {
+    /// Set on every node the walk stages, beyond the staged action itself.
+    pub node_flags: NodeFlags,
+    /// The identity a new file node takes. A new one is minted where absent, so
+    /// metadata can be attached before a commit assigns one.
+    ///
+    /// One identity serves the whole walk, so a caller supplying it stages one file.
+    /// A move is paired to its delete by identity, and repeating one across unrelated
+    /// files pairs those instead.
+    pub file_id: Option<Context>,
+}
+
 /// What a filesystem diff does with the differences it finds.
 #[derive(Debug, Clone, Copy)]
 pub enum FilesystemDiffIntent {
@@ -111,12 +136,25 @@ pub enum FilesystemDiffIntent {
     Report,
     /// Set and clear `Dirty` on each node as the walk settles it.
     MarkDirty,
+    /// Mark as [`MarkDirty`](Self::MarkDirty) does and record the staged action too.
+    Stage(StageIntent),
 }
 
 impl FilesystemDiffIntent {
     /// Whether the walk persists what it finds as dirty flags rather than only reporting.
     pub fn marks_dirty(self) -> bool {
-        matches!(self, FilesystemDiffIntent::MarkDirty)
+        matches!(
+            self,
+            FilesystemDiffIntent::MarkDirty | FilesystemDiffIntent::Stage(_)
+        )
+    }
+
+    /// What the walk stages beyond marking, where it stages at all.
+    pub fn stage(self) -> Option<StageIntent> {
+        match self {
+            FilesystemDiffIntent::Stage(intent) => Some(intent),
+            _ => None,
+        }
     }
 }
 
@@ -217,35 +255,6 @@ where
     Ok(value)
 }
 
-/// A path that can be either relative to the repository root or an absolute scratch path.
-///
-/// Use `Repository` for paths within the working directory, and `Scratch` for temporary
-/// paths outside the repository (e.g., diff scratch directories).
-#[derive(Clone, Copy)]
-pub enum FilesystemPath<'a> {
-    /// A path relative to the repository root.
-    Repository(&'a RepositoryPath),
-    /// An absolute path outside the repository (scratch/temp files).
-    Scratch(&'a Path),
-}
-
-impl<'a> FilesystemPath<'a> {
-    pub fn from_repository(path: &'a RepositoryPath) -> Self {
-        FilesystemPath::Repository(path)
-    }
-
-    pub fn from_scratch_path(absolute_path: &'a Path) -> Self {
-        Self::Scratch(absolute_path)
-    }
-
-    pub fn as_absolute_path(&self) -> &Path {
-        match self {
-            FilesystemPath::Repository(path) => path.absolute(),
-            FilesystemPath::Scratch(abs) => abs,
-        }
-    }
-}
-
 /// Instance operation trait - performs file operations within a context.
 ///
 /// Operations are performed against a consistent snapshot (for SWFS) or directly
@@ -273,15 +282,36 @@ pub trait InstanceOperation: Send + Sync {
     /// content modification against a node.
     fn file_info(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
+
+    /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
+    ///
+    /// The question a case resolution nearly always has, and one lookup answers it: no
+    /// directory read and no string to hold the answer. `Some(false)` says the name is not
+    /// held in this spelling rather than that it is absent, and `None` is the filesystem
+    /// declining to say — macOS for every name, Windows past its path limit — which only
+    /// [`names_folding_to`](Self::names_folding_to) answers.
+    fn holds_name_exactly(&self, path: &RelativePath) -> impl Future<Output = Option<bool>> + Send;
+
+    /// Every spelling of `name` the directory at `path` holds that folds to the same name:
+    /// the exact one alone where it is there, and empty where no spelling is.
+    ///
+    /// Reads the directory, which is what answering for a spelling other than the one asked
+    /// about takes. A caller that only needs to know whether its own spelling is the one on
+    /// disk asks [`holds_name_exactly`](Self::holds_name_exactly).
+    fn names_folding_to(
+        &self,
+        path: &RelativePath,
+        name: &str,
+    ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
     /// Gets the hash of a file in the repository, optionally providing the Node if it has
     /// separately been loaded.
     fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
@@ -307,53 +337,65 @@ pub trait InstanceOperation: Send + Sync {
     /// On Windows, this is a no-op.
     fn make_executable(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         executable: bool,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create a directory if it doesn't exist (mkdir -p behavior).
     fn create_dir_all(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create an empty file.
-    fn create_file(
-        &self,
-        path: FilesystemPath<'_>,
-    ) -> impl Future<Output = Result<(), FsError>> + Send;
+    fn create_file(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Changes the casing of a file from `from` to `to` based on various OS and command argument
     /// settings. `to` must be identical to `from` other than case differences.
     fn unify_case_rename(
         &self,
-        from: FilesystemPath<'_>,
-        to: FilesystemPath<'_>,
+        from: &RelativePath,
+        to: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Delete a file or empty directory.
-    fn remove(&self, path: FilesystemPath<'_>) -> impl Future<Output = Result<(), FsError>> + Send;
+    fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Delete a directory and all contents.
     fn remove_recursive(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
+
+    /// Write `node`'s content to `path`, creating the directory above it, applying the node's
+    /// mode, and reporting what the file looks like once written.
+    ///
+    /// One call rather than four because the steps are never useful apart, and each one asked
+    /// separately resolves the same name against the root again.
+    ///
+    /// A path that cannot be read back once written is an error: what the file looks like is
+    /// the point of the call, and a caller records a modified time from it.
+    fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
     /// Sets the file at `path` to be the contents of `Node`.
     fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(Fragment, Option<FileInfo>), FsError>> + Send;
 
     /// Copy the contents of `source_path` to `destination_path`, with the destination being a
     /// scratch file that is not expected to be part of the repository even if it's in its path.
-    fn copy_to_scratch_file(
+    fn copy_file(
         &self,
-        source_path: FilesystemPath<'_>,
-        destination_path: impl AsRef<Path> + Send,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Merge 3 files that exist on the file system.
@@ -369,7 +411,7 @@ pub trait InstanceOperation: Send + Sync {
     /// Load the contents of `path` to see if it can be diffed or must only be opaquely compared.
     fn infer_is_diffable(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<bool, FsError>> + Send;
 
     /// Finalize the operation.
@@ -450,18 +492,38 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
+    async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         match &self.dispatch {
             #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
+        }
+    }
+
+    async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
+        }
+    }
+
+    async fn names_folding_to(
+        &self,
+        path: &RelativePath,
+        name: &str,
+    ) -> Result<Vec<String>, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
+            StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
         }
     }
 
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         match &self.dispatch {
@@ -491,11 +553,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn make_executable(
-        &self,
-        path: FilesystemPath<'_>,
-        executable: bool,
-    ) -> Result<(), FsError> {
+    async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -505,7 +563,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -513,7 +571,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -523,8 +581,8 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn unify_case_rename(
         &self,
-        from: FilesystemPath<'_>,
-        to: FilesystemPath<'_>,
+        from: &RelativePath,
+        to: &RelativePath,
     ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
@@ -533,7 +591,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -541,7 +599,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn remove_recursive(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -549,11 +607,26 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    async fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.write_node(repository, node, path).await
+            }
+        }
+    }
+
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         match &self.dispatch {
             #[cfg(test)]
@@ -565,17 +638,16 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn copy_to_scratch_file(
+    async fn copy_file(
         &self,
-        source_path: FilesystemPath<'_>,
-        destination_path: impl AsRef<Path> + Send,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.copy_to_scratch_file(source_path, destination_path)
-                    .await
+                this.copy_file(source_path, destination_path).await
             }
         }
     }
@@ -598,7 +670,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
+    async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -619,6 +691,9 @@ impl InstanceOperation for InstanceOperationImpl {
 }
 
 #[cfg(test)]
+// A fixture builds filesystem state directly, outside any repository; what these
+// test is how the provider reads it.
+#[allow(clippy::disallowed_methods)]
 pub mod tests {
     use std::path::Path;
     use std::sync::Arc;
@@ -634,7 +709,6 @@ pub mod tests {
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FilesystemDiffIntent;
     use crate::fs::filesystem_provider::FilesystemDiffTree;
-    use crate::fs::filesystem_provider::FilesystemPath;
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::fs::filesystem_provider::FsError;
     use crate::fs::filesystem_provider::InstanceOperation;
@@ -656,17 +730,17 @@ pub mod tests {
     #[derive(Default)]
     pub struct TestFilesystemProvider {
         pub begin_count: Arc<AtomicUsize>,
+        pub file_info_count: Arc<AtomicUsize>,
+        pub holds_name_count: Arc<AtomicUsize>,
+        pub names_folding_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        holds_paths: bool,
     }
 
     impl TestFilesystemProvider {
         pub fn new() -> TestFilesystemProvider {
-            Self {
-                begin_count: Arc::new(AtomicUsize::new(0)),
-                finalize_events: Arc::new(Mutex::new(Vec::new())),
-                finalize_fails: false,
-            }
+            Self::default()
         }
 
         /// A provider whose operations record the finalize and then report it failed.
@@ -677,8 +751,31 @@ pub mod tests {
             }
         }
 
+        /// A provider that reports every path as a file it holds, spelled as asked, which is
+        /// what a caller resolving a path that exists reads.
+        pub fn holding_every_path() -> TestFilesystemProvider {
+            Self {
+                holds_paths: true,
+                ..Self::new()
+            }
+        }
+
         pub fn begins(&self) -> usize {
             self.begin_count.load(Ordering::Acquire)
+        }
+
+        /// How many paths were looked up through operations this provider began.
+        pub fn file_infos(&self) -> usize {
+            self.file_info_count.load(Ordering::Acquire)
+        }
+
+        /// How many single-name lookups and directory reads a case resolution cost.
+        pub fn name_lookups(&self) -> usize {
+            self.holds_name_count.load(Ordering::Acquire)
+        }
+
+        pub fn directory_reads(&self) -> usize {
+            self.names_folding_count.load(Ordering::Acquire)
         }
     }
 
@@ -698,16 +795,24 @@ pub mod tests {
             self.begin_count.fetch_add(1, Ordering::AcqRel);
             Ok(Arc::new(InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Test(TestOperation {
+                    file_info_count: self.file_info_count.clone(),
+                    holds_name_count: self.holds_name_count.clone(),
+                    names_folding_count: self.names_folding_count.clone(),
                     finalize_events: self.finalize_events.clone(),
                     finalize_fails: self.finalize_fails,
+                    holds_paths: self.holds_paths,
                 }),
             )))
         }
     }
 
     pub struct TestOperation {
+        file_info_count: Arc<AtomicUsize>,
+        holds_name_count: Arc<AtomicUsize>,
+        names_folding_count: Arc<AtomicUsize>,
         finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        holds_paths: bool,
     }
 
     impl InstanceOperation for TestOperation {
@@ -729,14 +834,46 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn file_info(&self, _path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Counts the lookup and reports what the provider was told to hold, which for the
+        /// default is a path the filesystem does not hold — what a caller acts on without
+        /// needing content behind it.
+        async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
+            self.file_info_count.fetch_add(1, Ordering::AcqRel);
+            Ok(if self.holds_paths {
+                FileInfo {
+                    exists: true,
+                    is_file: true,
+                    ..Default::default()
+                }
+            } else {
+                FileInfo::default()
+            })
+        }
+
+        /// Counts the lookup and reports the spelling asked about as the one held, so a
+        /// resolver reading through this one settles a path without reading a directory.
+        async fn holds_name_exactly(&self, _path: &RelativePath) -> Option<bool> {
+            self.holds_name_count.fetch_add(1, Ordering::AcqRel);
+            Some(self.holds_paths)
+        }
+
+        async fn names_folding_to(
+            &self,
+            _path: &RelativePath,
+            name: &str,
+        ) -> Result<Vec<String>, FsError> {
+            self.names_folding_count.fetch_add(1, Ordering::AcqRel);
+            Ok(if self.holds_paths {
+                vec![name.to_string()]
+            } else {
+                vec![]
+            })
         }
 
         async fn file_hash(
             &self,
             _repository: Arc<RepositoryContext>,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
             _node_hint: Option<&Node>,
         ) -> Result<Hash, FsError> {
             panic!("Test operation unimplemented except finalize")
@@ -755,33 +892,42 @@ pub mod tests {
 
         async fn make_executable(
             &self,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
             _executable: bool,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn create_dir_all(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn create_file(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
         async fn unify_case_rename(
             &self,
-            _from: FilesystemPath<'_>,
-            _to: FilesystemPath<'_>,
+            _from: &RelativePath,
+            _to: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn remove(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn remove_recursive(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
+            panic!("Test operation unimplemented except finalize")
+        }
+
+        async fn write_node(
+            &self,
+            _repository: Arc<RepositoryContext>,
+            _node: &Node,
+            _path: &RelativePath,
+        ) -> Result<FileInfo, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -789,15 +935,15 @@ pub mod tests {
             &self,
             _repository: Arc<RepositoryContext>,
             _node: &Node,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
         ) -> Result<(Fragment, Option<FileInfo>), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn copy_to_scratch_file(
+        async fn copy_file(
             &self,
-            _source_path: FilesystemPath<'_>,
-            _destination_path: impl AsRef<Path>,
+            _source_path: &RelativePath,
+            _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
@@ -813,7 +959,7 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn infer_is_diffable(&self, _path: FilesystemPath<'_>) -> Result<bool, FsError> {
+        async fn infer_is_diffable(&self, _path: &RelativePath) -> Result<bool, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
     }
@@ -827,7 +973,7 @@ pub mod tests {
             default_repository_creation_args(immutable_store, mutable_store)
                 .with_filesystem_provider(filesystem.clone()),
         ));
-        let link = Arc::new(parent.to_link_context(RepositoryId::from([1; 16])).await);
+        let link = parent.to_link_context(RepositoryId::from([1; 16])).await;
 
         assert!(
             Arc::ptr_eq(&parent.file_system(), &link.file_system()),
@@ -959,6 +1105,79 @@ pub mod tests {
                 assert_eq!(0, stats.file_add.load(std::sync::atomic::Ordering::Relaxed));
             })
             .await;
+    }
+
+    /// The walk hands this to every component above a staged path, so it has to report
+    /// a directory that holds nothing a directory node would store.
+    #[test]
+    fn a_directory_info_is_an_existing_directory_with_no_content() {
+        let info = FileInfo::DIRECTORY;
+        assert!(info.exists);
+        assert!(info.is_dir);
+        assert!(!info.is_file);
+        assert_eq!(0, info.size);
+        assert_eq!(0, info.mtime);
+    }
+
+    /// A node staged from a `FileInfo` has to land the size, time and mode a node
+    /// staged from the metadata itself would, since the two are the same walk before
+    /// and after the file information became the currency between them.
+    #[test]
+    fn file_information_answers_what_the_metadata_helpers_answer() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"content").expect("write");
+
+        let check = |path: &Path| {
+            let metadata = std::fs::metadata(path).expect("metadata");
+            let info = FileInfo::from_metadata(&metadata);
+            assert_eq!(crate::util::fs::file_size(&metadata), info.size);
+            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime);
+            assert_eq!(metadata.is_dir(), info.is_dir);
+            assert_eq!(metadata.is_file(), info.is_file);
+            for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
+                assert_eq!(
+                    crate::util::fs::metadata_to_mode(&metadata, previous),
+                    info.mode(previous),
+                    "mode for {} from previous {previous}",
+                    path.display()
+                );
+            }
+        };
+
+        check(&path);
+        check(dir.path());
+
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("set executable");
+            check(&path);
+            let info = FileInfo::from_metadata(&std::fs::metadata(&path).expect("metadata"));
+            assert_eq!(
+                crate::node::NodeFileMode::Executable.bits(),
+                info.mode(0),
+                "an executable file reports the bit whatever the node held"
+            );
+        }
+    }
+
+    /// The forwarder routes a lookup to the operation rather than refusing one, which
+    /// is what lets a test observe the paths an operation was asked about.
+    #[tokio::test]
+    async fn a_lookup_through_an_operation_is_counted() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let operation = filesystem.begin_operation().await.expect("an operation");
+        let path = RelativePath::new_from_initial_path("a/b").expect("path");
+
+        let info = operation
+            .file_info(&path)
+            .await
+            .expect("a lookup is answered");
+
+        assert!(!info.exists);
+        assert_eq!(1, filesystem.file_infos());
     }
 
     #[tokio::test]

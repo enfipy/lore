@@ -40,6 +40,7 @@ pub async fn info(
         repository.clone(),
         state_staged.clone(),
         state_current.clone(),
+        link::LinkChainBase::root(),
         link_path.clone(),
         parent_branch,
     )
@@ -55,7 +56,7 @@ pub async fn info(
     let node_link = owner_state
         .find_relative_node_link(
             owner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -80,11 +81,9 @@ pub async fn info(
         .into());
     }
 
-    let link_context = Arc::new(
-        owner_repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link_context = owner_repository
+        .to_link_context(link_node.address.context.into())
+        .await;
 
     // Staging a removal drops the registry entry but leaves the node in the
     // tree, so fall back to the committed registry to describe a link on its

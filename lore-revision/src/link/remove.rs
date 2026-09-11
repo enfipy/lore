@@ -47,6 +47,7 @@ pub async fn remove(
         repository.clone(),
         state_staged.clone(),
         state_current.clone(),
+        crate::link::LinkChainBase::root(),
         link_path.clone(),
         parent_branch,
     )
@@ -57,7 +58,7 @@ pub async fn remove(
     let node_link = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -125,6 +126,7 @@ pub async fn remove(
         stage::stage_delete(
             inner_repository.clone(),
             inner_state.clone(),
+            link_path.clone(),
             node_link.node,
             NodeFlags::NoFlags,
             Arc::default(),

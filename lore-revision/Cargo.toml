@@ -63,15 +63,17 @@ xxhash-rust = { workspace = true }
 zerocopy = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
+# `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and instance
+# staleness reads its error constants from the latter, so both are named here.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
 # The non-self-describing format an event crosses the service boundary in.
 bitcode = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-tempfile = "3"
 trybuild = { workspace = true }
 
 [features]

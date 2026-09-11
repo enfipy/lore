@@ -179,7 +179,10 @@ pub struct NodeChange {
     pub flags: Flags,
     pub from: NodeChangeState,
     pub to: NodeChangeState,
+    /// Path of the node, relative to the root of the working tree.
     pub path: RelativePath,
+    /// Path the node was at before a move, relative to the root of the working tree. `None` for
+    /// a change that is not a move, and for a move whose old path the walk cannot spell.
     pub from_path: Option<RelativePath>,
     /// What a filesystem diff measured at `path`, so a consumer does not re-stat
     /// it. `None` for a change between two revisions, which consulted no filesystem.
@@ -275,24 +278,6 @@ impl NodeChange {
                 .await?;
             let noderef = block.node(inode);
             Ok(noderef.is_directory())
-        }
-    }
-
-    /// Translate paths from inner path inside the layer to the outer path in the main repository
-    pub fn translate_from_layer_path(&mut self, inner_path: &str, outer_path: &str) {
-        if self.path.as_str().starts_with(inner_path) {
-            self.path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &self.path.as_str()[inner_path.len()..],
-            );
-        }
-        if let Some(from_path) = self.from_path.as_mut()
-            && from_path.as_str().starts_with(inner_path)
-        {
-            *from_path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &from_path.as_str()[inner_path.len()..],
-            );
         }
     }
 }

@@ -44,12 +44,14 @@ use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use lore_transport::grpc::set_user_agent;
+use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
+use lore_transport::set_fallback_user_agent_product;
+use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::resource::ResourceDetector;
 use rustls::server::NoClientAuth;
@@ -175,7 +177,7 @@ pub struct Cli {
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
 pub fn server_main(config: ServerConfig) -> Result<()> {
-    set_user_agent(format!("lore-server/{}", LORE_LIBRARY_VERSION.as_str()));
+    set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
 
     let cli = Cli::parse();
@@ -738,6 +740,7 @@ impl QuicPublicStreamHandler {
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
         limits: AdmissionLimits,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -775,6 +778,7 @@ impl QuicPublicStreamHandler {
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
@@ -783,6 +787,7 @@ impl QuicPublicStreamHandler {
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
+                        user_agent_filter.clone(),
                     );
                     Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
                         as Box<dyn StreamDataHandler>
@@ -819,14 +824,18 @@ impl QuicInternalStreamHandler {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         limits: AdmissionLimits,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         let mut service_store = ServiceStore::default();
         {
             service_store.add_service(
                 ReplicationStoreClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
-                    let protocol =
-                        ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
+                    let protocol = ReplicationStoreService::new(
+                        immutable_store.clone(),
+                        local_store.clone(),
+                        user_agent_filter.clone(),
+                    );
                     Box::new(StreamHandler::new(Arc::new(protocol), context, limits))
                 }),
             );
@@ -1231,6 +1240,10 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
+    factory.user_agent = Some(make_user_agent_with_component(
+        user_agent_product(),
+        "replicated-immutable-store",
+    ));
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1808,21 +1821,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
-            None => None,
-        },
+        Some(auth) => {
+            let jwk = auth.jwk.clone().unwrap_or_default();
+            let jwk_service = JwkServiceImpl::with_issuers(jwk, Some(&auth.jwt_issuer))?;
+            jwk_service
+                .fetch_new_keys(None /* fetch all keys */)
+                .await?;
+            Some(JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: Some(auth.jwt_issuer.clone()),
+                jwt_audience: Some(auth.jwt_audience.clone()),
+            })
+        }
         None => None,
     };
 
@@ -1975,6 +1985,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
             let quic_settings = settings
@@ -2016,6 +2027,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     jwt_verifier,
                     limits,
+                    user_agent_filter,
                 )),
                 frequency,
                 quic_settings,
@@ -2058,6 +2070,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let user_agent_filter = user_agent_filter.clone();
 
             let quic_settings = settings
                 .server
@@ -2088,6 +2101,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     local_immutable_store,
                     limits,
+                    user_agent_filter,
                 )),
                 frequency,
                 quic_settings,

@@ -481,12 +481,18 @@ async fn add_change_for_solo_to_node(
         lore_trace!("Node {} deleted", to_named_node.node);
         (change::FileAction::Delete, None)
     } else if to_node.is_staged_move() {
-        // Look up the original path from the from state
-        let original_path = from_nodes
-            .state
-            .node_path(from_nodes.repository.clone(), to_named_node.node)
-            .await
-            .ok();
+        // TODO(mjansson): A node moved within a repository the working tree materializes below
+        //                 its root needs the path of the mount to spell where it was, which the
+        //                 walk does not carry. Such a move is realized as a delete and an add.
+        let original_path = if from_nodes.repository.id == from_nodes.repository.root_id() {
+            from_nodes
+                .state
+                .node_path(from_nodes.repository.clone(), to_named_node.node)
+                .await
+                .ok()
+        } else {
+            None
+        };
         lore_trace!(
             "Node {} moved from {:?} to {}",
             to_named_node.node,
@@ -718,7 +724,7 @@ async fn add_change_for_paired_nodes(
                         false
                     } else {
                         let linked_repository =
-                            Arc::new(to.repository.to_link_context(link_repository_id).await);
+                            to.repository.to_link_context(link_repository_id).await;
                         let linked_state =
                             State::deserialize(linked_repository.clone(), to_node.address.hash)
                                 .await
@@ -980,7 +986,65 @@ pub struct NodeSearchResult {
     pub path: RelativePath,
 }
 
-pub async fn get_node_and_path(
+/// The node a walk matched against an entry on disk.
+pub struct NodeMatch {
+    pub node: Node,
+    /// The node's own path, present only where the state spells its name differently from
+    /// the entry. Names are matched by a case-folded hash, so every other node is spelled
+    /// exactly by the entry and its path is built from that instead.
+    pub renamed_path: Option<RelativePath>,
+}
+
+impl NodeMatch {
+    /// The node's own path, for a change to record or a recursion to walk below.
+    ///
+    /// `parent` must be the one [`get_node_match`] was given and `name` the entry it was
+    /// matched against: a renamed node already carries a path built under that parent, and
+    /// answers with it whatever is passed here.
+    pub fn path(&self, parent: &RelativePath, name: &str) -> RelativePath {
+        match &self.renamed_path {
+            Some(path) => path.clone(),
+            None => parent.push_into_buf(name).freeze(),
+        }
+    }
+
+    /// Whether the state spells the node's name differently from the entry on disk.
+    pub fn renamed(&self) -> bool {
+        self.renamed_path.is_some()
+    }
+}
+
+/// The node `node_id` holds, matched against the entry named `name` in `parent`, or nothing
+/// where the node's name is unusable.
+///
+/// A walk matches far more nodes than it records, so no path is built for a node the state
+/// spells as the entry does; [`NodeMatch::path`] builds one where it is needed.
+pub async fn get_node_match(
+    nodes: &StateChildrenNodes,
+    node_id: NodeID,
+    name: &str,
+    parent: &RelativePath,
+) -> Result<Option<NodeMatch>, StateError> {
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+    let block = nodes
+        .state
+        .block_with_nametable(nodes.repository.clone(), block_index)
+        .await?;
+    let node = block.node(node_index);
+    let node_name = match block.node_name_ref(node_index) {
+        Ok(node_name) => node_name,
+        Err(err) => {
+            lore_warn!("Skipping node {} with invalid name: {err}", node_id);
+            return Ok(None);
+        }
+    };
+    let renamed_path = (*node_name != *name).then(|| parent.push_into_buf(&node_name).freeze());
+
+    Ok(Some(NodeMatch { node, renamed_path }))
+}
+
+async fn get_node_and_path(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
@@ -999,7 +1063,7 @@ pub async fn get_node_and_path(
             return Ok(None);
         }
     };
-    let path = path.push_into_buf(&name).freeze();
+    let path = path.push_into_buf(name).freeze();
 
     Ok(Some(NodeSearchResult { node, path }))
 }

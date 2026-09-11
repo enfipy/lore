@@ -17,7 +17,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -31,7 +31,10 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_warn;
 use crate::metadata;
+use crate::node::INVALID_NODE;
 use crate::node::NodeID;
+use crate::node::NodeLink;
+use crate::node::ROOT_NODE;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -43,7 +46,6 @@ use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -222,6 +224,41 @@ pub struct LayerState {
     pub repository: Arc<RepositoryContext>,
     pub state_current: Arc<State>,
     pub state_staged: Arc<State>,
+}
+
+/// One side of a diff of the subtree a layer draws, as `state` holds it.
+///
+/// A layer names that subtree by the path it draws from, which is the one thing the drawn-from
+/// repository's own spelling of a path is read for: a revision numbers its nodes as it pleases,
+/// so the same subtree is a different node in each. A revision holding no such subtree names no
+/// node, which is one side of an add or a delete.
+///
+/// `source_path` reaches no further. What a diff of two of these reports is spelled from the
+/// mount, so no change carries the drawn-from spelling.
+pub(crate) async fn drawn_subtree_state(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    source_path: &RelativePath,
+) -> change::NodeChangeState {
+    if source_path.is_empty() {
+        return state::node_change_state(repository, state, ROOT_NODE).await;
+    }
+
+    let node_link = state
+        .find_node_link(repository.clone(), source_path.as_str())
+        .await
+        .ok()
+        .filter(NodeLink::is_valid);
+    let Some(node_link) = node_link else {
+        return state::node_change_state(repository, state, INVALID_NODE).await;
+    };
+
+    match node_link.resolve(repository.clone(), state.clone()).await {
+        Ok((repository, state)) => {
+            state::node_change_state(&repository, &state, node_link.node).await
+        }
+        Err(_) => state::node_change_state(repository, state, INVALID_NODE).await,
+    }
 }
 
 impl Layer {
@@ -413,8 +450,6 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
-
     // Materialize layer
     lore_debug!("Connecting remote storage");
     let correlation_id = crate::lore::execution_context()
@@ -427,7 +462,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(target_path.relative().clone()),
+        target_path: LoreString::from(&target_path.clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -437,7 +472,7 @@ pub async fn add(
 
     // Ensure the target path exist to clone into
     lore_io::IoDriver::global()
-        .create_dir_all(target_path.absolute())
+        .create_dir_all(target_path.to_absolute_path(repository.require_path()?))
         .await
         .internal("Failed to create the target directory for layer")?;
 
@@ -457,7 +492,7 @@ pub async fn add(
         stats: Arc::default(),
         modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
-    let target_states = layer_repository.filter.mount_states(target_path.relative());
+    let target_states = layer_repository.filter.mount_states(&target_path);
     clone::clone_node(
         clone_ctx,
         layer_storage,
@@ -764,14 +799,14 @@ pub async fn list_with_context(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<(Layer, Arc<RepositoryContext>)>, LayerError> {
     let layers = list(repository.clone()).await?;
-    Ok(futures::future::join_all(layers.into_iter().map(|layer| {
+    futures::future::try_join_all(layers.into_iter().map(|layer| {
         let repository = repository.clone();
         async move {
             let context = Arc::new(repository.to_layer_context(layer.repository).await);
-            (layer, context)
+            Ok((layer, context))
         }
     }))
-    .await)
+    .await
 }
 
 /// Information about a layer with staged changes, including the count of files
@@ -873,40 +908,19 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
+    let current = drawn_subtree_state(&repository, &state_current, &source_path).await;
+    let target = drawn_subtree_state(&repository, &state_target, &source_path).await;
+
     let changes = if !options.reset {
         lore_info!(
             "Calculating deltas {} -> {}",
             state_current.revision_number(),
             state_target.revision_number()
         );
-        let changes = state::diff_collect(
-            repository.clone(),
-            state_current.clone(),
-            repository.clone(),
-            state_target.clone(),
-            if !source_path.is_empty() {
-                Some(source_path.clone())
-            } else {
-                None
-            },
-            options.filter_mode,
-        )
-        .await
-        .forward::<LayerError>("Failed to calculate state diff when synchronizing")?;
-
-        if target_path != source_path {
-            // TODO(mjansson): Rewrite changes paths
-            return Err(LayerError::internal("Not implemented"));
-        }
-
-        changes
+        state::diff_collect_subtree(current, target, target_path, options.filter_mode)
+            .await
+            .forward::<LayerError>("Failed to calculate state diff when synchronizing")?
     } else {
-        if target_path != source_path {
-            // TODO(mjansson): File system diff not implemented when repository subpath
-            //                 and filesystem subpath are not equal
-            return Err(LayerError::internal("Not implemented"));
-        }
-
         // Reverse the changes since diff filesystem returns changes from state to filesystem,
         // while we want to do filesystem to state
         lore_info!(
@@ -914,21 +928,21 @@ async fn sync_in_operation(
             state_target.revision_number()
         );
         let mut changes = Vec::new();
-        state::diff_filesystem(
+        state::diff_filesystem_subtree(
             &operation,
-            FilesystemDiffTree {
-                repository: repository.clone(),
-                state: state_target.clone(),
+            FilesystemTraversal {
+                repository: target.repository,
+                state: target.state,
+                node_path: target_path.clone(),
+                root_node: target.node,
             },
-            FilesystemDiffTree {
-                repository: repository.clone(),
-                state: state_current.clone(),
+            FilesystemTraversal {
+                repository: current.repository,
+                state: current.state,
+                node_path: target_path.clone(),
+                root_node: current.node,
             },
-            if !source_path.is_empty() {
-                Some(source_path)
-            } else {
-                None
-            },
+            target_path,
             options.filter_mode,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),

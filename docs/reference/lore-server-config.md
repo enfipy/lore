@@ -299,29 +299,74 @@ directory. The server does not load the example in place.
 > a restricted deployment without an edit. Check the `Registered public gRPC
 > services` line after an upgrade.
 
-### Authentication
+#### Forwarded requests
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.
+`[server.grpc_public_services.forwarded_requests]` lets this server answer selected
+public RPCs by forwarding them to another Lore server's internal endpoint. It is
+absent by default, and no RPC is forwarded until it is named under `enabled_rpcs`.
+
+`[server.grpc_public_services.forwarded_requests.enabled_rpcs]` takes one boolean
+per forwardable RPC, all `false` by default. Releases add to the set; an unknown
+key here is ignored, so a name that is not yet forwardable forwards nothing.
+
+`[server.grpc_public_services.forwarded_requests.client]` configures the channel to
+the peer. The defaults suit a long-lived connection that sits idle between
+forwards; tune them to the path the peer is actually reached over:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `jwt_issuer` | none | Accepted JWT `iss` values, as a string or an array. When set, tokens whose issuer matches no entry are rejected. When unset, issuer validation is skipped. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
-| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
-| `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `url` | none (required) | The peer's internal gRPC endpoint, for example `https://peer.example.com:41340`. |
+| `certs` | none | Optional certificate block for mutual TLS to the peer — same fields as the [Certificate block](#certificate-block). The peer's `[server.grpc_internal]` requires client certificates unless it sets `verify_client_certs = false`. |
+| `connect_timeout_seconds` | `5` | Ceiling on the TCP connect, divided across the addresses the URL resolves to. It covers neither DNS resolution nor the TLS handshake, so it is not a bound on the whole of establishing a connection. |
+| `request_timeout_seconds` | `40` | Deadline for each forwarded request. Keep below the `request_handler_timeout_seconds` of the endpoint doing the forwarding, so that handler outlives the call it forwards. |
+| `tcp_keepalive_seconds` | `30` | TCP keep-alive probe interval. Holds open any NAT or proxy flow state on the path while the channel is idle between requests. |
+| `http2_keepalive_interval_seconds` | `20` | HTTP/2 keep-alive PING interval. Keep below the idle timeout of anything on the path that reaps idle connections. Pings are sent while the channel is idle, not only while requests are in flight. |
+| `http2_keepalive_timeout_seconds` | `10` | How long a keep-alive PING may go unanswered before the connection is dropped and redialled. |
+
+```toml
+[server.grpc_public_services.forwarded_requests.client]
+url = "https://peer.example.com:41340"
+
+[server.grpc_public_services.forwarded_requests.client.certs]
+cert_file = "/etc/lore/tls/client.crt"
+pkey_file = "/etc/lore/tls/client.key"
+cert_chain = "/etc/lore/tls/ca.crt"
+
+[server.grpc_public_services.forwarded_requests.enabled_rpcs]
+repository_get = true
+```
+
+### Authentication
+
+`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
+
+When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandatory and the server refuses to start without them: A deployment that verifies tokens without pinning issuer would accept tokens from any issuer. And a deployment that doesn't pin the audience would accept tokens minted for any service.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `jwt_issuer` | required | Accepted JWT `iss` values, as a string or an array. Tokens whose issuer matches no entry are rejected. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
+| `jwt_audience` | required | Array of accepted JWT `aud` values. A token's audience must match one entry. |
+| `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
+| `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
+| `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
+| `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
+| `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
+| `identity_claim` | `sub` | The claim recorded and compared as the caller's identity. The value read from this claim will be recorded as the user ID in Lore revisions. Any unique string value can be used as the user ID. |
+| `baseline_access` | `denied` | What the repository listing answers for an authenticated caller with no explicit repository-specific grant: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. |
 
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `endpoint` | none (required) | URL of the JWKS (JSON Web Key Set) endpoint. The server fetches and caches signing keys from it at startup and re-fetches on an unknown key ID. |
+| `endpoint` | none | URL of the JWKS (JSON Web Key Set) endpoint, as an override for providers with non-standard discovery. When unset and `jwt_issuer` is an issuer URL, the server resolves the endpoint through OIDC discovery: it fetches `<jwt_issuer>/.well-known/openid-configuration` (the first jwt_issuer entry, when several issuers are configured) and takes `jwks_uri` from it. The server fetches and caches signing keys at startup and re-fetches on an unknown key ID. If this is unset, and `jwt_issuer` has no issuer URL, this is a startup error. |
 
 ```toml
+# Presence of `[server.auth]` enables JWT verification. By default the
+# JWKS endpoint is resolved through OIDC discovery against jwt_issuer.
+# Add [server.auth.jwk] endpoint = "..." to override discovery.
 [server.auth]
 jwt_issuer = "https://accounts.example.com"
 jwt_audience = ["lore-service"]
-
-[server.auth.jwk]
-endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
 
 ## Store settings

@@ -168,8 +168,6 @@ mod tests {
                     .flatten()
                     .expect("Real stage should persist staged anchor");
                 assert_eq!(staged_revision, signature);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -240,8 +238,6 @@ mod tests {
                 )
                 .await
                 .expect("Stage of nonexisting file failed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -385,8 +381,6 @@ mod tests {
 
                 let node = block.node(block.node(0).child().unwrap() as usize);
                 assert!(node.is_staged_delete());
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -491,8 +485,6 @@ mod tests {
                 )
                 .await
                 .expect_err("Case difference not detected as expected");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -607,7 +599,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -631,14 +623,12 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.file");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -760,7 +750,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "testdir")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
                         .await
                         .expect("Failed to get updated directory name");
                 assert_eq!(updated_name.len(), 1);
@@ -784,13 +774,13 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_directory_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "testdir")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
                         .await
                         .expect("Failed to get updated directory name");
                 assert_eq!(updated_directory_name.len(), 1);
                 let updated_directory_name = updated_directory_name[0].clone();
                 assert_eq!(updated_directory_name, "testDir");
-                let updated_file_name = lore_revision::util::fs::filesystem_names(
+                let updated_file_name = lore_revision::util::fs::names_folding_to(
                     first_directory_path.as_path(),
                     "test.file",
                 )
@@ -799,8 +789,6 @@ mod tests {
                 assert_eq!(updated_file_name.len(), 1);
                 let updated_file_name = updated_file_name[0].clone();
                 assert_eq!(updated_file_name, "teST.file");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -914,7 +902,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -938,7 +926,7 @@ mod tests {
 
                 // Verify the file system was maintained
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -978,8 +966,6 @@ mod tests {
                 let node_name = block.node_name_ref(node_index).expect("Invalid node name");
 
                 assert_eq!(&*node_name, updated_name.as_str());
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -1113,7 +1099,7 @@ mod tests {
                         }
                     }
                 }
-                let names = lore_revision::util::fs::filesystem_names(path.as_path(), "assets")
+                let names = lore_revision::util::fs::names_folding_to(path.as_path(), "assets")
                     .await
                     .expect("the directory must still be there");
                 assert_eq!(names, vec!["Assets".to_string()]);
@@ -1156,8 +1142,6 @@ mod tests {
                     child = block.node(index).sibling();
                 }
                 assert_eq!(children, vec!["Assets".to_string()]);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -1385,13 +1369,11 @@ mod tests {
                     tree.sort();
                 }
 
-                let outcome = CaseOutcome {
+                CaseOutcome {
                     staged: staged.is_ok(),
                     filesystem,
                     tree,
-                };
-                let _ = std::fs::remove_dir_all(path.as_path());
-                outcome
+                }
             }))
             .await
             .expect("Test task failed")
@@ -1864,8 +1846,6 @@ mod tests {
                     .expect("Failed to get child node");
 
                 assert_eq!(node.address.context, file_id);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -2068,9 +2048,7 @@ mod tests {
         let staged = state::State::deserialize(repository.clone(), signature)
             .await
             .expect("Failed to deserialize the staged state");
-        let listed = staged_file_listing(repository.clone(), staged).await;
-        let _ = std::fs::remove_dir_all(path.as_path());
-        listed
+        staged_file_listing(repository.clone(), staged).await
     }
 
     /// Resolution collects targets in completion order, and only the antichain
@@ -2109,6 +2087,108 @@ mod tests {
                 assert_eq!(
                     together, one_at_a_time,
                     "targets resolved at once must reach the same tree as targets resolved singly"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The mode a node records is the one its file carries on disk, which the walk reads
+    /// through `FileInfo` rather than from the metadata directly.
+    ///
+    /// Only the executable bit is tracked. An already-staged node is left alone, so the
+    /// revision is committed between the two stages for the second to reach the mode.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn staging_a_file_records_the_executable_bit_it_carries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    Context::from(uuid::Uuid::now_v7()),
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let file_path = path.as_path().join("script.sh");
+                let stage_all = async |mode: u32, contents: &[u8]| {
+                    test_file_write(file_path.as_path(), contents);
+                    std::fs::set_permissions(
+                        file_path.as_path(),
+                        std::fs::Permissions::from_mode(mode),
+                    )
+                    .expect("Failed to set test file mode");
+                    let signature = file::stage::stage(
+                        repository.clone(),
+                        &write_token,
+                        LoreArray::from_vec(vec![LoreString::from(&path)]),
+                        StageOptions {
+                            case_change: stage::StageCaseChange::Error,
+                            node_flags: NodeFlags::NoFlags,
+                            file_id: None,
+                            no_children: false,
+                            scan: true,
+                        },
+                    )
+                    .await
+                    .expect("Failed to stage the test file");
+                    let staged = state::State::deserialize(repository.clone(), signature)
+                        .await
+                        .expect("Failed to deserialize the staged state");
+                    let link = staged
+                        .find_node_link(repository.clone(), "script.sh")
+                        .await
+                        .expect("The staged state must hold the file");
+                    staged
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("The staged node must read back")
+                        .mode
+                };
+
+                let executable = node::NodeFileMode::Executable.bits();
+
+                let mode = stage_all(0o755, b"#!/bin/sh\necho one").await;
+                assert_eq!(
+                    executable,
+                    mode & executable,
+                    "an executable file must record the bit"
+                );
+
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions {
+                        message: String::new(),
+                        link_messages: std::collections::HashMap::new(),
+                        link: None,
+                        layer_messages: std::collections::HashMap::new(),
+                        layer: None,
+                    },
+                ))
+                .await
+                .expect("Failed to commit the executable file");
+
+                let mode = stage_all(0o644, b"#!/bin/sh\necho two and three").await;
+                assert_eq!(
+                    0,
+                    mode & executable,
+                    "a file that lost the bit must record its loss"
                 );
             }))
             .await

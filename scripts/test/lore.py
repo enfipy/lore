@@ -166,22 +166,43 @@ class Lore:
         remote_path: str | None = None,
         repo_id: str | None = None,
         create_repo: bool = True,
+        created_paths: list[str] | None = None,
     ):
         self.lore_executable_path = lore_executable_path
         self.path = path
         self.name = name
         self.global_dir = global_dir
         self.environment_vars = environment_vars or {}
+        # The `new_lore_repo` fixture's record of what to remove when the test
+        # ends. Handed down to every repository this one clones, so a clone --
+        # which lands beside its source rather than inside it -- is removed with
+        # the rest. Defaults to a list of its own so a directly constructed Lore
+        # outside a fixture still works, just without the cleanup.
+        self.created_paths = [] if created_paths is None else created_paths
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and
         # registers this repo against the wrong instance.
         if remote_url:
             self.environment_vars.setdefault("LORE_REMOTE_URL", remote_url)
+        # Resolved before creating, because the create now passes the full URL rather
+        # than a bare name for the CLI to expand out of LORE_REMOTE_URL.
+        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
+        if remote_path:
+            self.remote_path = remote_path
+        elif self.remote:
+            # Supply the separator rather than assuming the caller's remote ends in one:
+            # the session fixture appends it, but a `remote_url=` passed straight in need
+            # not, and concatenating would yield `lore://host:1234name` -- a different
+            # host rather than the intended repository.
+            self.remote_path = f"{self.remote.rstrip('/')}/{self.name}"
+        else:
+            # No remote at all, so the bare name is the whole identifier. Joining a
+            # separator onto nothing would make `/name`, whose empty first segment is not
+            # a valid repository name.
+            self.remote_path = self.name
         if create_repo:
             self.repository_create(remote_path=remote_path, repo_id=repo_id)
-        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
-        self.remote_path = remote_path if remote_path else self.remote + self.name
         self.test_commit_id = 1
 
     def dot_dir(self) -> str:
@@ -379,7 +400,7 @@ class Lore:
         **kwargs: Unpack[GlobalOptions],
     ):
         output = self.run(
-            ["repository", "create", remote_path if remote_path else self.name]
+            ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
             + (["--id", repo_id] if repo_id else [])
             + (["--vfs", vfs] if vfs else [])
@@ -426,7 +447,7 @@ class Lore:
         self, remote_path: str | None = None, **kwargs: Unpack[GlobalOptions]
     ):
         return self.run(
-            ["repository", "delete", remote_path if remote_path else self.name],
+            ["repository", "delete", remote_path if remote_path else self.remote_path],
             **kwargs,
         )
 
@@ -1881,6 +1902,9 @@ class Lore:
             new_repo_path = parent / new_repo_name
         else:
             new_repo_path = Path(path)
+        # Recorded before the directory exists, so a clone that fails partway
+        # through still has its half-written tree removed with the test.
+        self.created_paths.append(str(new_repo_path))
         if not kwargs.get("dry_run"):
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
@@ -1923,6 +1947,7 @@ class Lore:
             path=str(new_repo_path),
             name=new_repo_name,
             create_repo=False,
+            created_paths=self.created_paths,
         )
         new_repo._ensure_test_identity_in_config()
         return new_repo
@@ -2171,12 +2196,14 @@ class Lore:
         self,
         name: str | None = None,
         fast_forward_merge: bool = False,
+        stats: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["push"]
             + ([name] if name else [])
-            + (["--fast-forward-merge"] if fast_forward_merge else []),
+            + (["--fast-forward-merge"] if fast_forward_merge else [])
+            + (["--stats"] if stats else []),
             **kwargs,
         )
 
