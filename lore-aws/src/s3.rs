@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::ops::Range;
@@ -12,6 +13,7 @@ use aws_sdk_s3 as s3;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+use aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
@@ -22,6 +24,8 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::BucketVersioningStatus;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -35,6 +39,79 @@ use tracing::warn;
 
 use crate::aws_error::AwsError;
 use crate::observe_aws_operation_callback;
+use crate::store::immutable_store::S3ObjectVersioning;
+
+/// Bucket capability mismatch or failed versioning probe.
+#[derive(Debug, thiserror::Error)]
+pub enum BucketVersioningValidationError {
+    /// The provider reported semantics that contradict Lore's configured deletion mode.
+    #[error("S3 bucket versioning mismatch: configured {expected:?}, provider reported {observed}")]
+    Mismatch {
+        expected: S3ObjectVersioning,
+        observed: String,
+    },
+    /// The provider failed the capability probe.
+    #[error("failed to query S3 bucket versioning: {0}")]
+    Request(AwsError<SdkError<GetBucketVersioningError>>),
+    /// The provider denied the versioning query while exposing an object-history API.
+    #[error(
+        "cannot verify unversioned S3 semantics: bucket versioning was denied ({versioning}) \
+         but ListObjectVersions is available"
+    )]
+    HistoryApiAvailable {
+        versioning: AwsError<SdkError<GetBucketVersioningError>>,
+    },
+    /// Both the versioning query and the fallback object-history probe failed.
+    #[error(
+        "cannot verify unversioned S3 semantics: bucket versioning failed ({versioning}); \
+         ListObjectVersions failed ({history})"
+    )]
+    HistoryProbe {
+        versioning: AwsError<SdkError<GetBucketVersioningError>>,
+        history: AwsError<SdkError<ListObjectVersionsError>>,
+    },
+}
+
+fn validate_bucket_versioning_status(
+    expected: S3ObjectVersioning,
+    status: Option<&BucketVersioningStatus>,
+) -> Result<(), BucketVersioningValidationError> {
+    let matches = match expected {
+        S3ObjectVersioning::Versioned => status == Some(&BucketVersioningStatus::Enabled),
+        S3ObjectVersioning::Unversioned => status.is_none(),
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(BucketVersioningValidationError::Mismatch {
+        expected,
+        observed: status.map_or_else(|| "unversioned".to_string(), ToString::to_string),
+    })
+}
+
+fn is_service_error<E>(error: &AwsError<SdkError<E>>, status: u16, code: &str) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let AwsError::AwsSdkError(error) = error else {
+        return false;
+    };
+    match &**error {
+        SdkError::ServiceError(error) => {
+            error.raw().status().as_u16() == status || error.err().code() == Some(code)
+        }
+        _ => false,
+    }
+}
+
+fn should_probe_history(
+    expected: S3ObjectVersioning,
+    error: &AwsError<SdkError<GetBucketVersioningError>>,
+) -> bool {
+    expected == S3ObjectVersioning::Unversioned
+        && (is_service_error(error, 403, "AccessDenied")
+            || is_service_error(error, 501, "NotImplemented"))
+}
 
 #[derive(Clone)]
 struct S3InstrumentProvider;
@@ -109,6 +186,62 @@ impl S3Impl {
                 warn!("Failed to check if bucket exists: {e}");
                 Err(AwsError::sdk_error(e))
             }
+        }
+    }
+
+    /// Verify that the bucket's actual versioning semantics match Lore's deletion mode.
+    #[tracing::instrument(name = "S3Impl::validate_bucket_versioning", skip_all)]
+    pub async fn validate_bucket_versioning(
+        &self,
+        bucket: &str,
+        expected: S3ObjectVersioning,
+    ) -> Result<(), BucketVersioningValidationError> {
+        let output = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                self.instruments
+                    .instrument_provider
+                    .get_labels_for_operation_context("get_bucket_versioning"),
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::sdk_error);
+        match output {
+            Ok(output) => validate_bucket_versioning_status(expected, output.status.as_ref()),
+            Err(versioning) if should_probe_history(expected, &versioning) => {
+                let history = self
+                    .client
+                    .list_object_versions()
+                    .bucket(bucket)
+                    .max_keys(1)
+                    .send()
+                    .observe(
+                        self.instruments.operation_latency_histogram.clone(),
+                        self.instruments
+                            .instrument_provider
+                            .get_labels_for_operation_context("list_object_versions_capability"),
+                        observe_aws_operation_callback(self.slow_operation_duration),
+                    )
+                    .await
+                    .output
+                    .map_err(AwsError::sdk_error);
+                match history {
+                    Err(error) if is_service_error(&error, 501, "NotImplemented") => Ok(()),
+                    Ok(_) => {
+                        Err(BucketVersioningValidationError::HistoryApiAvailable { versioning })
+                    }
+                    Err(history) => Err(BucketVersioningValidationError::HistoryProbe {
+                        versioning,
+                        history,
+                    }),
+                }
+            }
+            Err(error) => Err(BucketVersioningValidationError::Request(error)),
         }
     }
 
@@ -207,12 +340,14 @@ impl S3Impl {
         key: &str,
         body: Bytes,
         metadata: Option<HashMap<String, String>>,
+        if_none_match: Option<String>,
     ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>> {
         self.client
             .put_object()
             .bucket(bucket)
             .key(key)
             .set_metadata(metadata)
+            .set_if_none_match(if_none_match)
             .body(ByteStream::from(body))
             .send()
             .observe(
@@ -231,11 +366,15 @@ impl S3Impl {
         &self,
         bucket: &str,
         key: &str,
+        key_marker: Option<String>,
+        version_id_marker: Option<String>,
     ) -> Result<ListObjectVersionsOutput, AwsError<SdkError<ListObjectVersionsError>>> {
         self.client
             .list_object_versions()
             .bucket(bucket)
             .prefix(key)
+            .set_key_marker(key_marker)
+            .set_version_id_marker(version_id_marker)
             .send()
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
@@ -276,5 +415,102 @@ impl S3Impl {
 
     pub fn sdk_client(&self) -> &s3::Client {
         &self.client
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningError;
+    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
+    use aws_sdk_s3::types::BucketVersioningStatus;
+
+    use super::*;
+    use crate::store::immutable_store::S3ObjectVersioning;
+    use crate::store::test_util::aws_error;
+
+    #[test]
+    fn versioned_mode_requires_an_enabled_bucket() {
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Versioned,
+                Some(&BucketVersioningStatus::Enabled),
+            )
+            .is_ok()
+        );
+        assert!(validate_bucket_versioning_status(S3ObjectVersioning::Versioned, None).is_err());
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Versioned,
+                Some(&BucketVersioningStatus::Suspended),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unversioned_mode_rejects_versioned_buckets() {
+        assert!(validate_bucket_versioning_status(S3ObjectVersioning::Unversioned, None).is_ok());
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Unversioned,
+                Some(&BucketVersioningStatus::Enabled),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_bucket_versioning_status(
+                S3ObjectVersioning::Unversioned,
+                Some(&BucketVersioningStatus::Suspended),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn service_error_classification_uses_status_or_code() {
+        let denied = aws_error(
+            GetBucketVersioningError::generic(
+                ErrorMetadata::builder().code("AccessDenied").build(),
+            ),
+            400,
+        );
+        assert!(is_service_error(&denied, 403, "AccessDenied"));
+
+        let unsupported = aws_error(
+            ListObjectVersionsError::generic(ErrorMetadata::builder().build()),
+            501,
+        );
+        assert!(is_service_error(&unsupported, 501, "NotImplemented"));
+    }
+
+    #[test]
+    fn service_error_classification_rejects_other_failures() {
+        let failure = aws_error(
+            GetBucketVersioningError::generic(
+                ErrorMetadata::builder().code("InternalError").build(),
+            ),
+            500,
+        );
+        assert!(!is_service_error(&failure, 403, "AccessDenied"));
+        assert!(!is_service_error(&failure, 501, "NotImplemented"));
+    }
+
+    #[test]
+    fn unavailable_versioning_api_requires_an_object_history_probe() {
+        for (error, status) in [("AccessDenied", 403), ("NotImplemented", 501)] {
+            let failure = aws_error(
+                GetBucketVersioningError::generic(ErrorMetadata::builder().code(error).build()),
+                status,
+            );
+            assert!(should_probe_history(
+                S3ObjectVersioning::Unversioned,
+                &failure
+            ));
+            assert!(!should_probe_history(
+                S3ObjectVersioning::Versioned,
+                &failure
+            ));
+        }
     }
 }

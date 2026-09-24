@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -31,6 +33,7 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
+use lore_error_set::prelude::ChainError;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::Oversized;
 use lore_storage::StoreError;
@@ -38,6 +41,15 @@ use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::fragment_catalog::BeginObliteration;
+use lore_storage::fragment_catalog::CatalogGeneration;
+use lore_storage::fragment_catalog::CatalogPublication;
+use lore_storage::fragment_catalog::CatalogResolution;
+use lore_storage::fragment_catalog::FragmentCatalog;
+#[cfg(test)]
+use lore_storage::fragment_catalog::FragmentCatalogGuard;
+use lore_storage::fragment_catalog::FragmentState as CatalogFragmentState;
+use lore_storage::fragment_catalog::unlock_fragment_catalog_guard;
 #[cfg(test)]
 use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -79,7 +91,49 @@ pub mod metadata_migrator;
 
 enum QueryResultSource {
     LegacyMetadata(Fragment),
-    State,
+    State(Option<CatalogGeneration>),
+}
+
+#[derive(Clone, Copy)]
+enum BackendPublication {
+    DynamoDb(FragmentState),
+    External(CatalogPublication),
+}
+
+impl BackendPublication {
+    fn state(self) -> FragmentState {
+        match self {
+            Self::DynamoDb(state) => state,
+            Self::External(publication) => catalog_state(publication.state),
+        }
+    }
+
+    fn generation(self) -> Option<CatalogGeneration> {
+        match self {
+            Self::DynamoDb(_) => None,
+            Self::External(publication) => Some(publication.generation),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BackendResolution {
+    associated: bool,
+    publication: Option<BackendPublication>,
+}
+
+impl BackendResolution {
+    fn state(self) -> Option<FragmentState> {
+        self.publication.map(BackendPublication::state)
+    }
+
+    fn generation(self) -> Option<CatalogGeneration> {
+        self.publication.and_then(BackendPublication::generation)
+    }
+
+    fn stored_association(self) -> bool {
+        self.associated && self.state() == Some(FragmentState::Stored)
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -164,6 +218,14 @@ impl FragmentState {
     }
 }
 
+fn catalog_state(state: CatalogFragmentState) -> FragmentState {
+    match state {
+        CatalogFragmentState::Stored => FragmentState::Stored,
+        CatalogFragmentState::Obliterating => FragmentState::Obliterating,
+        CatalogFragmentState::Obliterated => FragmentState::Obliterated,
+    }
+}
+
 /// A row in the fragment state table. Presence of the row means the hash exists in some state.
 ///
 /// The `state` field is what distinguishes a row written under this model from one written when
@@ -204,11 +266,25 @@ impl FragmentStateEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum S3ObjectVersioning {
+    /// The backend may retain historical object versions. Obliteration must enumerate and delete
+    /// every version rather than relying on an unversioned delete.
+    #[default]
+    Versioned,
+    /// The backend stores only one value per key. Obliteration can permanently remove it with one
+    /// exact-key `DeleteObject` request.
+    Unversioned,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct S3StoreSettings {
     pub bucket: String,
     pub endpoint_url: Option<String>,
     pub region: Option<String>,
+    #[serde(default)]
+    pub object_versioning: S3ObjectVersioning,
     pub slow_operation_threshold_millis: u64,
     #[serde(default = "default_aws_timeout_millis")]
     pub timeout_millis: u64,
@@ -220,6 +296,7 @@ impl S3StoreSettings {
             bucket,
             endpoint_url: None,
             region: None,
+            object_versioning: S3ObjectVersioning::default(),
             slow_operation_threshold_millis: u64::MAX,
             timeout_millis: default_aws_timeout_millis(),
         }
@@ -232,6 +309,12 @@ impl S3StoreSettings {
 
     pub fn with_region(mut self, region: String) -> Self {
         self.region = Some(region);
+        self
+    }
+
+    /// Declare whether object deletion must remove historical versions.
+    pub fn with_object_versioning(mut self, object_versioning: S3ObjectVersioning) -> Self {
+        self.object_versioning = object_versioning;
         self
     }
 }
@@ -290,6 +373,21 @@ pub struct AwsImmutableStoreSettings {
     pub dynamodb: DynamoDbImmutableStoreSettings,
     #[serde(default)]
     pub force_write: bool,
+}
+
+/// Object-store settings used with a non-DynamoDB fragment catalog.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ObjectStoreImmutableStoreSettings {
+    pub s3: S3StoreSettings,
+    #[serde(default)]
+    pub force_write: bool,
+}
+
+impl ObjectStoreImmutableStoreSettings {
+    /// Create object-store settings for an external fragment catalog.
+    pub fn new(s3: S3StoreSettings, force_write: bool) -> Self {
+        Self { s3, force_write }
+    }
 }
 
 impl AwsImmutableStoreSettings {
@@ -509,6 +607,20 @@ where
     }
 }
 
+fn is_s3_precondition_failed(
+    error: &AwsError<aws_sdk_s3::error::SdkError<PutObjectError>>,
+) -> bool {
+    let AwsError::AwsSdkError(error) = error else {
+        return false;
+    };
+    match &**error {
+        aws_sdk_s3::error::SdkError::ServiceError(error) => {
+            error.raw().status().as_u16() == 412 || error.err().code() == Some("PreconditionFailed")
+        }
+        _ => false,
+    }
+}
+
 /// Mark a fragment as durably stored.
 ///
 /// Durability is a fact about this store, not about the payload, so it is derived on read rather
@@ -532,19 +644,10 @@ struct GetS3objectContentsOutput {
 
 pub struct AwsImmutableStore {
     s3: S3,
-    dynamodb: DynamoDb,
+    catalog: FragmentCatalogBackend,
     bucket: String,
-    fragments_table_name: Arc<str>,
-    /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
-    /// lifecycle state only, never a fragment.
-    fragment_state_table_name: Arc<str>,
-    /// Set only where objects predating the move onto the S3 object may still exist. `None` is a
-    /// deployment that has never written one, and reads accordingly refuse to guess.
-    fragment_metadata_table_name: Option<Arc<str>>,
+    object_versioning: S3ObjectVersioning,
     force_write: bool,
-    /// How long to wait between removing an association and counting what remains, so a put that
-    /// had already passed its state probe has time to land its own association and be counted.
-    obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
     labels_put: LabelArray,
@@ -557,6 +660,46 @@ pub struct AwsImmutableStore {
     /// already says which condition it is, and either can be observed from more than one operation.
     missing_payload_counter: Counter<u64>,
     association_without_state_counter: Counter<u64>,
+}
+
+enum FragmentCatalogBackend {
+    DynamoDb(DynamoDbCatalogBackend),
+    External(Arc<dyn FragmentCatalog>),
+}
+
+struct DynamoDbCatalogBackend {
+    client: Box<DynamoDb>,
+    fragments_table: Arc<str>,
+    state_table: Arc<str>,
+    /// Set only where objects predating object metadata may still exist.
+    legacy_metadata_table: Option<Arc<str>>,
+    /// Lets a put already past its state probe publish before reference counting.
+    obliteration_drain: Duration,
+}
+
+impl FragmentCatalogBackend {
+    fn dynamodb(&self) -> Result<&DynamoDbCatalogBackend, StoreError> {
+        match self {
+            Self::DynamoDb(catalog) => Ok(catalog),
+            Self::External(_) => Err(StoreError::internal(
+                "DynamoDB operation requested from an external fragment catalog",
+            )),
+        }
+    }
+
+    fn external(&self) -> Option<&Arc<dyn FragmentCatalog>> {
+        match self {
+            Self::DynamoDb(_) => None,
+            Self::External(catalog) => Some(catalog),
+        }
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.external()
+            .map_or(Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT), |catalog| {
+                catalog.max_query_batch()
+            })
+    }
 }
 
 impl AwsImmutableStore {
@@ -576,24 +719,25 @@ impl AwsImmutableStore {
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
         Self {
             s3,
-            dynamodb,
-            bucket: settings.s3.bucket.clone(),
-            fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
-            fragment_state_table_name: Arc::from(
-                settings.dynamodb.fragment_state_table_name.clone(),
-            ),
-            fragment_metadata_table_name: settings
-                .dynamodb
-                .fragment_metadata_table_name
-                .as_ref()
-                .map(|name| Arc::from(name.clone())),
-            force_write: settings.force_write,
-            obliteration_drain: Duration::from_millis(
-                settings
+            catalog: FragmentCatalogBackend::DynamoDb(DynamoDbCatalogBackend {
+                client: Box::new(dynamodb),
+                fragments_table: Arc::from(settings.dynamodb.fragments_table_name.clone()),
+                state_table: Arc::from(settings.dynamodb.fragment_state_table_name.clone()),
+                legacy_metadata_table: settings
                     .dynamodb
-                    .timeout_millis
-                    .max(MIN_OBLITERATION_DRAIN_MILLIS),
-            ),
+                    .fragment_metadata_table_name
+                    .as_ref()
+                    .map(|name| Arc::from(name.clone())),
+                obliteration_drain: Duration::from_millis(
+                    settings
+                        .dynamodb
+                        .timeout_millis
+                        .max(MIN_OBLITERATION_DRAIN_MILLIS),
+                ),
+            }),
+            bucket: settings.s3.bucket.clone(),
+            object_versioning: settings.s3.object_versioning,
+            force_write: settings.force_write,
             latency_histogram,
             labels_get,
             labels_put,
@@ -603,6 +747,107 @@ impl AwsImmutableStore {
             labels_query,
             missing_payload_counter,
             association_without_state_counter,
+        }
+    }
+
+    /// Compose S3-compatible payload storage with a backend-neutral fragment catalog.
+    pub fn with_catalog(
+        s3: S3,
+        catalog: Arc<dyn FragmentCatalog>,
+        settings: &ObjectStoreImmutableStoreSettings,
+    ) -> Self {
+        let provider = AwsImmutableStoreInstrumentProvider;
+        Self {
+            s3,
+            catalog: FragmentCatalogBackend::External(catalog),
+            bucket: settings.s3.bucket.clone(),
+            object_versioning: settings.s3.object_versioning,
+            force_write: settings.force_write,
+            latency_histogram: provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+            labels_get: provider.get_labels_for_operation_context("get"),
+            labels_put: provider.get_labels_for_operation_context("put"),
+            labels_obliterate: provider.get_labels_for_operation_context("obliterate"),
+            labels_copy: provider.get_labels_for_operation_context("copy"),
+            labels_get_metadata: provider.get_labels_for_operation_context("get_metadata"),
+            labels_query: provider.get_labels_for_operation_context("query"),
+            missing_payload_counter: provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME),
+            association_without_state_counter: provider
+                .counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME),
+        }
+    }
+
+    fn dynamodb(&self) -> Result<&DynamoDb, StoreError> {
+        Ok(&self.catalog.dynamodb()?.client)
+    }
+
+    async fn resolve_backend(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<BackendResolution, StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                let resolution = catalog.resolve(partition, address).await?;
+                Ok(BackendResolution {
+                    associated: resolution.associated,
+                    publication: resolution.publication.map(BackendPublication::External),
+                })
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                let (associated, state) = tokio::join!(
+                    self.exists(partition, address),
+                    self.load_state(address.hash)
+                );
+                Ok(BackendResolution {
+                    associated: associated?,
+                    publication: state?.map(BackendPublication::DynamoDb),
+                })
+            }
+        }
+    }
+
+    async fn resolve_partition_backend(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<BackendResolution, StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                let resolution = catalog.resolve_partition(partition, hash).await?;
+                Ok(BackendResolution {
+                    associated: resolution.associated,
+                    publication: resolution.publication.map(BackendPublication::External),
+                })
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                let (associated, state) = tokio::join!(
+                    self.has_partition_association(partition, hash),
+                    self.load_state(hash)
+                );
+                Ok(BackendResolution {
+                    associated: associated?,
+                    publication: state?.map(BackendPublication::DynamoDb),
+                })
+            }
+        }
+    }
+
+    async fn associate_backend(
+        &self,
+        partition: Partition,
+        address: Address,
+        payload_confirmed: bool,
+    ) -> Result<(), StoreError> {
+        match &self.catalog {
+            FragmentCatalogBackend::External(catalog) => {
+                if !payload_confirmed {
+                    self.head_fragment(address.hash).await?;
+                }
+                catalog.publish(partition, address).await
+            }
+            FragmentCatalogBackend::DynamoDb(_) => {
+                self.associate_fragment(partition, address).await
+            }
         }
     }
 
@@ -622,9 +867,9 @@ impl AwsImmutableStore {
         })?;
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .get_item(
-                &self.fragments_table_name,
+                &self.catalog.dynamodb()?.fragments_table,
                 item,
                 true, /* consistent read */
             )
@@ -666,8 +911,8 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
-            .batch_get_item(&self.fragments_table_name, items, true)
+            .dynamodb()?
+            .batch_get_item(&self.catalog.dynamodb()?.fragments_table, items, true)
             .await
             .map_err(|e| {
                 warn!("DynamoDb association resolve failed: {e:?}");
@@ -710,12 +955,37 @@ impl AwsImmutableStore {
         address: Address,
         labels: &[KeyValue],
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
+        if let Some(catalog) = self.catalog.external() {
+            let resolution = catalog.resolve(partition, address).await?;
+            let miss = (QueryResultSource::State(None), StoreGetData::default());
+            if !resolution.associated {
+                return Ok(miss);
+            }
+            return match resolution.state() {
+                Some(CatalogFragmentState::Stored) => Ok((
+                    QueryResultSource::State(resolution.generation()),
+                    StoreGetData::metadata(
+                        stored_durable(Fragment::default()),
+                        StoreMatch::MatchFull,
+                        partition,
+                    ),
+                )),
+                Some(CatalogFragmentState::Obliterating | CatalogFragmentState::Obliterated) => {
+                    Ok(miss)
+                }
+                None => {
+                    self.association_without_state_counter.add(1, labels);
+                    Ok(miss)
+                }
+            };
+        }
+
         let (associated, state) = tokio::join!(
             self.exists(partition, address),
             self.load_state(address.hash)
         );
 
-        let miss = Ok((QueryResultSource::State, StoreGetData::default()));
+        let miss = Ok((QueryResultSource::State(None), StoreGetData::default()));
 
         if !associated? {
             return miss;
@@ -725,7 +995,7 @@ impl AwsImmutableStore {
 
         match state? {
             Some(FragmentState::Stored) => Ok((
-                QueryResultSource::State,
+                QueryResultSource::State(None),
                 StoreGetData::metadata(stored_durable(Fragment::default()), match_made, partition),
             )),
             Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
@@ -735,7 +1005,7 @@ impl AwsImmutableStore {
             None => {
                 // if not in the `state` table then it could be a legacy fragment
                 // that only exists in the metadata table
-                if self.fragment_metadata_table_name.is_some()
+                if self.catalog.dynamodb()?.legacy_metadata_table.is_some()
                     && let Some(fragment) = self.fragment_from_metadata_table(address.hash).await?
                 {
                     let legacy_fragment_state = FragmentState::from_bits(fragment.flags);
@@ -770,8 +1040,39 @@ impl AwsImmutableStore {
         addresses: &[Address],
         results: &mut [StoreMatchResult],
     ) -> Result<(), StoreError> {
+        if let Some(catalog) = self.catalog.external() {
+            let resolutions = catalog.resolve_batch(partition, addresses).await?;
+            if resolutions.len() != addresses.len() {
+                return Err(StoreError::internal(
+                    "Fragment catalog returned an unexpected batch size",
+                ));
+            }
+            for ((address, resolution), result) in
+                addresses.iter().zip(resolutions).zip(results.iter_mut())
+            {
+                if resolution.associated && resolution.state() == Some(CatalogFragmentState::Stored)
+                {
+                    *result = StoreMatchResult {
+                        match_made: StoreMatch::MatchFull,
+                        partition,
+                        context: address.context,
+                        stored_local: false,
+                        stored_durable: true,
+                    };
+                } else {
+                    if resolution.associated && resolution.publication.is_none() {
+                        self.association_without_state_counter
+                            .add(1, &self.labels_query);
+                        trace!(%address, "Query found an association with no stored payload");
+                    }
+                    *result = StoreMatchResult::default();
+                }
+            }
+            return Ok(());
+        }
+
         // Neither read needs what the other returns.
-        let (associations, states) = if self.fragment_metadata_table_name.is_some() {
+        let (associations, states) = if self.catalog.dynamodb()?.legacy_metadata_table.is_some() {
             let (associations, states) = tokio::join!(
                 self.associations_present(partition, addresses),
                 self.states_for(addresses)
@@ -851,8 +1152,8 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
-            .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
+            .dynamodb()?
+            .put_item_conditional(&self.catalog.dynamodb()?.state_table, item, RowAbsent)
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
@@ -907,13 +1208,27 @@ impl AwsImmutableStore {
     /// was, and the alarm has been raised regardless.
     ///
     /// `labels` carries the calling operation's context, for the reason on [`Self::do_query`].
-    async fn report_missing_payload(&self, address: Address, labels: &[KeyValue]) {
-        self.missing_payload_counter.add(1, labels);
-        error!(
-            %address,
-            "Fragment is referenced by a partition but absent from S3; content for this hash has \
-             been lost. Clearing its state so the content can be stored again."
-        );
+    async fn report_missing_payload(
+        &self,
+        address: Address,
+        generation: Option<CatalogGeneration>,
+        labels: &[KeyValue],
+    ) {
+        self.record_missing_payload(address, labels);
+
+        if let Some(catalog) = self.catalog.external() {
+            let Some(generation) = generation else {
+                warn!(%address, "Missing external catalog generation for a lost payload");
+                return;
+            };
+            if let Err(error) = catalog
+                .repair_missing_payload(address.hash, generation)
+                .await
+            {
+                warn!(%address, ?error, "Failed to clear state for a lost payload");
+            }
+            return;
+        }
 
         match self.load_state(address.hash).await {
             Ok(Some(FragmentState::Stored)) => {
@@ -930,6 +1245,15 @@ impl AwsImmutableStore {
         }
     }
 
+    fn record_missing_payload(&self, address: Address, labels: &[KeyValue]) {
+        self.missing_payload_counter.add(1, labels);
+        error!(
+            %address,
+            "Fragment is referenced by a partition but absent from S3; content for this hash has \
+             been lost. Clearing its state so the content can be stored again."
+        );
+    }
+
     /// Delete the state row for a hash, so the next put treats it as new content.
     ///
     /// Only called for a payload S3 has lost. An obliteration holding the mark is left alone by the
@@ -940,8 +1264,8 @@ impl AwsImmutableStore {
             StoreError::internal_with_context(e, "Failed to serialize fragment state for delete")
         })?;
 
-        self.dynamodb
-            .delete_item(&self.fragment_state_table_name, item)
+        self.dynamodb()?
+            .delete_item(&self.catalog.dynamodb()?.state_table, item)
             .await
             .map_err(|e| {
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1003,9 +1327,9 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
+            .dynamodb()?
             .put_item_conditional(
-                &self.fragment_state_table_name,
+                &self.catalog.dynamodb()?.state_table,
                 item,
                 StateUnchanged(expected),
             )
@@ -1047,7 +1371,9 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb.put_item(&self.fragments_table_name, item).await
+        self.dynamodb()?
+            .put_item(&self.catalog.dynamodb()?.fragments_table, item)
+            .await
             .map_err(|e| {
                 warn!({REPOSITORY_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1084,8 +1410,8 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
-            .batch_get_item(&self.fragment_state_table_name, items, true)
+            .dynamodb()?
+            .batch_get_item(&self.catalog.dynamodb()?.state_table, items, true)
             .await
             .map_err(|e| {
                 warn!("DynamoDb fragment state resolve failed: {e:?}");
@@ -1122,7 +1448,7 @@ impl AwsImmutableStore {
         &self,
         hashes: &[Hash],
     ) -> Result<HashMap<Hash, FragmentState>, StoreError> {
-        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+        let Some(table_name) = self.catalog.dynamodb()?.legacy_metadata_table.as_ref() else {
             return Ok(HashMap::new());
         };
 
@@ -1147,7 +1473,7 @@ impl AwsImmutableStore {
         }
 
         let output = self
-            .dynamodb
+            .dynamodb()?
             .batch_get_item(table_name, items, true /* consistent read */)
             .await
             .map_err(|e| {
@@ -1182,9 +1508,9 @@ impl AwsImmutableStore {
         partition: Partition,
         hash: Hash,
     ) -> Result<bool, StoreError> {
-        self.dynamodb
+        self.dynamodb()?
             .query_single(
-                &self.fragments_table_name,
+                &self.catalog.dynamodb()?.fragments_table,
                 PartitionAssociationQuery(hash, partition),
             )
             .await
@@ -1208,8 +1534,11 @@ impl AwsImmutableStore {
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
-        self.dynamodb
-            .query_single(&self.fragments_table_name, FragmentsQuery(hash))
+        self.dynamodb()?
+            .query_single(
+                &self.catalog.dynamodb()?.fragments_table,
+                FragmentsQuery(hash),
+            )
             .await
             .map(|output| output.count > 0)
             .map_err(|e| {
@@ -1242,8 +1571,8 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb
-            .delete_item(&self.fragments_table_name, item)
+        self.dynamodb()?
+            .delete_item(&self.catalog.dynamodb()?.fragments_table, item)
             .await
             .map_err(|e| {
                 warn!("Failed to delete fragment association for partition: {partition} and address: {address}: {e:?}");
@@ -1279,26 +1608,39 @@ impl AwsImmutableStore {
             let mut dst = [0u8; 64];
             let s3_key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
-            self.s3
+            let result = self
+                .s3
                 .put_object(
                     self.bucket.as_str(),
                     s3_key,
-                    payload,
+                    payload.clone(),
                     Some(to_object_metadata(&fragment)),
+                    self.catalog.external().map(|_| "*".to_string()),
                 )
-                .await
-                .map(|_| ())
-                .map_err(|error| {
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(error) if is_s3_precondition_failed(&error) => {
+                    self.verify_existing_payload(hash, fragment, &payload)
+                        .await?;
+                }
+                Err(error) => {
                     warn!(?error, %hash, %s3_key, "Failed to write payload for hash");
-                    if matches!(&error, AwsError::AwsSdkError(_)) {
+                    return Err(if matches!(&error, AwsError::AwsSdkError(_)) {
                         StoreError::from(SlowDown)
                     } else {
                         StoreError::internal_with_context(error, "S3 put object failed")
-                    }
-                })?;
+                    });
+                }
+            }
         }
 
-        match self.publish_state(hash).await? {
+        if self.catalog.external().is_some() {
+            return Ok(());
+        }
+
+        let state = self.publish_state(hash).await?;
+        match state {
             FragmentState::Stored => {}
             FragmentState::Obliterating => {
                 info!(
@@ -1317,58 +1659,162 @@ impl AwsImmutableStore {
         Ok(())
     }
 
+    async fn verify_existing_payload(
+        &self,
+        hash: Hash,
+        expected_fragment: Fragment,
+        expected_payload: &Bytes,
+    ) -> Result<(), StoreError> {
+        let (stored_fragment, stored_payload) = self.load(hash).await?;
+        if to_object_metadata(&stored_fragment) == to_object_metadata(&expected_fragment)
+            && stored_payload == *expected_payload
+        {
+            return Ok(());
+        }
+        Err(StoreError::internal(format!(
+            "Immutable S3 object for hash {hash} differs from the attempted publication"
+        )))
+    }
+
     /// Permanently delete a payload from S3 by removing *ALL* versions from the bucket.
     async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
-        let versions: Option<Vec<Option<String>>> = self
-            .s3
-            .list_versions(self.bucket.as_str(), hash)
-            .await
-            .map(|output| {
-                output
-                    .versions
-                    .map(|versions| versions.into_iter().map(|v| v.version_id).collect())
-            })
-            .map_err(|e| {
-                warn!("Failed to list versions for hash: {hash}: {e:?}");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "S3 list object versions failed")
-                }
-            })?;
-
-        if let Some(versions) = versions {
-            for version in versions {
-                self.s3
-                    .delete_object(self.bucket.as_str(), hash, version)
-                    .await
-                    .map_err(|e| {
-                        warn!("Failed to delete payload for hash: {hash}: {e:?}");
-                        if matches!(&e, AwsError::AwsSdkError(_)) {
-                            StoreError::from(SlowDown)
-                        } else {
-                            StoreError::internal_with_context(e, "S3 delete object version failed")
-                        }
-                    })?;
-            }
-        } else {
+        if self.object_versioning == S3ObjectVersioning::Unversioned {
             self.s3
                 .delete_object(self.bucket.as_str(), hash, None)
                 .await
+                .map(|_| ())
                 .map_err(|e| {
-                    warn!("Failed to delete payload for hash: {hash}: {e:?}");
+                    warn!("Failed to delete unversioned payload for hash: {hash}: {e:?}");
                     if matches!(&e, AwsError::AwsSdkError(_)) {
-                        StoreError::from(SlowDown)
+                        let source =
+                            StoreError::internal_with_context(e, "S3 delete object failed");
+                        StoreError::SlowDown(
+                            SlowDown.chain_err_from(source, "retryable S3 delete object failure"),
+                        )
                     } else {
                         StoreError::internal_with_context(e, "S3 delete object failed")
                     }
                 })?;
+            return self.verify_payload_absent(hash).await;
         }
 
-        Ok(())
+        const MAX_VERSION_SWEEPS: usize = 16;
+        for _ in 0..MAX_VERSION_SWEEPS {
+            let mut key_marker = None;
+            let mut version_id_marker = None;
+            let mut found = false;
+            loop {
+                let output = self
+                    .s3
+                    .list_versions(
+                        self.bucket.as_str(),
+                        hash,
+                        key_marker.take(),
+                        version_id_marker.take(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!("Failed to list versions for hash: {hash}: {e:?}");
+                        if matches!(&e, AwsError::AwsSdkError(_)) {
+                            let source = StoreError::internal_with_context(
+                                e,
+                                "S3 list object versions failed",
+                            );
+                            StoreError::SlowDown(SlowDown.chain_err_from(
+                                source,
+                                "retryable S3 list object versions failure",
+                            ))
+                        } else {
+                            StoreError::internal_with_context(e, "S3 list object versions failed")
+                        }
+                    })?;
+                let truncated = output.is_truncated() == Some(true);
+                let next_key_marker = output.next_key_marker.clone();
+                let next_version_id_marker = output.next_version_id_marker.clone();
+                let mut versions: Vec<Option<String>> = output
+                    .versions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|version| version.key.as_deref() == Some(hash))
+                    .map(|version| version.version_id)
+                    .collect();
+                versions.extend(
+                    output
+                        .delete_markers
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|marker| marker.key.as_deref() == Some(hash))
+                        .map(|marker| marker.version_id),
+                );
+                found |= !versions.is_empty();
+                for version in versions {
+                    let version = version.ok_or_else(|| {
+                        StoreError::internal(format!(
+                            "S3 version history for payload {hash} omitted a version ID"
+                        ))
+                    })?;
+                    self.s3
+                        .delete_object(self.bucket.as_str(), hash, Some(version))
+                        .await
+                        .map_err(|e| {
+                            warn!("Failed to delete payload for hash: {hash}: {e:?}");
+                            if matches!(&e, AwsError::AwsSdkError(_)) {
+                                let source = StoreError::internal_with_context(
+                                    e,
+                                    "S3 delete object version failed",
+                                );
+                                StoreError::SlowDown(SlowDown.chain_err_from(
+                                    source,
+                                    "retryable S3 delete object version failure",
+                                ))
+                            } else {
+                                StoreError::internal_with_context(
+                                    e,
+                                    "S3 delete object version failed",
+                                )
+                            }
+                        })?;
+                }
+                if !truncated {
+                    break;
+                }
+                key_marker = next_key_marker;
+                version_id_marker = next_version_id_marker;
+                if key_marker.is_none() || version_id_marker.is_none() {
+                    return Err(StoreError::internal(
+                        "Truncated S3 version listing returned no continuation markers",
+                    ));
+                }
+            }
+            if !found {
+                return self.verify_payload_absent(hash).await;
+            }
+        }
+        Err(StoreError::internal(format!(
+            "S3 version history for payload {hash} did not become empty"
+        )))
+    }
+
+    async fn verify_payload_absent(&self, key: &str) -> Result<(), StoreError> {
+        match self.s3.head_object(self.bucket.as_str(), key).await {
+            Ok(_) => Err(StoreError::internal(format!(
+                "S3 payload {key} is still present after deletion"
+            ))),
+            Err(AwsError::AwsSdkError(error)) => match error.into_service_error() {
+                HeadObjectError::NotFound(_) => Ok(()),
+                error => Err(StoreError::internal_with_context(
+                    error,
+                    "Failed to verify S3 payload deletion",
+                )),
+            },
+            Err(error) => Err(StoreError::internal_with_context(
+                error,
+                "Failed to verify S3 payload deletion",
+            )),
+        }
     }
 
     async fn s3_head_object(&self, hash: Hash) -> Result<HeadObjectOutput, StoreError> {
@@ -1444,9 +1890,9 @@ impl AwsImmutableStore {
         })?;
 
         let Some(av_map) = self
-            .dynamodb
+            .dynamodb()?
             .get_item(
-                &self.fragment_state_table_name,
+                &self.catalog.dynamodb()?.state_table,
                 item,
                 true, /* consistent read */
             )
@@ -1486,7 +1932,7 @@ impl AwsImmutableStore {
         &self,
         hash: Hash,
     ) -> Result<Option<Fragment>, StoreError> {
-        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+        let Some(table_name) = self.catalog.dynamodb()?.legacy_metadata_table.as_ref() else {
             warn!(
                 %hash,
                 "Stored object carries no fragment metadata and no fragment metadata table is \
@@ -1506,7 +1952,7 @@ impl AwsImmutableStore {
         })?;
 
         let entry = self
-            .dynamodb
+            .dynamodb()?
             .get_item(table_name, item, true /* consistent read */)
             .await
             .map_err(|e| {
@@ -1751,6 +2197,92 @@ impl AwsImmutableStore {
         info!("Done obliterating sub-fragments");
         Ok(())
     }
+
+    async fn put_external(
+        &self,
+        catalog: &Arc<dyn FragmentCatalog>,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), StoreError> {
+        let mut guard = catalog.lock_hash(address.hash).await?;
+        let result = async {
+            let resolution = if self.force_write {
+                CatalogResolution::default()
+            } else {
+                guard.resolve(partition, address).await?
+            };
+
+            match resolution.state() {
+                Some(CatalogFragmentState::Obliterating) => {
+                    debug!(%address, "Put rejected while the payload is being obliterated");
+                    Err(StoreError::from(SlowDown))
+                }
+                Some(CatalogFragmentState::Stored) => {
+                    match self.head_fragment(address.hash).await {
+                        Ok(_) => guard.publish(partition, address).await,
+                        Err(error) if error.is_address_not_found() => {
+                            self.record_missing_payload(address, &self.labels_put);
+                            let generation = resolution.generation().ok_or_else(|| {
+                                StoreError::internal("Stored catalog publication has no generation")
+                            })?;
+                            guard.repair_missing_payload(generation).await?;
+                            let payload = payload.ok_or(error)?;
+                            self.write_payload_and_state(address.hash, fragment, payload)
+                                .await?;
+                            guard.publish(partition, address).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => {
+                    let payload =
+                        payload.ok_or_else(|| StoreError::internal("Payload buffer required"))?;
+                    self.write_payload_and_state(address.hash, fragment, payload)
+                        .await?;
+                    guard.publish(partition, address).await
+                }
+            }
+        }
+        .await;
+        unlock_fragment_catalog_guard(guard, result).await
+    }
+
+    async fn put_dynamodb(
+        &self,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), StoreError> {
+        let resolution = if self.force_write {
+            BackendResolution::default()
+        } else {
+            self.resolve_backend(partition, address).await?
+        };
+
+        match (resolution.state(), resolution.associated) {
+            (Some(FragmentState::Obliterating), _) => {
+                debug!(%address, "Put rejected while the payload is being obliterated");
+                Err(StoreError::from(SlowDown))
+            }
+            (Some(FragmentState::Stored), true) => Ok(()),
+            (Some(FragmentState::Stored), false) if payload.is_some() => {
+                self.associate_backend(partition, address, false).await
+            }
+            (Some(FragmentState::Stored), false) => {
+                Err(StoreError::internal("Payload buffer required"))
+            }
+            _ => {
+                let payload =
+                    payload.ok_or_else(|| StoreError::internal("Payload buffer required"))?;
+                self.write_payload_and_state(address.hash, fragment, payload)
+                    .await?;
+                self.associate_backend(partition, address, true).await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1862,7 +2394,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 QueryResultSource::LegacyMetadata(fragment) => {
                     Ok(StoreGetData::metadata(fragment, match_made, partition))
                 }
-                QueryResultSource::State => {
+                QueryResultSource::State(generation) => {
                     let head_output = match head_result {
                         Some(result) => result,
                         None => head_fut.await,
@@ -1871,8 +2403,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     match head_output {
                         Ok(fragment) => Ok(StoreGetData::metadata(fragment, match_made, partition)),
                         Err(e) if e.is_address_not_found() => {
-                            self.report_missing_payload(address, &self.labels_get_metadata)
-                                .await;
+                            self.report_missing_payload(
+                                address,
+                                generation,
+                                &self.labels_get_metadata,
+                            )
+                            .await;
                             Ok(miss)
                         }
                         Err(e) => Err(e),
@@ -1894,7 +2430,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             timed!(self.latency_histogram, &self.labels_get, {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.exists(partition, address);
+                let exists_fut = self.resolve_backend(partition, address);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -1909,7 +2445,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 };
                 // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
                 // early return. Exists error takes priority over any load error.
-                if !exists_result? {
+                let resolution = exists_result?;
+                if !resolution.stored_association() {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
 
@@ -1923,7 +2460,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     .err()
                     .is_some_and(StoreError::is_address_not_found)
                 {
-                    self.report_missing_payload(address, &self.labels_get).await;
+                    self.report_missing_payload(address, resolution.generation(), &self.labels_get)
+                        .await;
                 }
 
                 load_output
@@ -1957,44 +2495,15 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             lore_storage::validate_fragment_size(&fragment)?;
         }
         timed!(self.latency_histogram, &self.labels_put, {
-            let probe = if self.force_write {
-                (None, false)
-            } else {
-                let (associated, state) = tokio::join!(
-                    self.exists(partition, address),
-                    self.load_state(address.hash)
-                );
-                (state?, associated?)
-            };
-
-            match probe {
-                (Some(FragmentState::Obliterating), _) => {
-                    debug!(
-                        "Received request to put fragment at {address} that is in the process of \
-                         being obliterated"
-                    );
-                    Err(StoreError::from(SlowDown))
+            match self.catalog.external() {
+                Some(catalog) => {
+                    self.put_external(catalog, partition, address, fragment, payload)
+                        .await
                 }
-
-                (Some(FragmentState::Stored), true) => Ok(()),
-
-                (Some(FragmentState::Stored), false) if payload.is_some() => {
-                    self.associate_fragment(partition, address).await
+                None => {
+                    self.put_dynamodb(partition, address, fragment, payload)
+                        .await
                 }
-
-                (Some(FragmentState::Stored), false) => {
-                    Err(StoreError::internal("Payload buffer required"))
-                }
-
-                _ => match payload {
-                    Some(payload) => {
-                        self.write_payload_and_state(address.hash, fragment, payload)
-                            .await?;
-                        self.associate_fragment(partition, address).await?;
-                        Ok(())
-                    }
-                    None => Err(StoreError::internal("Payload buffer required")),
-                },
             }
         })
         .into()
@@ -2012,6 +2521,71 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // Note: given the importance of the work done here, and how relatively infrequently we
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
+
+            if let Some(catalog) = self.catalog.external() {
+                let mut guard = catalog
+                    .lock_hash(address.hash)
+                    .instrument(span.clone())
+                    .await?;
+                let begin = guard.begin_obliteration(partition, address).await;
+                let begin = unlock_fragment_catalog_guard(guard, begin).await?;
+                match begin {
+                    BeginObliteration::NoState => {
+                        info!("No fragment state for {address}, nothing to obliterate");
+                        return Ok(());
+                    }
+                    BeginObliteration::AlreadyObliterated => {
+                        info!("Fragment {address} has already been obliterated");
+                        return Ok(());
+                    }
+                    BeginObliteration::ResumePayloadDeletion => {
+                        info!("Resuming interrupted payload deletion for {address}");
+                    }
+                    BeginObliteration::ReferencesRemain => {
+                        stats
+                            .num_fragments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    BeginObliteration::PayloadUnreferenced => {
+                        stats
+                            .num_fragments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                self.clone()
+                    .obliterate_sub_fragments(partition, address, stats.clone())
+                    .instrument(span.clone())
+                    .await?;
+                let mut guard = catalog
+                    .lock_hash(address.hash)
+                    .instrument(span.clone())
+                    .await?;
+                let result = async {
+                    let resolution = guard.resolve(partition, address).await?;
+                    if resolution.state() != Some(CatalogFragmentState::Obliterating) {
+                        info!(
+                            %address,
+                            state = ?resolution.state(),
+                            "Skipping stale payload deletion after catalog state changed"
+                        );
+                        return Ok(false);
+                    }
+                    self.delete_payload(address.hash)
+                        .instrument(span.clone())
+                        .await?;
+                    guard.finalize_obliteration().await?;
+                    Ok(true)
+                }
+                .await;
+                if unlock_fragment_catalog_guard(guard, result).await? {
+                    stats
+                        .num_payloads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(());
+            }
 
             // Content written before the state table existed has no row here, so this returns
             // having deleted nothing: the association stays, and still resolves to a full match.
@@ -2055,7 +2629,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .instrument(span.clone())
                 .await?;
 
-            tokio::time::sleep(self.obliteration_drain).await;
+            tokio::time::sleep(self.catalog.dynamodb()?.obliteration_drain).await;
 
             info!("Association deleted, re-checking for other associations...");
             if self
@@ -2122,18 +2696,29 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            let present = if source_address.context.is_zero() {
-                self.has_partition_association(source_partition, source_address.hash)
+            let source = if source_address.context.is_zero() {
+                self.resolve_partition_backend(source_partition, source_address.hash)
                     .await?
             } else {
-                self.exists(source_partition, source_address).await?
+                self.resolve_backend(source_partition, source_address)
+                    .await?
             };
-            if !present {
+            if !source.stored_association() {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
-            self.associate_fragment(destination_partition, destination_address)
-                .await
+            let result = self
+                .associate_backend(destination_partition, destination_address, false)
+                .await;
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(StoreError::is_address_not_found)
+            {
+                self.report_missing_payload(source_address, source.generation(), &self.labels_copy)
+                    .await;
+            }
+            result
         })
         .into()
     }
@@ -2173,8 +2758,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     }
 
     fn max_query_batch(&self) -> Option<usize> {
-        // DynamoDB batch size cannot exceed 100
-        Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT)
+        self.catalog.max_query_batch()
     }
 }
 
@@ -2192,16 +2776,895 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 
 #[cfg(test)]
 mod test {
+    use std::future::Future;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
+    use async_trait::async_trait;
+    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
+    use aws_sdk_s3::types::DeleteMarkerEntry;
+    use aws_sdk_s3::types::ObjectVersion;
     use lore_base::types::FragmentFlags;
     use lore_storage::ImmutableStore;
     use rand::random;
+    use tokio::sync::oneshot;
     use zerocopy::IntoBytes;
 
     use super::*;
     use crate::store::object_metadata::PAYLOAD_FLAGS;
+    use crate::store::setup_execution;
     use crate::store::test_util::*;
+
+    type BeginPause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    #[derive(Default)]
+    struct MemoryCatalogState {
+        generation: i64,
+        publications: HashMap<Hash, CatalogPublication>,
+        associations: HashSet<(Partition, Address)>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryCatalog {
+        serial: Arc<tokio::sync::Mutex<()>>,
+        state: Arc<Mutex<MemoryCatalogState>>,
+        paused_begin: Arc<Mutex<Option<BeginPause>>>,
+    }
+
+    struct MemoryCatalogGuard {
+        _serial: tokio::sync::OwnedMutexGuard<()>,
+        state: Arc<Mutex<MemoryCatalogState>>,
+        paused_begin: Arc<Mutex<Option<BeginPause>>>,
+        hash: Hash,
+    }
+
+    impl MemoryCatalogState {
+        fn resolve(&self, partition: Partition, address: Address) -> CatalogResolution {
+            CatalogResolution {
+                associated: self.associations.contains(&(partition, address)),
+                publication: self.publications.get(&address.hash).copied(),
+            }
+        }
+
+        fn publish(&mut self, partition: Partition, address: Address) -> Result<(), StoreError> {
+            if self
+                .publications
+                .get(&address.hash)
+                .is_some_and(|publication| publication.state == CatalogFragmentState::Obliterating)
+            {
+                return Err(StoreError::from(SlowDown));
+            }
+            self.generation += 1;
+            self.publications.insert(
+                address.hash,
+                CatalogPublication {
+                    state: CatalogFragmentState::Stored,
+                    generation: CatalogGeneration::new(self.generation),
+                },
+            );
+            self.associations.insert((partition, address));
+            Ok(())
+        }
+    }
+
+    impl MemoryCatalog {
+        fn pause_next_begin(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            *self.paused_begin.lock().unwrap() = Some((started_tx, release_rx));
+            (started_rx, release_tx)
+        }
+    }
+
+    #[async_trait]
+    impl FragmentCatalogGuard for MemoryCatalogGuard {
+        async fn resolve(
+            &mut self,
+            partition: Partition,
+            address: Address,
+        ) -> Result<CatalogResolution, StoreError> {
+            if address.hash != self.hash {
+                return Err(StoreError::internal("memory catalog guard hash mismatch"));
+            }
+            Ok(self.state.lock().unwrap().resolve(partition, address))
+        }
+
+        async fn publish(
+            &mut self,
+            partition: Partition,
+            address: Address,
+        ) -> Result<(), StoreError> {
+            if address.hash != self.hash {
+                return Err(StoreError::internal("memory catalog guard hash mismatch"));
+            }
+            self.state.lock().unwrap().publish(partition, address)
+        }
+
+        async fn repair_missing_payload(
+            &mut self,
+            generation: CatalogGeneration,
+        ) -> Result<(), StoreError> {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .publications
+                .get(&self.hash)
+                .is_some_and(|publication| publication.generation == generation)
+            {
+                state.publications.remove(&self.hash);
+            }
+            Ok(())
+        }
+
+        async fn begin_obliteration(
+            &mut self,
+            partition: Partition,
+            address: Address,
+        ) -> Result<BeginObliteration, StoreError> {
+            if address.hash != self.hash {
+                return Err(StoreError::internal("memory catalog guard hash mismatch"));
+            }
+            let result = {
+                let mut state = self.state.lock().unwrap();
+                match state.publications.get(&address.hash).copied() {
+                    None => {
+                        state.associations.remove(&(partition, address));
+                        BeginObliteration::NoState
+                    }
+                    Some(publication) if publication.state == CatalogFragmentState::Obliterated => {
+                        BeginObliteration::AlreadyObliterated
+                    }
+                    Some(publication)
+                        if publication.state == CatalogFragmentState::Obliterating =>
+                    {
+                        BeginObliteration::ResumePayloadDeletion
+                    }
+                    Some(publication) => {
+                        state.associations.remove(&(partition, address));
+                        if state
+                            .associations
+                            .iter()
+                            .any(|(_, candidate)| candidate.hash == address.hash)
+                        {
+                            BeginObliteration::ReferencesRemain
+                        } else {
+                            state.publications.insert(
+                                address.hash,
+                                CatalogPublication {
+                                    state: CatalogFragmentState::Obliterating,
+                                    generation: publication.generation,
+                                },
+                            );
+                            BeginObliteration::PayloadUnreferenced
+                        }
+                    }
+                }
+            };
+            let pause = self.paused_begin.lock().unwrap().take();
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            Ok(result)
+        }
+
+        async fn finalize_obliteration(&mut self) -> Result<(), StoreError> {
+            let mut state = self.state.lock().unwrap();
+            let publication = state
+                .publications
+                .get_mut(&self.hash)
+                .ok_or_else(|| StoreError::internal("missing memory catalog state"))?;
+            if publication.state != CatalogFragmentState::Obliterating {
+                return Err(StoreError::internal(
+                    "memory catalog fragment is not obliterating",
+                ));
+            }
+            publication.state = CatalogFragmentState::Obliterated;
+            Ok(())
+        }
+
+        async fn unlock(self: Box<Self>) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl FragmentCatalog for MemoryCatalog {
+        async fn lock_hash(&self, hash: Hash) -> Result<Box<dyn FragmentCatalogGuard>, StoreError> {
+            Ok(Box::new(MemoryCatalogGuard {
+                _serial: self.serial.clone().lock_owned().await,
+                state: self.state.clone(),
+                paused_begin: self.paused_begin.clone(),
+                hash,
+            }))
+        }
+
+        async fn resolve(
+            &self,
+            partition: Partition,
+            address: Address,
+        ) -> Result<CatalogResolution, StoreError> {
+            Ok(self.state.lock().unwrap().resolve(partition, address))
+        }
+
+        async fn resolve_batch(
+            &self,
+            partition: Partition,
+            addresses: &[Address],
+        ) -> Result<Vec<CatalogResolution>, StoreError> {
+            let state = self.state.lock().unwrap();
+            Ok(addresses
+                .iter()
+                .map(|address| state.resolve(partition, *address))
+                .collect())
+        }
+
+        async fn publish(&self, partition: Partition, address: Address) -> Result<(), StoreError> {
+            let mut guard = self.lock_hash(address.hash).await?;
+            guard.publish(partition, address).await?;
+            guard.unlock().await
+        }
+
+        async fn repair_missing_payload(
+            &self,
+            hash: Hash,
+            generation: CatalogGeneration,
+        ) -> Result<(), StoreError> {
+            let _serial = self.serial.lock().await;
+            let mut state = self.state.lock().unwrap();
+            if state
+                .publications
+                .get(&hash)
+                .is_some_and(|publication| publication.generation == generation)
+            {
+                state.publications.remove(&hash);
+            }
+            Ok(())
+        }
+
+        async fn resolve_partition(
+            &self,
+            partition: Partition,
+            hash: Hash,
+        ) -> Result<CatalogResolution, StoreError> {
+            let state = self.state.lock().unwrap();
+            Ok(CatalogResolution {
+                associated: state
+                    .associations
+                    .iter()
+                    .any(|(candidate, address)| *candidate == partition && address.hash == hash),
+                publication: state.publications.get(&hash).copied(),
+            })
+        }
+
+        async fn begin_obliteration(
+            &self,
+            partition: Partition,
+            address: Address,
+        ) -> Result<BeginObliteration, StoreError> {
+            let mut guard = self.lock_hash(address.hash).await?;
+            let result = guard.begin_obliteration(partition, address).await?;
+            guard.unlock().await?;
+            Ok(result)
+        }
+
+        async fn finalize_obliteration(&self, hash: Hash) -> Result<(), StoreError> {
+            let mut guard = self.lock_hash(hash).await?;
+            guard.finalize_obliteration().await?;
+            guard.unlock().await
+        }
+    }
+
+    async fn external_store_with_versioning(
+        fake: &Fake,
+        catalog: Arc<dyn FragmentCatalog>,
+        object_versioning: S3ObjectVersioning,
+    ) -> Arc<AwsImmutableStore> {
+        let (s3, _) = wire(fake);
+        let settings = ObjectStoreImmutableStoreSettings::new(
+            S3StoreSettings::new(BUCKET.to_string()).with_object_versioning(object_versioning),
+            false,
+        );
+        Arc::new(AwsImmutableStore::with_catalog(s3, catalog, &settings))
+    }
+
+    async fn external_store(
+        fake: &Fake,
+        catalog: Arc<dyn FragmentCatalog>,
+    ) -> Arc<AwsImmutableStore> {
+        external_store_with_versioning(fake, catalog, S3ObjectVersioning::Unversioned).await
+    }
+
+    async fn in_test_context<T>(name: &str, test: impl Future<Output = T>) -> T {
+        LORE_CONTEXT
+            .scope(setup_execution(name.to_string()), test)
+            .await
+    }
+
+    macro_rules! context_tests {
+        ($( $(#[$attribute:meta])* $test:ident => $body:ident; )+) => {
+            $(
+                $(#[$attribute])*
+                async fn $test() {
+                    in_test_context(stringify!($test), $body()).await;
+                }
+            )+
+        };
+    }
+
+    context_tests! {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        publication_racing_obliteration_never_acknowledges_a_missing_payload
+            => publication_racing_obliteration_never_acknowledges_a_missing_payload_body;
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        stale_obliterator_cannot_delete_a_revived_payload
+            => stale_obliterator_cannot_delete_a_revived_payload_body;
+        #[tokio::test]
+        versioned_obliteration_deletes_versions_and_delete_markers
+            => versioned_obliteration_deletes_versions_and_delete_markers_body;
+        #[tokio::test]
+        versioned_obliteration_follows_every_history_page
+            => versioned_obliteration_follows_every_history_page_body;
+        #[tokio::test]
+        versioned_obliteration_repeats_until_history_is_empty
+            => versioned_obliteration_repeats_until_history_is_empty_body;
+        #[tokio::test]
+        versioned_obliteration_never_deletes_a_prefix_neighbor
+            => versioned_obliteration_never_deletes_a_prefix_neighbor_body;
+        #[tokio::test]
+        versioned_obliteration_rejects_history_without_a_version_id
+            => versioned_obliteration_rejects_history_without_a_version_id_body;
+        #[tokio::test]
+        successful_delete_response_does_not_tombstone_a_present_payload
+            => successful_delete_response_does_not_tombstone_a_present_payload_body;
+        #[tokio::test]
+        conditional_write_accepts_an_identical_existing_payload
+            => conditional_write_accepts_an_identical_existing_payload_body;
+        #[tokio::test]
+        conditional_write_rejects_different_existing_bytes
+            => conditional_write_rejects_different_existing_bytes_body;
+        #[tokio::test]
+        unversioned_obliteration_does_not_list_versions
+            => unversioned_obliteration_does_not_list_versions_body;
+    }
+
+    async fn publication_racing_obliteration_never_acknowledges_a_missing_payload_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store = external_store(&fake, catalog.clone()).await;
+        let hash: Hash = random();
+        let first_partition: Partition = random();
+        let second_partition: Partition = random();
+        let first = Address {
+            hash,
+            context: random(),
+        };
+        let second = Address {
+            hash,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(
+                first_partition,
+                first,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("initial publication");
+
+        let (head_started, release_head) = fake.pause_next_head();
+        let publisher = {
+            let store = store.clone();
+            let payload = payload.clone();
+            lore_base::lore_spawn!(async move {
+                store
+                    .put(second_partition, second, fragment, Some(payload), false)
+                    .await
+            })
+        };
+        lore_base::lore_spawn_blocking!(move || head_started.recv())
+            .await
+            .expect("head rendezvous task")
+            .expect("publication reached HeadObject");
+
+        let mut obliterator = {
+            let store = store.clone();
+            lore_base::lore_spawn!(async move {
+                store
+                    .obliterate(
+                        first_partition,
+                        first,
+                        Arc::new(StoreObliterateStats::default()),
+                    )
+                    .await
+            })
+        };
+        let obliteration_finished_early =
+            tokio::time::timeout(Duration::from_millis(100), &mut obliterator).await;
+        release_head.send(()).expect("release HeadObject");
+
+        publisher
+            .await
+            .expect("publisher task panicked")
+            .expect("concurrent publication");
+        match obliteration_finished_early {
+            Ok(result) => result
+                .expect("obliterator task panicked")
+                .expect("concurrent obliteration"),
+            Err(_) => obliterator
+                .await
+                .expect("obliterator task panicked")
+                .expect("concurrent obliteration"),
+        }
+        store
+            .get(second_partition, second)
+            .await
+            .expect("acknowledged association retains its payload");
+    }
+
+    async fn stale_obliterator_cannot_delete_a_revived_payload_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store = external_store(&fake, catalog.clone()).await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let revived_partition: Partition = random();
+        let revived = Address {
+            hash: address.hash,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("initial publication");
+
+        let (begin_finished, release_begin) = catalog.pause_next_begin();
+        let first_obliterator = {
+            let store = store.clone();
+            lore_base::lore_spawn!(async move {
+                store
+                    .obliterate(
+                        partition,
+                        address,
+                        Arc::new(StoreObliterateStats::default()),
+                    )
+                    .await
+            })
+        };
+        begin_finished
+            .await
+            .expect("first obliterator completed its catalog transition");
+
+        let second_obliterator = {
+            let store = store.clone();
+            lore_base::lore_spawn!(async move {
+                store
+                    .obliterate(
+                        partition,
+                        address,
+                        Arc::new(StoreObliterateStats::default()),
+                    )
+                    .await
+            })
+        };
+        let finalized_while_first_delete_waited =
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if catalog
+                        .resolve(partition, address)
+                        .await
+                        .expect("resolve concurrent obliteration")
+                        .state()
+                        == Some(CatalogFragmentState::Obliterated)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+        if finalized_while_first_delete_waited {
+            store
+                .clone()
+                .put(
+                    revived_partition,
+                    revived,
+                    fragment,
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("revive before stale deletion resumes");
+        }
+        release_begin.send(()).expect("release stale obliterator");
+        let _ = first_obliterator.await.expect("first obliterator panicked");
+        let _ = second_obliterator
+            .await
+            .expect("second obliterator panicked");
+        if !finalized_while_first_delete_waited {
+            store
+                .clone()
+                .put(revived_partition, revived, fragment, Some(payload), false)
+                .await
+                .expect("revive after coordinated obliteration");
+        }
+
+        store
+            .get(revived_partition, revived)
+            .await
+            .expect("revived association retains its payload");
+    }
+
+    async fn versioned_obliteration_deletes_versions_and_delete_markers_body() {
+        let fake = Fake::default();
+        let store = external_store_with_versioning(
+            &fake,
+            Arc::new(MemoryCatalog::default()),
+            S3ObjectVersioning::Versioned,
+        )
+        .await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish versioned payload");
+        fake.set_object_history(
+            &address.hash.to_string(),
+            &["version-1", "version-2"],
+            &["delete-marker-1"],
+        );
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate every stored version");
+
+        let mut deleted = fake
+            .deleted_version_ids()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        deleted.sort();
+        assert_eq!(deleted, vec!["delete-marker-1", "version-1", "version-2"]);
+    }
+
+    async fn versioned_obliteration_follows_every_history_page_body() {
+        let fake = Fake::default();
+        let store = external_store_with_versioning(
+            &fake,
+            Arc::new(MemoryCatalog::default()),
+            S3ObjectVersioning::Versioned,
+        )
+        .await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish versioned payload");
+        fake.set_object_history_pages(
+            &address.hash.to_string(),
+            &[
+                (&["version-1"], &["delete-marker-1"]),
+                (&["version-2"], &["delete-marker-2"]),
+            ],
+        );
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate paginated history");
+
+        let mut deleted = fake
+            .deleted_version_ids()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec![
+                "delete-marker-1",
+                "delete-marker-2",
+                "version-1",
+                "version-2",
+            ]
+        );
+    }
+
+    async fn versioned_obliteration_repeats_until_history_is_empty_body() {
+        let fake = Fake::default();
+        let store = external_store_with_versioning(
+            &fake,
+            Arc::new(MemoryCatalog::default()),
+            S3ObjectVersioning::Versioned,
+        )
+        .await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let key = address.hash.to_string();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish versioned payload");
+        fake.set_object_history_outputs(vec![
+            ListObjectVersionsOutput::builder()
+                .versions(
+                    ObjectVersion::builder()
+                        .key(&key)
+                        .version_id("first-version")
+                        .build(),
+                )
+                .build(),
+            ListObjectVersionsOutput::builder()
+                .versions(
+                    ObjectVersion::builder()
+                        .key(&key)
+                        .version_id("late-version")
+                        .build(),
+                )
+                .build(),
+            ListObjectVersionsOutput::builder().build(),
+        ]);
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate history that changed between sweeps");
+
+        assert_eq!(
+            fake.deleted_version_ids(),
+            vec![
+                Some("first-version".to_string()),
+                Some("late-version".to_string()),
+            ]
+        );
+    }
+
+    async fn versioned_obliteration_never_deletes_a_prefix_neighbor_body() {
+        let fake = Fake::default();
+        let store = external_store_with_versioning(
+            &fake,
+            Arc::new(MemoryCatalog::default()),
+            S3ObjectVersioning::Versioned,
+        )
+        .await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let key = address.hash.to_string();
+        let neighbor = format!("{key}0");
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish versioned payload");
+        fake.set_object_history_outputs(vec![
+            ListObjectVersionsOutput::builder()
+                .versions(
+                    ObjectVersion::builder()
+                        .key(&key)
+                        .version_id("target-version")
+                        .build(),
+                )
+                .versions(
+                    ObjectVersion::builder()
+                        .key(&neighbor)
+                        .version_id("neighbor-version")
+                        .build(),
+                )
+                .delete_markers(
+                    DeleteMarkerEntry::builder()
+                        .key(&neighbor)
+                        .version_id("neighbor-marker")
+                        .build(),
+                )
+                .build(),
+        ]);
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate exact key only");
+
+        assert_eq!(
+            fake.deleted_version_ids(),
+            vec![Some("target-version".to_string())]
+        );
+    }
+
+    async fn versioned_obliteration_rejects_history_without_a_version_id_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store =
+            external_store_with_versioning(&fake, catalog.clone(), S3ObjectVersioning::Versioned)
+                .await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let key = address.hash.to_string();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish versioned payload");
+        fake.set_object_history_outputs(vec![
+            ListObjectVersionsOutput::builder()
+                .versions(ObjectVersion::builder().key(&key).build())
+                .build(),
+        ]);
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("missing version ID must prevent a false permanent deletion");
+
+        assert!(fake.deleted_version_ids().is_empty());
+        assert_eq!(
+            catalog
+                .resolve(partition, address)
+                .await
+                .expect("resolve failed deletion")
+                .state(),
+            Some(CatalogFragmentState::Obliterating)
+        );
+    }
+
+    async fn successful_delete_response_does_not_tombstone_a_present_payload_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store = external_store(&fake, catalog.clone()).await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("publish payload");
+        fake.fail(Fault::ObjectDeleteNoop);
+
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("present payload must prevent tombstone finalization");
+
+        assert_eq!(
+            catalog
+                .resolve(partition, address)
+                .await
+                .expect("resolve failed deletion")
+                .state(),
+            Some(CatalogFragmentState::Obliterating)
+        );
+        assert!(fake.object(address.hash).is_some());
+    }
+
+    async fn conditional_write_accepts_an_identical_existing_payload_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store = external_store(&fake, catalog.clone()).await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        fake.put_object(address.hash, fragment, payload.as_ref());
+
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("identical immutable object is reusable");
+
+        assert!(
+            catalog
+                .resolve(partition, address)
+                .await
+                .expect("resolve reused payload")
+                .associated
+        );
+        assert_eq!(
+            fake.object(address.hash).expect("existing object").0,
+            payload
+        );
+    }
+
+    async fn conditional_write_rejects_different_existing_bytes_body() {
+        let fake = Fake::default();
+        let catalog = Arc::new(MemoryCatalog::default());
+        let store = external_store(&fake, catalog.clone()).await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        let mut different = payload.to_vec();
+        different[0] ^= 0xff;
+        fake.put_object(address.hash, fragment, &different);
+
+        store
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect_err("a hash collision or corrupted immutable object must fail closed");
+
+        assert!(
+            !catalog
+                .resolve(partition, address)
+                .await
+                .expect("resolve rejected payload")
+                .associated
+        );
+        assert_eq!(
+            fake.object(address.hash).expect("existing object").0,
+            different
+        );
+    }
 
     #[tokio::test]
     async fn put_stores_the_fragment_on_the_object() {
@@ -3634,6 +5097,49 @@ mod test {
             .expect_err("listing versions fails");
 
         assert_ne!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterated)
+        );
+    }
+
+    async fn unversioned_obliteration_does_not_list_versions_body() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        let (s3, dynamodb) = wire(&fake);
+        let mut settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: DynamoDbImmutableStoreSettings::new(
+                FRAGMENTS_TABLE_NAME.to_string(),
+                FRAGMENT_STATE_TABLE_NAME.to_string(),
+            ),
+            force_write: false,
+        };
+        settings.s3.object_versioning = S3ObjectVersioning::Unversioned;
+        settings.dynamodb.timeout_millis = 1;
+        let store = Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings));
+
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+        fake.fail(Fault::ObjectList);
+        store
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("unversioned deletion must not list versions");
+
+        assert!(fake.object(address.hash).is_none());
+        assert_eq!(
             fake.state_of(address.hash),
             Some(FragmentState::Obliterated)
         );
