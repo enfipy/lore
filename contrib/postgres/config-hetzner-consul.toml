@@ -1,0 +1,57 @@
+# Copyright 2026 David
+# SPDX-License-Identifier: MIT
+
+# Overlay for loreserver-postgres. Enable versioning on the dedicated Hetzner bucket before
+# starting Lore. Secrets should be supplied through environment variables.
+
+[immutable_store]
+mode = "composite"
+composite.local.mode = "local"
+composite.durable.mode = "postgres_s3"
+
+[immutable_store.composite.local.local]
+path = "/var/lib/lore/cache"
+flush_delay_seconds = 1
+max_capacity = 1_000_000
+max_size = 536_870_912_000
+
+[immutable_store.composite.replica_factory]
+client_message_buffer = 10_000
+read_replicas_enabled = true
+use_grpc_write_replication = true
+enable_same_region_write = true
+
+[plugins.postgres_s3.immutable_store]
+s3_bucket = "replace-with-hetzner-bucket"
+s3_endpoint_url = "https://fsn1.your-objectstorage.com"
+s3_region = "fsn1"
+s3_object_versioning = "versioned"
+s3_force_path_style = false
+s3_slow_operation_threshold_millis = 5_000
+timeout_millis = 30_000
+force_write = false
+
+[plugins.postgres_s3.immutable_store.postgres]
+# Override this value with
+# LORE__PLUGINS__POSTGRES_S3__IMMUTABLE_STORE__POSTGRES__CONNECTION_STRING.
+connection_string = "host=127.0.0.1 dbname=lore user=lore sslmode=require"
+schema = "lore_fragment_catalog"
+max_connections = 16
+connect_timeout_millis = 5_000
+max_batch_size = 10_000
+
+[topology]
+provider = "consul"
+
+[plugins.consul]
+# CONSUL_HTTP_ADDR and CONSUL_HTTP_TOKEN configure the client without placing secrets here.
+service_name = "lore-server"
+ignore_address = ""
+poll_interval_secs = 30
+
+# These local stores are for a single primary. See README.md before scaling to multiple writers.
+[mutable_store]
+mode = "local"
+
+[lock_store]
+mode = "local"
