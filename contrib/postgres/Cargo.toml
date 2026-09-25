@@ -1,0 +1,40 @@
+# Copyright 2026 David
+# SPDX-License-Identifier: MIT
+
+[workspace]
+resolver = "2"
+members = ["lore-postgres", "lore-postgres-server"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+deadpool-postgres = { version = "0.14.1", features = ["serde"] }
+lore-aws = { path = "../../lore-aws" }
+lore-base = { path = "../../lore-base" }
+lore-error-set = { path = "../../lore-error-set" }
+lore-server = { path = "../../lore-server" }
+lore-storage = { path = "../../lore-storage" }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8.2"
+serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.11.0"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = { version = "0.14.0", features = ["native-certs", "ring"] }
+toml = "0.9.5"
+tracing = "0.1.41"
+
+# A separate workspace does not inherit Lore's profiles; keep its release panic strategy.
+[profile.release]
+debug = "line-tables-only"
+panic = "abort"
+
+# A patch table belongs to a workspace root, so the Lore workspace patches are restated here.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }
+glob-match = { path = "../../vendor/glob-match" }

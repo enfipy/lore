@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 David
 // SPDX-License-Identifier: MIT
 #[cfg(test)]
 mod tests {
@@ -2718,6 +2719,40 @@ mod tests {
                     })
                     .await;
             }
+        }
+
+        #[tokio::test]
+        async fn durable_internal_error_is_not_reported_as_not_found() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution.clone(), async move {
+                    let repository: Partition = random::<RepositoryId>();
+                    let address = random::<Address>();
+                    let durable = Arc::new(DelayStore::failing(
+                        StoreError::internal("durable read failed"),
+                        Duration::ZERO,
+                    ));
+                    let composite = Arc::new(
+                        CompositeStoreBuilder::default()
+                            .with_local("local".to_string(), create_empty_local().await)
+                            .expect("local should work")
+                            .with_durable("durable".to_string(), durable)
+                            .expect("durable should work")
+                            .build()
+                            .expect("build should work"),
+                    );
+
+                    let error = composite
+                        .get(repository, address)
+                        .await
+                        .expect_err("durable failure must reach the caller");
+
+                    assert!(
+                        error.is_internal(),
+                        "expected internal error, got {error:?}"
+                    );
+                })
+                .await;
         }
     }
 
