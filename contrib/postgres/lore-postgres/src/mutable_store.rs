@@ -19,6 +19,7 @@ use lore_base::types::Partition;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
+use lore_storage::local::store_lock::StoreGuard;
 use tokio_postgres::Row;
 use tracing::debug;
 
@@ -298,6 +299,11 @@ impl PostgresMutableStore {
 
 #[async_trait]
 impl MutableStore for PostgresMutableStore {
+    /// Nothing on disk to claim: the values live in PostgreSQL.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     #[tracing::instrument(name = "PostgresMutableStore::load", skip(self))]
     async fn load(
         self: Arc<Self>,

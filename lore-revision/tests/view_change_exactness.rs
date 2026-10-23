@@ -383,9 +383,9 @@ mod tests {
     /// emitted more than the change set it should have.
     ///
     /// A delete removes the path it names and nothing below it, which is what a walk emits for the
-    /// directories these trees hold: `add_hierarchy_delete` spells out a record per node. A link
-    /// mount is the exception — that walk returns at a link (`state.rs:10044`), so one delete
-    /// carries the whole mount — and no tree here holds one.
+    /// directories these trees hold: `add_change_hierarchy` spells out a record per node. A link
+    /// mount is the exception, as that walk does not descend a link and one delete carries the
+    /// whole mount; no tree here holds one.
     fn applied(
         before: &BTreeMap<String, Held>,
         changes: &[NodeChange],

@@ -14,6 +14,7 @@ use crate::error::ProtocolError;
 use crate::types::Endpoint;
 use crate::types::EnvironmentConfig;
 use crate::types::EnvironmentServerConfig;
+use crate::types::Oidc;
 use crate::types::ServerCompressionMode;
 
 impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig {
@@ -66,8 +67,26 @@ impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig 
                     .compression_mode
                     .map(|mode| ServerCompressionMode::from_u32(mode as u32)),
             }),
+            oidc: value.oidc.and_then(oidc_from_proto),
         }
     }
+}
+
+/// `None` for a message with no issuer: there is no provider to discover without one.
+fn oidc_from_proto(oidc: lore_proto::lore::environment::v1::Oidc) -> Option<Oidc> {
+    if oidc.issuer.is_empty() {
+        return None;
+    }
+    let non_empty = |value: String| (!value.is_empty()).then_some(value);
+    Some(Oidc {
+        issuer: oidc.issuer,
+        client_id: oidc.client_id,
+        scopes: oidc.scopes,
+        preferred: oidc.preferred,
+        resource_template: non_empty(oidc.resource_template),
+        scope_template: non_empty(oidc.scope_template),
+        token_exchange_issuer: non_empty(oidc.token_exchange_issuer),
+    })
 }
 
 #[derive(Clone)]

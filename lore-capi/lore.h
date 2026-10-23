@@ -38,7 +38,22 @@
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
+//
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
 //
 // See lore_event_callback_config_t for how callbacks work.
 
@@ -51,7 +66,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.10.1-nightly"
+#define LORE_INTERFACE_VERSION "0.11.1-nightly"
 
 // The kind of value held by a metadata entry.
 //
@@ -160,12 +175,6 @@ typedef enum lore_revision_resolve_target_t {
 // thing as the code on `Complete.status`. This enum names the subset a
 // per-item event can carry; it is not a second numbering.
 //
-// The variant order is the serialized wire format, not the numbering. Serde
-// encodes a variant by its declaration index in a non-self-describing format,
-// and `LoreEvent` crosses the service boundary in one, so reordering these
-// would silently redecode old payloads as different errors. Add new variants
-// at the end and change discriminants in place.
-//
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
   LORE_ERROR_CODE_NONE = 0,
@@ -178,6 +187,47 @@ typedef enum lore_error_code_t {
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
+
+// What a range of lines resolved to, or why it did not resolve.
+//
+// An outcome is named the same way wherever it is reported, as
+// `binary-in-history` rather than `binaryInHistory`.
+typedef enum lore_file_audit_outcome_t {
+  // Resolved to the revision that last changed the lines.
+  LORE_FILE_AUDIT_OUTCOME_ATTRIBUTED = 0,
+  // Differs on disk from the revision the audit read, so no revision holds it.
+  LORE_FILE_AUDIT_OUTCOME_UNCOMMITTED = 1,
+  // The revision budget ran out before the lines resolved.
+  LORE_FILE_AUDIT_OUTCOME_BUDGET_EXHAUSTED = 2,
+  // A version the walk had to compare no longer holds its content, the
+  // address it is stored at surviving the payload.
+  LORE_FILE_AUDIT_OUTCOME_OBLITERATED = 3,
+  // A version the walk had to compare holds binary content, which cannot be
+  // compared line by line.
+  LORE_FILE_AUDIT_OUTCOME_BINARY_IN_HISTORY = 4,
+  // The chain continues in a linked repository that is unauthorized or out
+  // of reach.
+  LORE_FILE_AUDIT_OUTCOME_LINK_UNAVAILABLE = 5,
+  // A version the walk had to compare is not held locally, and the instance
+  // reads its local store alone.
+  LORE_FILE_AUDIT_OUTCOME_CONTENT_UNAVAILABLE = 6,
+  // The walk ended with an error before it reached the lines. The error
+  // arrives on the completion event.
+  LORE_FILE_AUDIT_OUTCOME_UNRESOLVED = 7,
+} lore_file_audit_outcome_t;
+
+// Which authentication path a client takes if a server advertises both its
+// gRPC auth service and an OIDC issuer. A path the server does not
+// advertise cannot be taken.
+typedef enum lore_auth_mode_t {
+  // Follow the server's preference: the OIDC path if the server marks it
+  // preferred, the gRPC path otherwise.
+  LORE_AUTH_MODE_AUTO = 0,
+  // The gRPC path, through the auth service at `auth_url`.
+  LORE_AUTH_MODE_GRPC = 1,
+  // The OIDC path, through the advertised OIDC issuer.
+  LORE_AUTH_MODE_OIDC = 2,
+} lore_auth_mode_t;
 
 // Virtual File System type for repository operations.
 //
@@ -361,9 +411,7 @@ typedef struct lore_complete_event_data_t {
   // The completion status code of the operation.
   int32_t status;
   // The error detail for the operation. The empty default detail on
-  // success; the populated detail on failure. `#[serde(default)]` lets an
-  // older payload that lacks this field deserialize: the detail then reads
-  // back as the empty default with an empty trace list.
+  // success; the populated detail on failure.
   struct lore_error_detail_t error;
 } lore_complete_event_data_t;
 
@@ -464,6 +512,9 @@ typedef struct lore_maintenance_event_data_t {
 typedef struct lore_auth_url_event_data_t {
   // Authentication URL
   struct lore_string_t url;
+  // Code the user enters or confirms at `url`. Empty when the login
+  // doesn't ask for one.
+  struct lore_string_t user_code;
 } lore_auth_url_event_data_t;
 
 // Event data resolving a user identity to a display name.
@@ -1845,7 +1896,8 @@ typedef struct lore_repository_clone_progress_event_data_t {
   struct lore_repository_clone_count_data_t count;
 } lore_repository_clone_progress_event_data_t;
 
-// Data for the event emitted when a clone finishes.
+// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+// reports its outcome on the complete event as every clone does.
 typedef struct lore_repository_clone_end_event_data_t {
   // Name of the branch that was cloned.
   struct lore_string_t branch;
@@ -2616,9 +2668,7 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   struct lore_error_detail_t error;
-  // Non-zero when the local store holds the content. Trailing, so a payload that lacks it still
-  // decodes: the IPC wire format is non-self-describing, where only a missing trailing field is
-  // recoverable.
+  // Non-zero when the local store holds the content.
   uint8_t stored_local;
   // Non-zero when the content reached the remote, or was already durable there. A remote
   // write that fails still reports success if the local write succeeded — this is how a
@@ -3266,6 +3316,87 @@ typedef struct lore_branch_push_stats_event_data_t {
   uint64_t put;
 } lore_branch_push_stats_event_data_t;
 
+// Data for the service status event, reporting whether the service is running
+// and its current metadata.
+typedef struct lore_service_status_event_data_t {
+  // Whether the service is running: 1 for running, 0 for not running.
+  uint8_t running;
+  // Path to the service binary.
+  struct lore_string_t binary_path;
+  // Milliseconds since the service started.
+  uint64_t uptime_ms;
+  // Number of active client connections.
+  uint32_t connection_count;
+  // Number of SWFS mounts currently active.
+  uint32_t swfs_mount_count;
+} lore_service_status_event_data_t;
+
+// Data for a service log message captured outside command execution.
+typedef struct lore_service_message_event_data_t {
+  // The severity level of the log message.
+  enum lore_log_level_t level;
+  // The log message text.
+  struct lore_string_t message;
+} lore_service_message_event_data_t;
+
+// Event data for one wait in an interactive login: the user has not
+// approved it yet, and the client is about to wait `interval_secs` before
+// asking again. Emitted once per poll, so a consumer can show that the
+// login is still in progress against a provider with a long interval.
+typedef struct lore_auth_pending_event_data_t {
+  // Whole seconds since polling began.
+  uint64_t elapsed_secs;
+  // Whole seconds until the next poll.
+  uint64_t interval_secs;
+  // Whole seconds left before the session expires unapproved.
+  uint64_t remaining_secs;
+} lore_auth_pending_event_data_t;
+
+// Per-leaf event for `get_resolved` with `fragments` set: one leaf fragment of the
+// item's content and its payload. The `bytes` view is valid only during the callback invocation.
+typedef struct lore_storage_get_fragment_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The content address of the item.
+  struct lore_address_t address;
+  // The byte offset of this leaf within the item's content.
+  uint64_t offset;
+  // The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
+  // and the content size the payload expands to.
+  struct lore_fragment_t fragment;
+  // The leaf's payload, compressed as `fragment` states.
+  struct lore_bytes_t bytes;
+} lore_storage_get_fragment_event_data_t;
+
+// Data for the event carrying one range of lines in a file.
+//
+// A range names the revision that last changed it and nothing more of that
+// revision: a caller reads the revision's metadata itself, once per distinct
+// revision. It carries no revision number, because numbers are per-branch and
+// reporting one would make the answer depend on the caller's branch.
+//
+// Each range is sent as soon as the step of the walk that resolves it ends, so
+// ranges arrive most recently changed first rather than in line order. Each
+// range is complete and never needs joining with another. A walk that ends
+// with an error still reports every line: the lines it resolved keep their outcomes, and the lines
+// it did not reach are reported as `LORE_FILE_AUDIT_OUTCOME_UNRESOLVED`. An
+// audit that fails before the walk starts reports no range. Read the
+// completion status before treating the ranges received as the whole answer.
+typedef struct lore_file_audit_event_data_t {
+  // Identifier of the repository the range came from. A walk that follows
+  // the file into a linked repository reports that repository.
+  lore_repository_id_t repository;
+  // Revision that last changed the range. Zero unless `outcome` is
+  // `Attributed`.
+  struct lore_hash_t revision;
+  // First line of the range, 1-based.
+  uint32_t line_first;
+  // Last line of the range, 1-based and inclusive.
+  uint32_t line_last;
+  // What the range resolved to, or why it did not resolve.
+  enum lore_file_audit_outcome_t outcome;
+} lore_file_audit_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3542,7 +3673,8 @@ enum lore_event_id_t {
   LORE_EVENT_REPOSITORY_CLONE_BEGIN,
   // Progress during a repository clone.
   LORE_EVENT_REPOSITORY_CLONE_PROGRESS,
-  // The end of a repository clone.
+  // The end of a repository clone that succeeded. A clone that fails sends none, and reports its
+  // outcome on the complete event as every clone does.
   LORE_EVENT_REPOSITORY_CLONE_END,
   // The start of resolving dependencies.
   LORE_EVENT_DEPENDENCY_RESOLVE_BEGIN,
@@ -3736,6 +3868,16 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_COMMIT_STATS,
   // What a push has cost so far, or in total once it has finished.
   LORE_EVENT_BRANCH_PUSH_STATS,
+  // The status of the background service.
+  LORE_EVENT_SERVICE_STATUS,
+  // A log message captured by the service outside command execution.
+  LORE_EVENT_SERVICE_MESSAGE,
+  // An interactive login is still waiting for the user's approval.
+  LORE_EVENT_AUTH_PENDING,
+  // One leaf fragment and its payload for a get-resolved item.
+  LORE_EVENT_STORAGE_GET_FRAGMENT,
+  // One range of a file's lines, attributed to the revision that last changed them.
+  LORE_EVENT_FILE_AUDIT,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3975,10 +4117,20 @@ typedef struct lore_event_t {
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
     struct lore_revision_commit_stats_event_data_t revision_commit_stats;
     struct lore_branch_push_stats_event_data_t branch_push_stats;
+    struct lore_service_status_event_data_t service_status;
+    struct lore_service_message_event_data_t service_message;
+    struct lore_auth_pending_event_data_t auth_pending;
+    struct lore_storage_get_fragment_event_data_t storage_get_fragment;
+    struct lore_file_audit_event_data_t file_audit;
   };
 } lore_event_t;
 
 // Common options shared by repository operations.
+//
+// Zero every byte of it, padding included, before setting the fields a call
+// uses, as every structure passed to the library: a field left zero selects
+// its default, and a field a release adds in its padding is left unset by
+// code built against an earlier header.
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
@@ -4002,7 +4154,8 @@ typedef struct lore_global_args_t {
   uint8_t remote;
   // Dry run mode, only report what would have been changed and perform no changes to local file system
   uint8_t dry_run;
-  // Maximum number of parallel connections for bulk data transfer
+  // Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+  // At most 10 are opened
   uint32_t max_connections;
   // Search limit when iterating revisions
   uint32_t search_limit;
@@ -4021,9 +4174,13 @@ typedef struct lore_global_args_t {
   uint64_t compress_task_limit;
   // Keep store references alive after a repository call completes to avoid
   // repeated store open/close cycles for consecutive API calls in the same process.
+  // The stores stay locked meanwhile, so another process using them waits. With
+  // `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+  // the call, the stores are kept after every call whether or not this is set,
+  // unlocked, and the next call reloads them only if another process changed them.
   uint8_t store_keep_alive;
-  // Duration in seconds to keep store references alive. Only used when
-  // `store_keep_alive` is set. 0 means use the default (10 seconds).
+  // Duration in seconds to keep store references alive, when `store_keep_alive` or
+  // `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
@@ -4058,6 +4215,16 @@ typedef struct lore_global_args_t {
   // whatever `stats` is set to, statistics being reported once at the end
   // rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
   uint64_t event_interval_ms;
+  // Which authentication path to take if the server advertises both its
+  // gRPC auth service and an OIDC issuer.
+  enum lore_auth_mode_t auth_mode;
+  // Treat the remote as a trusted source, for a caller within its
+  // infrastructure where performance comes first: payloads fetched from it
+  // have only their sizes checked against their length, are never hashed,
+  // and are decompressed only where their content is read. A storage handle
+  // takes it from the globals it is opened with. Any non-zero value trusts
+  // the remote, so a caller zeroes the whole struct, padding included
+  uint8_t trust_remote;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -4101,6 +4268,12 @@ typedef struct lore_auth_login_with_token_args_t {
   // Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`); used
   // directly when non-empty, required when no remote URL is available
   struct lore_string_t auth_url;
+  // Client ID of a confidential client registered with the auth service. When
+  // non-empty, logs in as that client with `client_secret`, and `token` and
+  // `token_type` must be empty
+  struct lore_string_t client_id;
+  // Secret of the client `client_id` names
+  struct lore_string_t client_secret;
 } lore_auth_login_with_token_args_t;
 
 // Arguments for listing all stored authentication identities across endpoints.
@@ -4279,6 +4452,10 @@ typedef struct lore_branch_merge_start_args_t {
   // revision. Empty carries nothing; the single entry `*` carries every
   // key that is not reserved to the merge itself.
   struct lore_string_array_t inherit_metadata;
+  // Array of link relative paths that have specific auto commit messages
+  struct lore_string_array_t link_paths;
+  // Array of messages corresponding to each link path (parallel array with `link_paths`)
+  struct lore_string_array_t link_messages;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.
@@ -4300,6 +4477,14 @@ typedef struct lore_branch_reset_args_t {
   // Branch to reset, current branch if empty
   struct lore_string_t branch;
 } lore_branch_reset_args_t;
+
+// Arguments for listing a branch's LATEST revision history.
+typedef struct lore_branch_latest_list_args_t {
+  // Branch to list, current branch if empty
+  struct lore_string_t branch;
+  // Maximum entries to return (`0` uses the default of 30)
+  uint32_t limit;
+} lore_branch_latest_list_args_t;
 
 // Arguments for pushing a branch and its revisions to the remote.
 typedef struct lore_branch_push_args_t {
@@ -4396,6 +4581,30 @@ typedef struct lore_file_history_args_t {
   uint32_t depth;
 } lore_file_history_args_t;
 
+// Arguments for attributing the lines of a file to the revisions that last changed them.
+typedef struct lore_file_audit_args_t {
+  // A path to a file
+  struct lore_string_t path;
+  // Revision to read the file at, in any form a revision specifier takes: a
+  // whole hash signature, `[branch]@<number>`, `[branch]@LATEST` or
+  // `<branch>@<hash>`, optionally followed by `~<count>` to step back that many
+  // parents. Empty reads the revision the instance is synced to and accounts for
+  // the file on disk
+  struct lore_string_t revision;
+  // Revisions of the file's predecessor chain to walk, `0` for the default of
+  // 100 and `UINT32_MAX` for the whole chain. Zero means the default rather
+  // than no limit, as `lore_file_history_args_t::length` does, so a
+  // zero-initialized value is bounded
+  uint32_t max_revisions;
+  // Count a line that differs only in trailing whitespace as changed.
+  // Trailing whitespace is ignored by default, so the field is stated as the
+  // refusal and a zero-initialized value carries the default
+  uint8_t no_ignore_space_at_eol;
+  // Collapse runs of internal whitespace to a single space before comparing,
+  // which leaves a reindented line with the revision that wrote its text
+  uint8_t ignore_space_change;
+} lore_file_audit_args_t;
+
 // Arguments for clearing all metadata associated with a file.
 typedef struct lore_file_metadata_clear_args_t {
   // Which file to clear metadata for
@@ -4461,6 +4670,8 @@ typedef struct lore_file_reset_to_last_merged_args_t {
   struct lore_string_t branch;
   // Purge untracked files
   uint8_t purge;
+  // Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
+  uint32_t merge_side;
 } lore_file_reset_to_last_merged_args_t;
 
 // Arguments for staging one or more files for the next commit.
@@ -4658,6 +4869,11 @@ typedef struct lore_link_list_args_t {
   int _unused;
 } lore_link_list_args_t;
 
+// Arguments for listing the links whose linked repositories hold staged changes.
+typedef struct lore_link_list_staged_args_t {
+  int _unused;
+} lore_link_list_staged_args_t;
+
 // Arguments for updating the pin or properties of an existing link.
 typedef struct lore_link_update_args_t {
   // Path within this repository of the link to update
@@ -4737,6 +4953,13 @@ typedef struct lore_repository_create_args_t {
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
 } lore_repository_create_args_t;
+
+// Arguments for deleting a remote repository.
+typedef struct lore_repository_delete_args_t {
+  // URL of the remote repository to delete, or a name or ID resolved against the remote of
+  // the repository at `repository_path`
+  struct lore_string_t repository_url;
+} lore_repository_delete_args_t;
 
 // Arguments for waiting on outstanding asynchronous repository tasks.
 typedef struct lore_repository_flush_args_t {
@@ -4967,6 +5190,29 @@ typedef struct lore_revision_sync_args_t {
   struct lore_string_t view;
 } lore_revision_sync_args_t;
 
+// Arguments for bisecting the revision range between two revisions.
+typedef struct lore_revision_bisect_args_t {
+  // Starting (known-good) revision of the bisect range
+  struct lore_string_t start;
+  // Ending (known-bad) revision of the bisect range
+  struct lore_string_t end;
+} lore_revision_bisect_args_t;
+
+// Arguments for cherry-picking a revision onto the current branch.
+typedef struct lore_revision_cherry_pick_args_t {
+  // Revision to cherry pick
+  struct lore_string_t revision;
+  // Message to use for an auto-commit if no conflicts arise; empty uses the
+  // picked revision's message
+  struct lore_string_t message;
+  // Disable auto-commit even if no conflicts arise
+  uint8_t no_commit;
+  // Metadata keys to carry from the picked revision onto the revision this
+  // creates. Empty carries nothing; the single entry `*` carries every key
+  // that is not reserved to the cherry-pick itself.
+  struct lore_string_array_t inherit_metadata;
+} lore_revision_cherry_pick_args_t;
+
 // Arguments for reverting the working directory to a specified revision.
 typedef struct lore_revision_revert_args_t {
   // Revision to revert
@@ -5027,6 +5273,12 @@ typedef struct lore_shared_store_info_args_t {
   int _unused;
 } lore_shared_store_info_args_t;
 
+// Arguments for listing the registry of shared stores.
+typedef struct lore_shared_store_list_args_t {
+  // Whether to load each shared store to search for each instance using it.
+  uint8_t include_instances;
+} lore_shared_store_list_args_t;
+
 // Arguments for setting whether to automatically use the shared store.
 typedef struct lore_shared_store_set_use_automatically_args_t {
   // Automatically use the shared store
@@ -5049,14 +5301,9 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
-  // Skip re-hashing a loaded payload and checking it against the address it was read from.
-  //
-  // Zero keeps the check, which is the default: a store handing back bytes under a content
-  // address should be able to say they are the bytes that address names. A caller whose own
-  // layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-  // the check on every byte of every read and learns nothing new from it, and can set this.
-  //
-  // Applies to every read on the handle.
+  // Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+  // set, so payloads fetched from it have only their sizes checked against their length and are
+  // never hashed. Payloads the local store holds are never hashed either way.
   uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
   // incremental background GC for the handle; `0` then selects the default. Shared disk backends
@@ -5116,9 +5363,10 @@ typedef struct lore_storage_put_args_t {
 // A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 // value says, as does a length no allocation can have.
 //
-// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-// The buffers supplied by the items of one call must not overlap: the items run alongside each
-// other, so two covering the same byte would write it at once.
+// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+// items of one call must not overlap: the items run alongside each other, so two covering the same
+// byte would write it at once.
 typedef struct lore_bytes_mut_t {
   // Pointer to the start of the writable slice.
   void *ptr;
@@ -5195,8 +5443,13 @@ typedef struct lore_storage_get_resolved_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
+  // carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
+  // is expanded or checked against its hash. An item with `data_out` supplied rejects with
+  // `INVALID_ARGUMENTS`
+  uint8_t fragments;
   // Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
-  // `GET_DATA` delivery.
+  // delivery in events.
   //
   // The capacity is the limit: content exceeding it fails the item with
   // `Oversized` rather than truncating. `GET_HEADER` reports the content
@@ -5686,6 +5939,11 @@ typedef struct lore_service_stop_args_t {
   int _unused;
 } lore_service_stop_args_t;
 
+// Arguments for querying the Lore service status (no parameters).
+typedef struct lore_service_status_args_t {
+  int _unused;
+} lore_service_status_args_t;
+
 // Arguments for naming the executable the Lore service runs from.
 typedef struct lore_service_set_executable_args_t {
   // Path of the executable to start as the service. Empty clears the setting,
@@ -6128,7 +6386,8 @@ void lore_auth_user_info_async(const struct lore_global_args_t *globals,
                                const struct lore_auth_user_info_args_t *args,
                                struct lore_event_callback_config_t callback);
 
-// Authenticate using an existing bearer token.
+// Authenticate using an existing bearer token, or, when `client_id` is set, as the
+// registered client it names with `client_secret`.
 //
 // # Events
 //
@@ -6307,7 +6566,8 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
@@ -6334,7 +6594,8 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,
@@ -7336,6 +7597,58 @@ void lore_branch_reset_async(const struct lore_global_args_t *globals,
                              const struct lore_branch_reset_args_t *args,
                              struct lore_event_callback_config_t callback);
 
+// List the revisions the LATEST of a branch has held, most recent first.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Branch Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_BRANCH_LATEST_LIST_ENTRY` | `lore_branch_latest_list_entry_event_data_t` | Emitted for each revision the branch LATEST has held, most recent first |
+int32_t lore_branch_latest_list(const struct lore_global_args_t *globals,
+                                const struct lore_branch_latest_list_args_t *args,
+                                struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_branch_latest_list`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Branch Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_BRANCH_LATEST_LIST_ENTRY` | `lore_branch_latest_list_entry_event_data_t` | Emitted for each revision the branch LATEST has held, most recent first |
+void lore_branch_latest_list_async(const struct lore_global_args_t *globals,
+                                   const struct lore_branch_latest_list_args_t *args,
+                                   struct lore_event_callback_config_t callback);
+
 // Push local branch commits to the remote repository.
 //
 // # Events
@@ -7645,6 +7958,73 @@ int32_t lore_file_history(const struct lore_global_args_t *globals,
 void lore_file_history_async(const struct lore_global_args_t *globals,
                              const struct lore_file_history_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Attribute each line of a file to the revision that last changed it.
+//
+// One `LORE_EVENT_FILE_AUDIT` event carries each range of consecutive lines
+// sharing an attribution. Each range arrives as soon as the step of the walk
+// that resolves it ends. The walk resolves the most recently changed lines
+// first, so ranges arrive in that order, not in line order. Each range is
+// complete and never needs joining with another. A caller with what it needs
+// may stop reading; the events already delivered stand.
+//
+// A range names its revision and repository, not the revision's metadata. Read
+// the metadata with `lore_revision_info`, once per distinct revision.
+//
+// An error that ends the walk, such as a lost connection to the remote, ends
+// the audit: every line is still delivered, those the walk did not reach with
+// the outcome `LORE_FILE_AUDIT_OUTCOME_UNRESOLVED`, and `LORE_EVENT_COMPLETE`
+// carries the error.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+int32_t lore_file_audit(const struct lore_global_args_t *globals,
+                        const struct lore_file_audit_args_t *args,
+                        struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_file_audit`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+void lore_file_audit_async(const struct lore_global_args_t *globals,
+                           const struct lore_file_audit_args_t *args,
+                           struct lore_event_callback_config_t callback);
 
 // Clear all metadata from a file.
 //
@@ -9084,6 +9464,58 @@ void lore_link_list_async(const struct lore_global_args_t *globals,
                           const struct lore_link_list_args_t *args,
                           struct lore_event_callback_config_t callback);
 
+// List the links whose linked repositories hold staged changes, including nested links.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_STAGED_ENTRY` | `lore_link_staged_entry_event_data_t` | Emitted for each link with staged changes |
+int32_t lore_link_list_staged(const struct lore_global_args_t *globals,
+                              const struct lore_link_list_staged_args_t *args,
+                              struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_link_list_staged`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_STAGED_ENTRY` | `lore_link_staged_entry_event_data_t` | Emitted for each link with staged changes |
+void lore_link_list_staged_async(const struct lore_global_args_t *globals,
+                                 const struct lore_link_list_staged_args_t *args,
+                                 struct lore_event_callback_config_t callback);
+
 // Update properties of an existing repository link.
 //
 // # Events
@@ -9138,6 +9570,12 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 
 // Clone a remote repository to a local path.
 //
+// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+// its files caches every file metadata block of the cloned revision, which staging and committing
+// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+// and reads them from the remote when a call needs them.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -9159,7 +9597,7 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -9193,7 +9631,7 @@ int32_t lore_repository_clone(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -9366,6 +9804,46 @@ void lore_repository_create_async(const struct lore_global_args_t *globals,
                                   const struct lore_repository_create_args_t *args,
                                   struct lore_event_callback_config_t callback);
 
+// Delete a Lore repository on the remote server.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_repository_delete(const struct lore_global_args_t *globals,
+                               const struct lore_repository_delete_args_t *args,
+                               struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_delete`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_repository_delete_async(const struct lore_global_args_t *globals,
+                                  const struct lore_repository_delete_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
 // Flush pending repository state to persistent storage.
 //
 // # Events
@@ -9448,9 +9926,10 @@ void lore_repository_gc_async(const struct lore_global_args_t *globals,
 
 // Release all cached store references for the given repository path.
 //
-// Frees in-memory store data and releases file-backed store cache entries.
-// Any active repository contexts for this path remain valid, but once they
-// are dropped the stores will be freed. Subsequent opens will create fresh stores.
+// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+// each is released once nothing uses it, and a later open reuses one that is still
+// alive, which the store epoch keeps current with what other processes wrote.
+// Any active repository contexts for this path remain valid.
 //
 // # Events
 //
@@ -10544,6 +11023,155 @@ void lore_revision_sync_async(const struct lore_global_args_t *globals,
                               const struct lore_revision_sync_args_t *args,
                               struct lore_event_callback_config_t callback);
 
+// Take one step of a bisect between two revisions, synchronizing the working directory to the
+// revision halfway between them.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Bisect Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_BISECT` | `lore_revision_bisect_event_data_t` | Emitted once the working directory is synchronized to the selected revision, with the revision numbers of the range and whether the search is done |
+//
+// ## Sync Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted once after resolving the selected revision |
+// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
+// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion |
+// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision |
+// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
+int32_t lore_revision_bisect(const struct lore_global_args_t *globals,
+                             const struct lore_revision_bisect_args_t *args,
+                             struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_revision_bisect`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Bisect Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_BISECT` | `lore_revision_bisect_event_data_t` | Emitted once the working directory is synchronized to the selected revision, with the revision numbers of the range and whether the search is done |
+//
+// ## Sync Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted once after resolving the selected revision |
+// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
+// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion |
+// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision |
+// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
+void lore_revision_bisect_async(const struct lore_global_args_t *globals,
+                                const struct lore_revision_bisect_args_t *args,
+                                struct lore_event_callback_config_t callback);
+
+// Cherry-pick a revision onto the current branch, applying its changes to the working tree.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Cherry-Pick Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_CHERRY_PICK_START_BEGIN` | `lore_cherry_pick_start_begin_event_data_t` | Emitted when cherry-pick begins, includes picked revision info |
+// | `LORE_EVENT_CHERRY_PICK_START_END` | `lore_cherry_pick_start_end_event_data_t` | Emitted when cherry-pick completes, includes conflict flag |
+// | `LORE_EVENT_CHERRY_PICK_CONFLICT_FILE` | `lore_cherry_pick_conflict_file_event_data_t` | Emitted for each file with an unresolved cherry-pick conflict |
+// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted while the picked changes are applied |
+// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file modified during cherry-pick realization |
+// | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file staged for deletion during cherry-pick |
+// | `LORE_EVENT_REVISION_COMMIT_BEGIN` | `lore_revision_commit_begin_event_data_t` | Emitted when auto-commit starts (no conflicts) |
+// | `LORE_EVENT_REVISION_COMMIT_PROGRESS` | `lore_revision_commit_progress_event_data_t` | Emitted during auto-commit |
+// | `LORE_EVENT_REVISION_COMMIT_END` | `lore_revision_commit_end_event_data_t` | Emitted when auto-commit completes |
+// | `LORE_EVENT_REVISION_COMMIT_REVISION` | `lore_revision_commit_revision_event_data_t` | Emitted with the committed cherry-pick revision |
+// | `LORE_EVENT_METADATA` | `lore_metadata_event_data_t` | Emitted for metadata of the auto-commit |
+// | `LORE_EVENT_FRAGMENT_WRITE` | `lore_fragment_write_event_data_t` | Emitted for fragments written during auto-commit |
+int32_t lore_revision_cherry_pick(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_cherry_pick_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_revision_cherry_pick`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Cherry-Pick Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_CHERRY_PICK_START_BEGIN` | `lore_cherry_pick_start_begin_event_data_t` | Emitted when cherry-pick begins, includes picked revision info |
+// | `LORE_EVENT_CHERRY_PICK_START_END` | `lore_cherry_pick_start_end_event_data_t` | Emitted when cherry-pick completes, includes conflict flag |
+// | `LORE_EVENT_CHERRY_PICK_CONFLICT_FILE` | `lore_cherry_pick_conflict_file_event_data_t` | Emitted for each file with an unresolved cherry-pick conflict |
+// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted while the picked changes are applied |
+// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file modified during cherry-pick realization |
+// | `LORE_EVENT_FILE_STAGE_FILE` | `lore_file_stage_file_event_data_t` | Emitted for each file staged for deletion during cherry-pick |
+// | `LORE_EVENT_REVISION_COMMIT_BEGIN` | `lore_revision_commit_begin_event_data_t` | Emitted when auto-commit starts (no conflicts) |
+// | `LORE_EVENT_REVISION_COMMIT_PROGRESS` | `lore_revision_commit_progress_event_data_t` | Emitted during auto-commit |
+// | `LORE_EVENT_REVISION_COMMIT_END` | `lore_revision_commit_end_event_data_t` | Emitted when auto-commit completes |
+// | `LORE_EVENT_REVISION_COMMIT_REVISION` | `lore_revision_commit_revision_event_data_t` | Emitted with the committed cherry-pick revision |
+// | `LORE_EVENT_METADATA` | `lore_metadata_event_data_t` | Emitted for metadata of the auto-commit |
+// | `LORE_EVENT_FRAGMENT_WRITE` | `lore_fragment_write_event_data_t` | Emitted for fragments written during auto-commit |
+void lore_revision_cherry_pick_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_cherry_pick_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
 // Revert a revision, applying its inverse changes to the working tree.
 //
 // # Events
@@ -11050,6 +11678,58 @@ void lore_shared_store_info_async(const struct lore_global_args_t *globals,
                                   const struct lore_shared_store_info_args_t *args,
                                   struct lore_event_callback_config_t callback);
 
+// List every registered shared store.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Shared Store Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set |
+int32_t lore_shared_store_list(const struct lore_global_args_t *globals,
+                               const struct lore_shared_store_list_args_t *args,
+                               struct lore_event_callback_config_t callback);
+
+// List every registered shared store (async).
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Shared Store Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set |
+void lore_shared_store_list_async(const struct lore_global_args_t *globals,
+                                  const struct lore_shared_store_list_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
 // Set whether to automatically use the shared store.
 //
 // # Events
@@ -11091,6 +11771,11 @@ void lore_shared_store_set_use_automatically_async(const struct lore_global_args
                                                    struct lore_event_callback_config_t callback);
 
 // Open a content-addressed storage handle.
+//
+// A disk-backed handle claims its stores for this process until it is released, so
+// another process using the same stores waits until then. The claim ends once the
+// flush `lore_storage_close` starts has finished and every revision tree loaded
+// against the handle has been closed.
 //
 // # Events
 //
@@ -11161,12 +11846,17 @@ void lore_storage_get_async(const struct lore_global_args_t *globals,
 // materialised in memory before the first byte reaches the callback, so a key naming something
 // large should set it.
 //
+// Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
+// `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
+// stored. No leaf is expanded or checked against its hash.
+//
 // # Events
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
 // | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+// | `LORE_EVENT_STORAGE_GET_FRAGMENT` | `lore_storage_get_fragment_event_data_t` | One leaf fragment and its payload, in content order, when `fragments` is set. The payload is valid only during the callback invocation |
 // | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
@@ -11233,7 +11923,12 @@ void lore_storage_put_resolved_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`.
 // Close does not block on the flush it spawns — `Complete` fires after
-// the in-flight counter drains, not after the flush finishes.
+// the in-flight counter drains, not after the flush finishes. The handle's
+// claim on its stores ends once that flush has finished and every revision
+// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
+// set to `1` or `true`, a disk-backed handle's stores stay in memory without
+// the claim for the window `store_keep_alive_seconds` gives, so a
+// `lore_storage_open` of the same repository in that window reuses them.
 int32_t lore_storage_close(const struct lore_global_args_t *globals,
                            const struct lore_storage_close_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -11558,7 +12253,9 @@ void lore_service_start_async(const struct lore_global_args_t *globals,
 // Stop the running Lore background service.
 //
 // Does not start a service in order to stop one. Returns `0` when no service
-// is running, since that is the state the call asks for.
+// is running, since that is the state the call asks for. A mount the service
+// cannot release because something holds it refuses the stop with `MountsBusy`,
+// unless the global `force` argument is set, which detaches busy mounts lazily.
 //
 // # Events
 //
@@ -11597,6 +12294,67 @@ int32_t lore_service_stop(const struct lore_global_args_t *globals,
 void lore_service_stop_async(const struct lore_global_args_t *globals,
                              const struct lore_service_stop_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Report whether the Lore background service is running, and its metadata.
+//
+// Answers from inside the service when called there, and otherwise reaches the
+// one that is listening. Nothing listening is an answer rather than a failure:
+// the call returns `0` with `running` set to `0`, so a caller branches on the
+// event rather than on a connection error. Also hands back the log messages the
+// service buffered while no command was running, emptying the buffer as it
+// reads it.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+int32_t lore_service_status(const struct lore_global_args_t *globals,
+                            const struct lore_service_status_args_t *args,
+                            struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_status`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+void lore_service_status_async(const struct lore_global_args_t *globals,
+                               const struct lore_service_status_args_t *args,
+                               struct lore_event_callback_config_t callback);
 
 // Name the executable the Lore background service runs from, for this machine.
 //
@@ -11808,7 +12566,10 @@ void lore_notification_unsubscribe_async(const struct lore_global_args_t *global
 int32_t lore_log_configure(const struct lore_log_config_t *config);
 
 // Shut the library down, stopping its worker threads and releasing the
-// resources it holds. Call this once, when no further calls will be made.
+// resources it holds. Call this once, when no further calls will be made and
+// every call made has completed. The library makes a best effort to cancel
+// calls still executing safely, but a call it does not stop in time may still
+// use the memory passed to it after this returns.
 //
 // Returns 0 on success and a non-zero value on failure.
 int32_t lore_shutdown(void);
@@ -11872,8 +12633,9 @@ int32_t lore_set_allocator(lore_alloc_fn alloc,
                            lore_realloc_fn realloc,
                            lore_dealloc_fn dealloc);
 
-// Return the library version as a NUL-terminated string. The string is owned
-// by the library and must not be freed by the caller.
+// Return the library version as a NUL-terminated string: `LORE_INTERFACE_VERSION`,
+// then `+` and the build name. The string is owned by the library and must not
+// be freed by the caller.
 const char *lore_version(void);
 
 // Return the path of the directory where the library keeps its per-user data
@@ -11962,6 +12724,9 @@ void lore_repository_config_get_async(const struct lore_global_args_t *globals,
 // `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
 // empty tree suitable for committing an initial revision.
 //
+// The tree keeps the storage handle's claim on its stores for as long as it is
+// open, past `lore_storage_close` on that handle.
+//
 // | Terminal event                       | Payload                                | Notes                                              |
 // |--------------------------------------|----------------------------------------|----------------------------------------------------|
 // | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
@@ -11978,7 +12743,9 @@ void lore_revision_tree_load_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`. The
 // call blocks until every in-flight op on the handle has paired its
-// decrement.
+// decrement. Closing a tree on a storage handle that is already closed
+// flushes what the tree wrote since, and closing the last one releases
+// what was keeping that handle's claim on its stores.
 //
 // | Terminal event                              | Payload                                       | Notes                                              |
 // |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|

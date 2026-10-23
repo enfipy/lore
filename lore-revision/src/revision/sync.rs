@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -29,6 +28,8 @@ use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::hold;
+use crate::fs::realize::realize_state;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -59,7 +60,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Source and target revisions selected for a sync.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionSyncTargetEventData {
     /// Remote URL
@@ -90,7 +91,7 @@ pub struct LoreRevisionSyncTargetEventData {
 
 /// Progress counters reported while a sync updates the working files.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionSyncProgressEventData {
     /// Number of files updated so far.
@@ -116,7 +117,7 @@ pub struct LoreRevisionSyncProgressEventData {
 
 /// The revision that resulted from a sync.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionSyncRevisionEventData {
     /// Branch (if any)
@@ -193,13 +194,15 @@ impl EventError for SyncError {
 
 impl From<FsError> for SyncError {
     fn from(value: FsError) -> Self {
-        SyncError::internal_with_context(value, "Failed during internal filesystem operation")
+        Err::<(), _>(value)
+            .forward::<SyncError>("Failed during internal filesystem operation")
+            .unwrap_err()
     }
 }
 
 /// Details of a single file changed by a sync.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionSyncFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -415,11 +418,24 @@ async fn revision_advances_branch_latest(
 /// measured against the view that materialized it and written under the view it is left holding.
 /// Everything else here takes the target context, since that is the view the instance keeps once
 /// this returns.
+///
+/// A provider that holds its state in a `State` ([`FilesystemProvider::holds_state`]) holds whole
+/// revisions, keeps its local changes itself and holds no files for a layer to be written into,
+/// so a sync restricted to a dependency set, one resetting local changes, and one carrying layers
+/// are refused there.
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
+    if repository.file_system().holds_state() {
+        if !options.root_files.is_empty() {
+            return Err(hold::refused("restrict a sync to a dependency set").into());
+        }
+        if options.reset {
+            return Err(hold::refused("reset local changes in a sync").into());
+        }
+    }
     let view = sync_load_view(&options).await?;
     let view_change = view.is_some();
     let repository_current = repository.clone();
@@ -653,13 +669,13 @@ pub(crate) async fn sync(
             format!("Failed to deserialize state {current_revision}")
         })?;
 
-    let (layers, nearest_revision) = Box::pin(sync_load_layer_list(
+    let (layers, nearest_revision) = sync_load_layer_list(
         repository.clone(),
         target_branch,
         revision,
         state_current.clone(),
         view_change || options.reset,
-    ))
+    )
     .await?;
 
     if let Some(main_revision) = nearest_revision
@@ -763,6 +779,9 @@ pub(crate) async fn sync(
         return Ok(());
     }
 
+    if !layers.is_empty() && repository.file_system().holds_state() {
+        return Err(hold::refused("sync layers").into());
+    }
     if !force && !options.reset {
         sync_reject_staged_layers(&layers).await?;
     }
@@ -811,6 +830,7 @@ pub(crate) async fn sync(
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
                 message: String::new(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
@@ -849,91 +869,98 @@ pub(crate) async fn sync(
     let cache_state = state_target.clone();
     let cache_task = Some(lore_spawn!(async move {
         // Ignore errors during caching
-        let _ = cache_state.cache_fragments(cache_repository).await;
+        let _ = cache_state.cache_fragments(cache_repository, false).await;
     }));
 
     let state_synced = state_target.clone();
-    let result = Box::pin(sync_realize(
-        repository_current.clone(),
-        repository.clone(),
-        state_current,
-        state_target,
-        options.clone(),
-    ))
-    .await;
-
-    // Make sure caching has finished
-    if let Some(task) = cache_task {
-        let _ = task.await;
-    }
-
-    // Safe to handle error when cache task has finished
-    let modified_times = result?;
-
-    if !layers.is_empty() {
-        Box::pin(sync_layers(
-            repository_current,
+    with_operation::<_, SyncError, _>(repository_current.file_system(), async |operation| {
+        Box::pin(realize_state(
+            repository_current.clone(),
             repository.clone(),
-            token,
-            layers,
+            operation.clone(),
+            state_current,
+            state_target,
             options.clone(),
         ))
         .await?;
-    }
 
-    if !execution_context().globals().dry_run() {
-        // If the target revision is taken on a different branch, update the
-        // current branch. This allows sync to transparently switch branches.
-        let synced_branch = match requested_branch.filter(|branch| !branch.is_zero()) {
-            Some(branch) => branch,
-            None => state_synced
-                .revision_metadata(repository.clone())
-                .await
-                .ok()
-                .map(|m| m.branch)
-                .filter(|b| !b.is_zero())
-                .unwrap_or(anchor_branch),
-        };
-        if synced_branch != anchor_branch {
-            // The revision the current branch was created at belongs to the
-            // branch it was created from, and the current branch holds it too,
-            // so it is no reason on its own to leave. Naming that branch resolves
-            // the revision onto it instead, which never reaches here.
-            let is_branch_point = branch::metadata(repository.clone(), anchor_branch)
-                .await
-                .ok()
-                .map(|m| branch::stack(&m))
-                .is_some_and(|stack| stack.first().is_some_and(|bp| bp.revision == revision));
-            if !is_branch_point {
-                // Warn if another instance has the target branch checked out
-                crate::instance::warn_branch_multiple_instance(&repository, synced_branch).await;
+        // Make sure caching has finished
+        if let Some(task) = cache_task {
+            let _ = task.await;
+        }
 
-                crate::instance::store_current_anchor_branch(&repository, synced_branch)
+        // Safe to handle error when cache task has finished
+        let modified_times = operation.take_modified_times();
+
+        if !layers.is_empty() {
+            Box::pin(sync_layers(
+                repository_current,
+                repository.clone(),
+                token,
+                layers,
+                options.clone(),
+            ))
+            .await?;
+        }
+
+        if !execution_context().globals().dry_run() {
+            // If the target revision is taken on a different branch, update the
+            // current branch. This allows sync to transparently switch branches.
+            let synced_branch = match requested_branch.filter(|branch| !branch.is_zero()) {
+                Some(branch) => branch,
+                None => state_synced
+                    .revision_metadata(repository.clone())
                     .await
-                    .forward::<SyncError>("Failed to serialize current revision anchor")?;
+                    .ok()
+                    .map(|m| m.branch)
+                    .filter(|b| !b.is_zero())
+                    .unwrap_or(anchor_branch),
+            };
+            if synced_branch != anchor_branch {
+                // The revision the current branch was created at belongs to the
+                // branch it was created from, and the current branch holds it too,
+                // so it is no reason on its own to leave. Naming that branch resolves
+                // the revision onto it instead, which never reaches here.
+                let is_branch_point = branch::metadata(repository.clone(), anchor_branch)
+                    .await
+                    .ok()
+                    .map(|m| branch::stack(&m))
+                    .is_some_and(|stack| stack.first().is_some_and(|bp| bp.revision == revision));
+                if !is_branch_point {
+                    // Warn if another instance has the target branch checked out
+                    crate::instance::warn_branch_multiple_instance(&repository, synced_branch)
+                        .await;
+
+                    crate::instance::store_current_anchor_branch(&repository, synced_branch)
+                        .await
+                        .forward::<SyncError>("Failed to serialize current revision anchor")?;
+                }
+            }
+            crate::instance::store_current_anchor(&repository, revision)
+                .await
+                .forward::<SyncError>("Failed to serialize current revision anchor")?;
+
+            modified_times.store(repository.clone()).await;
+
+            state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
+                .await
+                .forward::<SyncError>("Failed to rebase staged anchor")?;
+
+            if view_change {
+                sync_store_view(&repository).await?;
+            }
+
+            // Set the local branch LATEST to match remote if we synced to that
+            // If we synced to a local revision keep the branch LATEST to not lose
+            // any local history when going backwards
+            if location == LoreBranchLocation::Remote {
+                sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
             }
         }
-        crate::instance::store_current_anchor(&repository, revision)
-            .await
-            .forward::<SyncError>("Failed to serialize current revision anchor")?;
 
-        modified_times.store(repository.clone()).await;
-
-        state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
-            .await
-            .forward::<SyncError>("Failed to rebase staged anchor")?;
-
-        if view_change {
-            sync_store_view(&repository).await?;
-        }
-
-        // Set the local branch LATEST to match remote if we synced to that
-        // If we synced to a local revision keep the branch LATEST to not lose
-        // any local history when going backwards
-        if location == LoreBranchLocation::Remote {
-            sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
-        }
-    }
+        Ok(())
+    })
+    .await?;
 
     LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
         branch: target_branch,
@@ -1238,35 +1265,6 @@ async fn shim_with_operation<T>(
     .await
 }
 
-/// Realizes `state_target` over the working copy, returning the modified times of the files
-/// it wrote for the caller to store once the target revision is the current one.
-///
-/// `repository_current` is the context the working copy stands under, which is `repository` itself
-/// for a sync that carries the tree between revisions under one view.
-async fn sync_realize(
-    repository_current: Arc<RepositoryContext>,
-    repository: Arc<RepositoryContext>,
-    state_current: Arc<State>,
-    state_target: Arc<State>,
-    options: SyncOptions,
-) -> Result<RecordedModifiedTimes, SyncError> {
-    let (result, modified_times) =
-        shim_with_operation(repository.file_system(), async |operation| {
-            Box::pin(crate::fs::realize::realize_state(
-                repository_current,
-                repository,
-                operation,
-                state_current,
-                state_target,
-                options,
-            ))
-            .await
-        })
-        .await?;
-    result?;
-    Ok(modified_times)
-}
-
 #[derive(Clone)]
 pub struct SyncVerifyArgs {
     pub changes: Arc<Vec<NodeChange>>,
@@ -1415,122 +1413,5 @@ pub async fn unlink_merge_artifacts(operation: &InstanceOperationImpl, path: &Re
         let artifact = path.append_into_buf(suffix).freeze();
         lore_trace!("Delete merge artifact file {artifact}");
         let _ = operation.remove(&artifact).await;
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::disallowed_methods)] // Test fixtures writing the copies in a temporary directory.
-mod tests {
-    use lore_base::test_util::TempDir;
-
-    use super::*;
-    use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
-    use crate::fs::os::OsFilesystem;
-    use crate::repository::MINE_SUFFIX;
-
-    /// An operation rooted at `root`, which is what the helpers name their paths against.
-    async fn os_operation(root: &Path) -> Arc<InstanceOperationImpl> {
-        FilesystemProvider::begin_operation(&OsFilesystem::new(root))
-            .await
-            .expect("beginning an operation over the OS filesystem")
-    }
-
-    fn relative(path: &str) -> RelativePath {
-        RelativePath::new_from_initial_path(path).expect("relative path")
-    }
-
-    /// Every copy on its own, so a helper that reads one suffix and stops is not mistaken for
-    /// one that reads all three.
-    #[tokio::test]
-    async fn a_copy_under_any_suffix_is_found() {
-        for suffix in MERGE_ARTIFACT_SUFFIXES {
-            let dir = TempDir::new("lore-merge-artifact-");
-            let operation = os_operation(dir.path()).await;
-            std::fs::write(dir.path().join(format!("file.txt{suffix}")), b"side")
-                .expect("write copy");
-
-            assert!(
-                exist_merge_artifacts(&operation, &relative("file.txt")).await,
-                "the copy under {suffix} was not found"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_file_no_merge_left_copies_beside_reports_none() {
-        let dir = TempDir::new("lore-merge-artifact-");
-        let operation = os_operation(dir.path()).await;
-        std::fs::write(dir.path().join("file.txt"), b"merged").expect("write file");
-
-        assert!(!exist_merge_artifacts(&operation, &relative("file.txt")).await);
-    }
-
-    /// The file the copies belong to is not one of them, and stays.
-    #[tokio::test]
-    async fn removing_takes_every_copy_and_leaves_the_file() {
-        let dir = TempDir::new("lore-merge-artifact-");
-        let operation = os_operation(dir.path()).await;
-        std::fs::write(dir.path().join("file.txt"), b"merged").expect("write file");
-        for suffix in MERGE_ARTIFACT_SUFFIXES {
-            std::fs::write(dir.path().join(format!("file.txt{suffix}")), b"side")
-                .expect("write copy");
-        }
-
-        unlink_merge_artifacts(&operation, &relative("file.txt")).await;
-
-        assert!(!exist_merge_artifacts(&operation, &relative("file.txt")).await);
-        for suffix in MERGE_ARTIFACT_SUFFIXES {
-            assert!(
-                !dir.path().join(format!("file.txt{suffix}")).exists(),
-                "the copy under {suffix} was left behind"
-            );
-        }
-        assert!(
-            dir.path().join("file.txt").exists(),
-            "the file the copies belong to was removed"
-        );
-    }
-
-    /// Read from the working tree rather than from the tree the path is tracked in: a
-    /// provider serving tracked content virtually holds no node for a sidecar, so one asked
-    /// through [`InstanceOperation::file_info`] answers that every copy is absent.
-    #[tokio::test]
-    async fn a_copy_is_looked_for_outside_the_tracked_tree() {
-        let provider = Arc::new(TestFilesystemProvider::holding_every_path());
-        let operation = provider
-            .begin_operation()
-            .await
-            .expect("beginning an operation over the test provider");
-
-        assert!(exist_merge_artifacts(&operation, &relative("file.txt")).await);
-        assert_eq!(
-            0,
-            provider.file_infos(),
-            "the copies were looked up through the tracked tree"
-        );
-    }
-
-    /// A path under a directory, so the suffix lands on the name rather than anywhere in the
-    /// path it is reached by.
-    #[tokio::test]
-    async fn a_copy_beside_a_nested_file_is_found_and_removed() {
-        let dir = TempDir::new("lore-merge-artifact-");
-        let operation = os_operation(dir.path()).await;
-        std::fs::create_dir_all(dir.path().join("sub")).expect("create directory");
-        let copy = dir
-            .path()
-            .join("sub")
-            .join(format!("file.txt{MINE_SUFFIX}"));
-        std::fs::write(&copy, b"side").expect("write copy");
-
-        let nested = relative("sub/file.txt");
-        assert!(exist_merge_artifacts(&operation, &nested).await);
-
-        unlink_merge_artifacts(&operation, &nested).await;
-
-        assert!(
-            !copy.exists(),
-            "the copy beside a nested file was left behind"
-        );
     }
 }

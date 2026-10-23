@@ -227,65 +227,34 @@ impl PsyncDriver {
         durable: bool,
     ) -> std::io::Result<()> {
         SyscallPool::global()
-            .submit(move || {
-                let file = options.open(path)?;
-                let total: usize = buffers.byte_segments().map(|segment| segment.len()).sum();
-                let mut done = 0;
-                while done < total {
-                    let written = write_vectored_impl(&file, &buffers, done, done as u64)?;
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "file refused further writes",
-                        ));
-                    }
-                    done += written;
-                }
-                // See the atomic twin: the segments are released before the sync, not after it.
-                drop(buffers);
-                if durable {
-                    file.sync_all()?;
-                }
-                Ok(())
-            })
+            .submit(move || write_segments(options.open(path)?, buffers, durable))
             .await
     }
 
-    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
+    pub(crate) async fn write_file_segments_atomic<B: StableBufList, C: Send + 'static>(
         &self,
         options: std::fs::OpenOptions,
         temporary_path: PathBuf,
         final_path: PathBuf,
         buffers: B,
+        durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
                 let file = options.open(&temporary_path)?;
-                let total: usize = buffers.byte_segments().map(|segment| segment.len()).sum();
-                let mut done = 0;
-                while done < total {
-                    let written = write_vectored_impl(&file, &buffers, done, done as u64)?;
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "file refused further writes",
-                        ));
-                    }
-                    done += written;
+                let written = write_segments(file, buffers, durable)
+                    .and_then(|()| std::fs::rename(&temporary_path, &final_path));
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&temporary_path);
+                } else if durable {
+                    // Directory sync is best-effort: the rename is already durable in content, and
+                    // a lost directory entry after a crash reproduces the pre-write state the
+                    // caller already handles.
+                    let _ = sync_parent_dir(&final_path);
                 }
-                // The kernel has the bytes, so whatever kept the segments stable is free from
-                // here: the sync and the rename below touch the page cache and the directory,
-                // never the caller's memory.
-                drop(buffers);
-                file.sync_all()?;
-                drop(file);
-                std::fs::rename(&temporary_path, &final_path)?;
-                // Directory sync is best-effort: the rename is already
-                // durable in content, and a lost directory entry after a
-                // crash reproduces the pre-write state the caller already
-                // handles.
-                let _ = sync_parent_dir(&final_path);
-                Ok(())
+                drop(completion);
+                written
             })
             .await
     }
@@ -339,9 +308,18 @@ impl PsyncDriver {
         SyscallPool::global().submit(move || file.metadata()).await
     }
 
-    pub(crate) async fn set_len(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
+    pub(crate) async fn set_len<C: Send + 'static>(
+        &self,
+        file: Arc<File>,
+        len: u64,
+        completion: C,
+    ) -> std::io::Result<()> {
         SyscallPool::global()
-            .submit(move || retry_on_interrupt(|| file.set_len(len)))
+            .submit(move || {
+                let set = retry_on_interrupt(|| file.set_len(len));
+                drop(completion);
+                set
+            })
             .await
     }
 
@@ -416,6 +394,7 @@ impl PsyncDriver {
 /// a Windows container bind-mount root instead fails `mkdir` with `PermissionDenied` while
 /// remaining a directory. This restores the pre-1.94 contract every caller here was written
 /// against: success means the directory exists, however that came to be true.
+#[lore_macro::test_pub]
 fn forgive_existing_dir(
     result: std::io::Result<()>,
     path: &std::path::Path,
@@ -604,6 +583,30 @@ fn write_at_impl(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usi
     crate::overlapped::write_at(file, buffer, offset)
 }
 
+/// Writes `buffers` to `file` from its start and, with `durable`, syncs it. The segments are
+/// released once the kernel has the bytes, before the sync, which touches the page cache rather
+/// than the caller's memory, and `file` is closed by the time it returns, so that the caller can
+/// rename or remove it then.
+fn write_segments<B: StableBufList>(file: File, buffers: B, durable: bool) -> std::io::Result<()> {
+    let total: usize = buffers.byte_segments().map(|segment| segment.len()).sum();
+    let mut done = 0;
+    while done < total {
+        let written = write_vectored_impl(&file, &buffers, done, done as u64)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "file refused further writes",
+            ));
+        }
+        done += written;
+    }
+    drop(buffers);
+    if durable {
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -787,50 +790,4 @@ fn write_vectored_impl<B: StableBufList>(
         offset += done as u64;
     }
     Ok(total)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The shape of a Windows container bind-mount root: `mkdir` fails, but the target already
-    /// stats as a directory, so the failure is forgiven.
-    #[test]
-    fn forgive_existing_dir_forgives_a_failure_on_an_existing_directory() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        forgive_existing_dir(Err(synthetic_error), dir.path())
-            .expect("an existing directory must not fail the caller");
-    }
-
-    #[test]
-    fn forgive_existing_dir_propagates_a_failure_on_a_file() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let file_path = dir.path().join("blocker");
-        std::fs::File::create(&file_path).expect("create blocker file");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        let error = forgive_existing_dir(Err(synthetic_error), &file_path)
-            .expect_err("a file where a directory belongs must still fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn forgive_existing_dir_propagates_a_failure_on_a_missing_path() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let missing_path = dir.path().join("nowhere");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        let error = forgive_existing_dir(Err(synthetic_error), &missing_path)
-            .expect_err("a genuinely missing path must still fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn forgive_existing_dir_passes_success_through() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-
-        forgive_existing_dir(Ok(()), dir.path()).expect("success must not become a failure");
-    }
 }

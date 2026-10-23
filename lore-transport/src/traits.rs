@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::types::*;
 
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -21,7 +22,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         partition: Partition,
         index: usize,
@@ -34,7 +35,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -45,7 +46,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
@@ -56,7 +57,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -68,7 +69,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -398,14 +399,22 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError>;
 
-    /// Polls for completion of an interactive auth session.
+    /// Polls an interactive auth session once.
+    ///
+    /// Answers [`AuthSessionPoll::Pending`] while the user has yet to
+    /// approve, [`AuthSessionPoll::SlowDown`] when the backend wants the
+    /// caller to poll less often, and [`AuthSessionPoll::Complete`] with the
+    /// token once approved.
+    ///
+    /// The caller takes care of the cadence: it waits the session's `interval`
+    /// between polls, widens it on `SlowDown`, and gives up at `expires_in`.
     async fn poll_auth_session(
         &self,
         auth_url: &str,
         client_state: &str,
         session_code: &str,
         correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError>;
+    ) -> Result<AuthSessionPoll, ProtocolError>;
 
     /// Exchanges an external token for a URC authentication token.
     async fn exchange_external_token(
@@ -416,7 +425,21 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Obtains an authentication token for a confidential client registered with
+    /// the auth backend, which authenticates with its own ID and secret.
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError>;
+
     /// Refreshes the authentication token using a one-time-use refresh token.
+    ///
+    /// Fails with [`Disconnected`](lore_base::error::Disconnected) only when the refresh token
+    /// cannot have reached the backend, so the caller may present it again. After any other
+    /// failure the backend may have consumed it.
     async fn refresh_authentication(
         &self,
         auth_url: &str,

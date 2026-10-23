@@ -9,8 +9,6 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::error::ServiceUnavailable;
@@ -22,6 +20,7 @@ use lore_revision::lore_debug;
 use lore_revision::lore_warn;
 use lore_revision::util::config::SaveableConfig;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -60,10 +59,12 @@ fn unavailable(reason: impl Into<String>) -> ServiceProcessError {
 
 /// Environment variable that sets the executable to start the service with,
 /// overriding the one in the global config.
+#[lore_macro::test_pub]
 const SERVICE_EXECUTABLE_VAR: &str = "LORE_SERVICE_EXECUTABLE";
 
 /// Where the global config names an executable, for messages that ask a reader
 /// to set it.
+#[lore_macro::test_pub]
 const SERVICE_EXECUTABLE_SETTING: &str = "[service] executable";
 
 /// Arguments that make the executable run as the service.
@@ -72,13 +73,14 @@ const SERVICE_RUN_ARGUMENTS: [&str; 2] = ["service", "run"];
 /// How long a caller waits for a service to answer after starting one. It
 /// covers starting a process and binding the socket, and when several callers
 /// start one at once it also covers the wait for whichever process won the
-/// socket, so it is measured in seconds rather than milliseconds.
+/// claim, so it is measured in seconds rather than milliseconds. A service that
+/// lost the claim waits as long for the winner to answer.
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How much of that wait is left once the service this caller started has
-/// exited. A service exits either because another one holds the socket, which
-/// means one is listening already, or because none can run here at all, and
-/// neither outcome is worth the rest of the wait.
+/// exited. A service that lost the claim exits once a service answers or
+/// [`SERVICE_START_TIMEOUT`] passes, and one that cannot run here exits at once;
+/// neither is worth the rest of the wait.
 const SERVICE_EXITED_GRACE: Duration = Duration::from_secs(2);
 
 /// Delay between connection attempts while waiting for a service to answer.
@@ -112,6 +114,7 @@ fn executable_from_config(from_config: Option<&str>) -> Option<&str> {
 ///
 /// This ensures that clients of different versions sharing a machine have a predictable service
 /// version.
+#[lore_macro::test_pub]
 fn resolve_service_executable(
     from_env: Option<OsString>,
     from_config: Option<&str>,
@@ -181,6 +184,7 @@ fn reads_as_off(value: &str) -> bool {
 ///
 /// A blank value reads as unset and defers to the config, matching how a blank
 /// `[service] executable` defers to the config.
+#[lore_macro::test_pub]
 fn relaying_is_asked_for(from_env: Option<OsString>, from_config: bool) -> bool {
     if let Some(from_env) = from_env {
         let from_env = from_env.to_string_lossy();
@@ -249,33 +253,12 @@ impl ServiceSettings {
     }
 }
 
-/// Whether a unit test of this crate is what is running, which never relays.
-///
-/// A test sets its own fixture up in the process running it, and a service knows
-/// nothing of that fixture, so relaying a test's calls fails them wholesale — 202
-/// of this crate's unit tests, measured, on a machine with the service turned on.
-/// A developer who turns it on for their own use must still be able to run the
-/// tests.
-///
-/// Only the unit tests: an integration test links this crate compiled without
-/// `cfg(test)`, so this is false there. Those are covered by `LORE_USE_SERVICE=0`
-/// in `.cargo/config.toml`, which covers the unit tests too when they are run
-/// through cargo. This is here for when they are not — an editor's test runner,
-/// or a test binary run directly.
-fn a_unit_test_is_running() -> bool {
-    cfg!(test)
-}
-
 /// Whether this call is carried out by the service rather than here.
 ///
 /// Decided once per process: an embedder makes many calls, and each would
 /// otherwise read the config file again to learn something that does not change
 /// underneath it.
 pub(crate) async fn service_in_use() -> bool {
-    if a_unit_test_is_running() {
-        return false;
-    }
-
     if let Some(decided) = *SERVICE_IN_USE.read() {
         return decided;
     }
@@ -298,10 +281,6 @@ pub(crate) async fn service_in_use() -> bool {
 /// for the same reason, and fills the same answer [`service_in_use`] reads, so
 /// the file is read once either way.
 pub(crate) fn service_in_use_blocking() -> bool {
-    if a_unit_test_is_running() {
-        return false;
-    }
-
     if let Some(decided) = *SERVICE_IN_USE.read() {
         return decided;
     }
@@ -331,6 +310,7 @@ pub(crate) fn forget_whether_service_is_in_use() {
 /// to run the first command. On Unix that means its own session, via `setsid` in
 /// the child between fork and exec. On Windows it means no inherited console and
 /// no console of its own, which would otherwise appear as a stray window.
+#[lore_macro::test_pub]
 fn detach_from_caller(command: &mut Command) {
     #[cfg(target_family = "unix")]
     {
@@ -441,6 +421,7 @@ static STARTED_SERVICES: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 /// the library down — one process table entry, held until that program exits,
 /// against a task polling for the life of every program that ever started a
 /// service.
+#[lore_macro::test_pub]
 pub(crate) fn collect_exited_services() {
     STARTED_SERVICES
         .lock()
@@ -449,6 +430,7 @@ pub(crate) fn collect_exited_services() {
 
 /// Keeps a started service, whether it won the socket or lost it, so that it can
 /// be collected once it exits.
+#[lore_macro::test_pub]
 fn remember_started_service(service: Child) {
     STARTED_SERVICES.lock().push(service);
 }
@@ -505,10 +487,10 @@ pub(crate) async fn connect_to_running_service() -> Result<Option<UdsStream>, Se
 /// Connects to the service, starting one when none is running.
 ///
 /// Several callers reach this at once with no service running, and each starts
-/// one. Only the first to bind the socket keeps running and the rest exit, so
-/// what is waited for afterwards is *a* service answering rather than the one
-/// this caller started: the callers whose service lost the socket become
-/// clients of the one that won it.
+/// one. Only the first to claim the socket keeps running, and the rest exit once
+/// it answers, so what is waited for afterwards is *a* service answering rather
+/// than the one this caller started: the callers whose service lost the claim
+/// become clients of the one that won it.
 pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProcessError> {
     if let Some(connection) = connect_to_running_service().await? {
         return Ok(connection);
@@ -551,6 +533,12 @@ pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProce
     }
 }
 
+/// Waits up to [`SERVICE_START_TIMEOUT`] for a service to accept a connection,
+/// and reports whether one did.
+pub async fn wait_until_a_service_is_listening() -> Result<bool, ServiceProcessError> {
+    wait_for_listening(true, SERVICE_START_TIMEOUT).await
+}
+
 /// Waits until nothing is listening.
 ///
 /// A service acknowledges a stop over IPC and then keeps its socket while the
@@ -560,21 +548,30 @@ pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProce
 /// second would find the socket taken.
 pub(crate) async fn wait_until_no_service_is_listening() -> Result<(), ServiceProcessError> {
     let started = Instant::now();
-    let deadline = started + STOP_RELEASE_TIMEOUT;
+    if wait_for_listening(false, STOP_RELEASE_TIMEOUT).await? {
+        return Ok(());
+    }
+    // Not `ServiceUnavailable`: one is available, which is the problem.
+    Err(ServiceProcessError::internal(format!(
+        "a Lore service was asked to stop and was still listening {:.1} seconds later",
+        started.elapsed().as_secs_f32()
+    )))
+}
 
+/// Polls the socket until a service answers on it when `listening`, or until none does
+/// otherwise, for up to `timeout`; answers whether that happened in time.
+async fn wait_for_listening(
+    listening: bool,
+    timeout: Duration,
+) -> Result<bool, ServiceProcessError> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if connect_attempt().await?.is_none() {
-            return Ok(());
+        if connect_attempt().await?.is_some() == listening {
+            return Ok(true);
         }
-
         if Instant::now() >= deadline {
-            // Not `ServiceUnavailable`: one is available, which is the problem.
-            return Err(ServiceProcessError::internal(format!(
-                "a Lore service was asked to stop and was still listening {:.1} seconds later",
-                started.elapsed().as_secs_f32()
-            )));
+            return Ok(false);
         }
-
         tokio::time::sleep(CONNECT_RETRY_DELAY).await;
     }
 }
@@ -590,19 +587,105 @@ fn started_service_state(service: &mut Child) -> String {
     }
 }
 
+/// The lifecycle of the service in this process, which changes only under the
+/// lock on [`StopRequest`] so that starting, running and being asked to stop
+/// cannot interleave.
+#[derive(Default)]
+struct StopState {
+    /// Set once a stop has been asked for, and kept until the next service
+    /// begins to start.
+    requested: bool,
+    /// Whether a service is running in this process at the moment: it has
+    /// bound its socket and not yet ended. Clear for a process that has stopped,
+    /// or has not got as far as serving.
+    running: bool,
+    /// Whether a service is starting in this process, from the moment it begins
+    /// until it ends. A stop asked for in that window is kept for the service
+    /// to find once it is serving, rather than lost.
+    starting: bool,
+}
+
 /// The stop request for a service running in this process.
+#[lore_macro::test_pub]
 struct StopRequest {
-    /// Set once a stop has been asked for. Read on its own so that a wait
-    /// cannot miss a request which lands before the wait parks.
-    requested: AtomicBool,
+    state: Mutex<StopState>,
     notify: Notify,
 }
 
+impl StopRequest {
+    #[lore_macro::test_pub]
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StopState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, StopState> {
+        self.state.lock()
+    }
+
+    /// Claims the start for the caller, answering `false` when a service already
+    /// starts or runs. Clearing the stop asked of an earlier service happens in
+    /// the same step as publishing the start, so a stop that sees the start
+    /// is never one this clears.
+    #[lore_macro::test_pub]
+    fn begin_start(&self) -> bool {
+        let mut state = self.state();
+        if state.starting {
+            return false;
+        }
+        state.requested = false;
+        state.starting = true;
+        true
+    }
+
+    /// Ends the service that holds the start.
+    #[lore_macro::test_pub]
+    fn end_service(&self) {
+        let mut state = self.state();
+        state.running = false;
+        state.starting = false;
+    }
+
+    #[lore_macro::test_pub]
+    fn set_running(&self) {
+        self.state().running = true;
+    }
+
+    #[lore_macro::test_pub]
+    fn is_running(&self) -> bool {
+        self.state().running
+    }
+
+    #[lore_macro::test_pub]
+    fn is_requested(&self) -> bool {
+        self.state().requested
+    }
+
+    /// Asks the service to stop, and reports whether there was one, starting or
+    /// running, to ask. The request is stored before the wait is woken, so a wait
+    /// that reads it afterwards sees the request either way.
+    #[lore_macro::test_pub]
+    fn request_stop(&self) -> bool {
+        {
+            let mut state = self.state();
+            if !(state.running || state.starting) {
+                return false;
+            }
+            state.requested = true;
+        }
+        self.notify.notify_one();
+        true
+    }
+}
+
 /// Held by the process that runs the service. It is both the request that
-/// process waits on and the record that a service runs here at all.
+/// process waits on and the record that a service runs here, or has run here.
 static STOP_REQUEST: OnceLock<Arc<StopRequest>> = OnceLock::new();
 
 /// The stop request the process running the service waits on.
+#[lore_macro::test_pub]
 pub struct ServiceStopRequest {
     request: Arc<StopRequest>,
 }
@@ -611,289 +694,73 @@ impl ServiceStopRequest {
     /// Resolves once a stop has been requested, including one requested before
     /// the wait began.
     pub async fn requested(&self) {
-        while !self.request.requested.load(Ordering::Acquire) {
+        while !self.request.is_requested() {
             self.request.notify.notified().await;
         }
     }
 }
 
-/// Records that this process runs the service and returns the stop request it
-/// waits on. Repeated calls return the same request.
-pub fn register_service_process() -> ServiceStopRequest {
-    let request = STOP_REQUEST.get_or_init(|| {
-        Arc::new(StopRequest {
-            requested: AtomicBool::new(false),
-            notify: Notify::new(),
-        })
-    });
-    ServiceStopRequest {
-        request: Arc::clone(request),
+fn stop_request() -> &'static Arc<StopRequest> {
+    STOP_REQUEST.get_or_init(|| Arc::new(StopRequest::new()))
+}
+
+/// Held by a service from the moment it begins to start until it ends, however
+/// it ends. Dropping it makes the process one that runs no service.
+pub struct ServiceStartGuard {
+    request: Arc<StopRequest>,
+}
+
+impl ServiceStartGuard {
+    /// The stop request, to wait on before the service is serving as well.
+    pub fn stop_request(&self) -> ServiceStopRequest {
+        ServiceStopRequest {
+            request: Arc::clone(&self.request),
+        }
     }
+}
+
+impl Drop for ServiceStartGuard {
+    fn drop(&mut self) {
+        self.request.end_service();
+    }
+}
+
+/// Records that a service begins to start in this process, and answers `None` when
+/// one already has: a process runs one service, and a second start must not take
+/// the first's guard, whose drop would clear the state the running service still
+/// needs. From here a stop asked for in this process is kept until the service
+/// waits on it, so one that arrives while the service is still claiming its
+/// socket and mounting is not lost. Clears any stop asked for an earlier service,
+/// so that a service started after one has stopped is not stopped on arrival.
+pub fn begin_service_start() -> Option<ServiceStartGuard> {
+    let request = Arc::clone(stop_request());
+    // Built only on success: a guard made for a refused start would clear the state
+    // of the service that holds it when dropped.
+    request.begin_start().then(|| ServiceStartGuard { request })
+}
+
+/// Records that this process runs the service, which is what makes a stop act on
+/// it rather than reach for a socket this process owns. Left until the socket is
+/// bound, so that a process which lost it never claims to be the service for the
+/// moments before it exits.
+pub fn register_service_process(guard: &ServiceStartGuard) {
+    guard.request.set_running();
 }
 
 /// Whether the service runs in this process, which is what makes a stop act on
 /// it rather than reach for a socket this process owns.
+#[lore_macro::test_pub]
 pub(crate) fn service_runs_in_this_process() -> bool {
-    STOP_REQUEST.get().is_some()
+    STOP_REQUEST
+        .get()
+        .is_some_and(|request| request.is_running())
 }
 
 /// Asks the service running in this process to stop, and reports whether there
-/// was one to ask. The request is stored before the wait is woken, so a wait
-/// that reads it afterwards sees the request either way.
+/// was one to ask. This is the one path to a stop for both `stop` and `quit`.
+#[lore_macro::test_pub]
 pub(crate) fn request_service_stop() -> bool {
-    let Some(request) = STOP_REQUEST.get() else {
-        return false;
-    };
-    request.requested.store(true, Ordering::Release);
-    request.notify.notify_one();
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_executable_set_reports_both_places_to_set_one() {
-        let error =
-            resolve_service_executable(None, None).expect_err("no executable set must fail");
-
-        assert!(
-            error.to_string().contains(SERVICE_EXECUTABLE_SETTING)
-                && error.to_string().contains(SERVICE_EXECUTABLE_VAR),
-            "the failure must name both places one can be set: {error}"
-        );
-    }
-
-    #[test]
-    fn the_executable_from_config_resolves() {
-        let from_config = "/opt/lore/1.9/bin/lore";
-
-        let resolved = resolve_service_executable(None, Some(from_config))
-            .expect("the executable from config resolves");
-
-        assert_eq!(resolved, PathBuf::from(from_config));
-    }
-
-    /// A config value of nothing but space would otherwise be started as a path
-    /// made of spaces, which fails with an error about a file no one set.
-    #[test]
-    fn a_config_value_of_only_space_is_treated_as_unset() {
-        let error = resolve_service_executable(None, Some("   "))
-            .expect_err("a blank config value must fail");
-
-        assert!(
-            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
-            "the failure must name where one can be set: {error}"
-        );
-    }
-
-    #[test]
-    fn an_environment_value_that_reads_as_off_turns_relaying_off() {
-        // The obvious way to disable something must not enable it.
-        for off in ["0", "false", "no", "off", "OFF", "False", " 0 "] {
-            assert!(
-                !relaying_is_asked_for(Some(OsString::from(off)), true),
-                "{off} must turn relaying off even where the config turns it on"
-            );
-        }
-    }
-
-    #[test]
-    fn an_environment_value_that_reads_as_on_turns_relaying_on() {
-        for on in ["1", "true", "yes", "on", "anything"] {
-            assert!(
-                relaying_is_asked_for(Some(OsString::from(on)), false),
-                "{on} must turn relaying on even where the config leaves it off"
-            );
-        }
-    }
-
-    #[test]
-    fn no_environment_value_leaves_the_config_to_decide() {
-        assert!(
-            relaying_is_asked_for(None, true),
-            "the config turns relaying on"
-        );
-        assert!(!relaying_is_asked_for(None, false), "and off");
-        // Blank reads as unset, as a blank config value does.
-        assert!(relaying_is_asked_for(Some(OsString::from("   ")), true));
-        assert!(!relaying_is_asked_for(Some(OsString::new()), false));
-    }
-
-    #[test]
-    fn an_empty_config_value_is_treated_as_unset() {
-        let error = resolve_service_executable(None, Some(""))
-            .expect_err("an empty config value must fail");
-
-        assert!(
-            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
-            "the failure must name where one can be set: {error}"
-        );
-    }
-
-    #[test]
-    fn the_executable_from_environment_overrides_the_config() {
-        // One call, one build under test, without editing what the machine configures.
-        let from_env = PathBuf::from("/home/dev/lore/target/debug/lore");
-
-        let resolved = resolve_service_executable(
-            Some(from_env.clone().into_os_string()),
-            Some("/opt/lore/1.9/bin/lore"),
-        )
-        .expect("the executable from environment resolves");
-
-        assert_eq!(resolved, from_env);
-    }
-
-    #[test]
-    fn the_executable_from_environment_is_used_as_it_stands() {
-        let from_env = PathBuf::from("/opt/tools/lore-for-the-service");
-
-        let resolved = resolve_service_executable(Some(from_env.clone().into_os_string()), None)
-            .expect("the executable from environment resolves");
-
-        assert_eq!(resolved, from_env);
-    }
-
-    #[test]
-    fn an_empty_environment_value_falls_back_to_the_config() {
-        let from_config = "/opt/lore/bin/lore";
-
-        let resolved = resolve_service_executable(Some(OsString::new()), Some(from_config))
-            .expect("an empty environment value falls back to the config");
-
-        assert_eq!(resolved, PathBuf::from(from_config));
-    }
-
-    #[test]
-    fn an_empty_environment_value_with_no_config_fails() {
-        let error = resolve_service_executable(Some(OsString::new()), None)
-            .expect_err("an empty environment value with no config must fail");
-
-        assert!(
-            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
-            "the failure must name where one can be set: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stop_requested_before_the_wait_still_ends_it() {
-        let request = Arc::new(StopRequest {
-            requested: AtomicBool::new(false),
-            notify: Notify::new(),
-        });
-        let wait = ServiceStopRequest {
-            request: Arc::clone(&request),
-        };
-
-        request.requested.store(true, Ordering::Release);
-        request.notify.notify_one();
-
-        wait.requested().await;
-    }
-
-    #[tokio::test]
-    async fn a_stop_requested_during_the_wait_ends_it() {
-        let request = Arc::new(StopRequest {
-            requested: AtomicBool::new(false),
-            notify: Notify::new(),
-        });
-        let wait = ServiceStopRequest {
-            request: Arc::clone(&request),
-        };
-
-        // Both run on this task: the wait parks first, then the request lands.
-        tokio::join!(wait.requested(), async {
-            tokio::task::yield_now().await;
-            request.requested.store(true, Ordering::Release);
-            request.notify.notify_one();
-        });
-    }
-
-    /// The session a process belongs to, read from `/proc`. `comm` can hold
-    /// spaces and parentheses, so the fields after it are counted from the last
-    /// `)`: state, ppid, pgrp, then session.
-    #[cfg(target_os = "linux")]
-    fn session_of(pid: u32) -> i32 {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-        stat.rsplit_once(')')
-            .map(|(_comm, rest)| rest)
-            .unwrap_or_default()
-            .split_whitespace()
-            .nth(3)
-            .and_then(|session| session.parse().ok())
-            .unwrap_or(-1)
-    }
-
-    /// A service started here is this process's child until it is collected, so
-    /// one that has exited must not be left in the process table.
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn a_started_service_that_has_exited_is_collected() {
-        let mut started = Command::new("true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("a stand-in process must start");
-        let pid = started.id();
-        // Wait for it to exit without collecting it, which is the state a
-        // dropped handle would leave behind.
-        while !matches!(started.try_wait(), Ok(Some(_))) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // A collected process is no longer waitable, so a second wait on the pid
-        // is what tells the two apart.
-        remember_started_service(started);
-        collect_exited_services();
-
-        // Safety: waits on a pid this test started, writing only to `status`.
-        let waited = unsafe {
-            let mut status = 0;
-            libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG)
-        };
-        assert_eq!(
-            waited, -1,
-            "the process must already have been collected, leaving nothing to wait on"
-        );
-    }
-
-    /// A service has to outlive the terminal that started it, which means
-    /// leaving the caller's session rather than being signalled along with it.
-    /// Read from the started process rather than from the flags asked for, since
-    /// the flags being set is not the property that matters.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_started_service_leaves_the_callers_session() {
-        let mut command = Command::new("sleep");
-        command
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        detach_from_caller(&mut command);
-
-        let mut started = command.spawn().expect("a stand-in process must start");
-        let started_session = session_of(started.id());
-        let _ = started.kill();
-        let _ = started.wait();
-
-        // Safety: reads no memory through pointers and cannot fail for 0.
-        let our_session = unsafe { libc::getsid(0) };
-
-        assert_ne!(started_session, -1, "the session must be readable");
-        assert_ne!(
-            started_session, our_session,
-            "a started service must lead a session of its own"
-        );
-    }
-
-    #[test]
-    fn a_process_running_no_service_has_no_stop_to_request() {
-        // No test registers a service process, so nothing recorded a request.
-        assert!(!service_runs_in_this_process());
-        assert!(!request_service_stop());
-    }
+    STOP_REQUEST
+        .get()
+        .is_some_and(|request| request.request_stop())
 }

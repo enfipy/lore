@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -27,6 +27,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::merge::merge3_text;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::revision;
 use crate::state;
@@ -107,7 +108,7 @@ impl EventError for DiffError {
 
 /// Data for the event carrying the diff of a single file.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDiffEventData {
     /// Path of the file.
@@ -979,6 +980,58 @@ async fn emit_move_diff(
     Ok(())
 }
 
+/// One entry of a walk over a patch: the start of a hunk, or one line of the
+/// hunk in progress numbered on each side it exists on.
+#[derive(Clone, Copy)]
+pub(crate) enum PatchEntry {
+    /// The start of a hunk, carrying the lines it spans on each side.
+    HunkStart {
+        old_range: diffy::HunkRange,
+        new_range: diffy::HunkRange,
+    },
+    /// A line present unchanged on both sides, 1-based on each.
+    Context { old: usize, new: usize },
+    /// A line present on the old side alone, 1-based.
+    Delete { old: usize },
+    /// A line present on the new side alone, 1-based.
+    Insert { new: usize },
+}
+
+/// Walk each hunk of `patch` in order, reporting its start and then each of its
+/// lines.
+///
+/// diffy reports the kind of every line and the range of every hunk, but no
+/// per-line numbers, so the numbering is counted here. Each number is 1-based
+/// and indexes the side of the patch it names.
+pub(crate) fn walk_patch(patch: &diffy::Patch<'_, str>, mut visit: impl FnMut(PatchEntry)) {
+    for hunk in patch.hunks() {
+        visit(PatchEntry::HunkStart {
+            old_range: hunk.old_range(),
+            new_range: hunk.new_range(),
+        });
+
+        let mut old = hunk.old_range().start();
+        let mut new = hunk.new_range().start();
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(_) => {
+                    visit(PatchEntry::Context { old, new });
+                    old += 1;
+                    new += 1;
+                }
+                diffy::Line::Delete(_) => {
+                    visit(PatchEntry::Delete { old });
+                    old += 1;
+                }
+                diffy::Line::Insert(_) => {
+                    visit(PatchEntry::Insert { new });
+                    new += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Normalise `old` and `new` per-line for comparison, run diffy, then re-emit
 /// the unified diff with original (un-normalised) line content. Returns
 /// `None` when no hunks remain after normalisation (i.e. the files are equal
@@ -987,6 +1040,7 @@ async fn emit_move_diff(
 /// The line count of each normalised side equals the line count of the
 /// original side, so diffy's 1-based hunk line numbers index back into the
 /// original line arrays correctly.
+#[lore_macro::test_pub]
 fn format_patch_preserving_originals(
     old: &str,
     new: &str,
@@ -997,14 +1051,8 @@ fn format_patch_preserving_originals(
     let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
     let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
 
-    let old_norm: String = old_lines
-        .iter()
-        .map(|l| normalise_line(l, ignore_eol, ignore_inline))
-        .collect();
-    let new_norm: String = new_lines
-        .iter()
-        .map(|l| normalise_line(l, ignore_eol, ignore_inline))
-        .collect();
+    let old_norm = normalise_text(old, ignore_eol, ignore_inline);
+    let new_norm = normalise_text(new, ignore_eol, ignore_inline);
 
     let patch = diffy::DiffOptions::new()
         .set_context_len(context_lines as usize)
@@ -1018,93 +1066,88 @@ fn format_patch_preserving_originals(
     out.push_str("--- original\n");
     out.push_str("+++ modified\n");
 
-    for hunk in patch.hunks() {
-        out.push_str(&format!(
-            "@@ -{} +{} @@\n",
-            hunk.old_range(),
-            hunk.new_range()
-        ));
-        let mut old_idx = hunk.old_range().start();
-        let mut new_idx = hunk.new_range().start();
-
-        for line in hunk.lines() {
-            match line {
-                diffy::Line::Context(_) => {
-                    let orig = old_lines
-                        .get(old_idx.saturating_sub(1))
-                        .copied()
-                        .unwrap_or("");
-                    write_patch_line(&mut out, ' ', orig);
-                    old_idx += 1;
-                    new_idx += 1;
-                }
-                diffy::Line::Delete(_) => {
-                    let orig = old_lines
-                        .get(old_idx.saturating_sub(1))
-                        .copied()
-                        .unwrap_or("");
-                    write_patch_line(&mut out, '-', orig);
-                    old_idx += 1;
-                }
-                diffy::Line::Insert(_) => {
-                    let orig = new_lines
-                        .get(new_idx.saturating_sub(1))
-                        .copied()
-                        .unwrap_or("");
-                    write_patch_line(&mut out, '+', orig);
-                    new_idx += 1;
-                }
-            }
+    walk_patch(&patch, |entry| match entry {
+        PatchEntry::HunkStart {
+            old_range,
+            new_range,
+        } => out.push_str(&format!("@@ -{old_range} +{new_range} @@\n")),
+        PatchEntry::Context { old, .. } => {
+            write_patch_line(&mut out, ' ', line_at(&old_lines, old));
         }
-    }
+        PatchEntry::Delete { old } => {
+            write_patch_line(&mut out, '-', line_at(&old_lines, old));
+        }
+        PatchEntry::Insert { new } => {
+            write_patch_line(&mut out, '+', line_at(&new_lines, new));
+        }
+    });
 
     Some(out)
 }
 
-/// Per-line normalisation. Keeps the trailing `\n` (if present) so the line
-/// count is preserved between original and normalised content. `\r` is
-/// treated as whitespace so the EOL/inline rules apply uniformly to LF and
-/// CRLF inputs.
-fn normalise_line(line: &str, ignore_eol: bool, ignore_inline: bool) -> String {
+/// The whole of one side, normalised a line at a time under the whitespace
+/// rules the caller selected, and `text` itself where no rule is selected.
+///
+/// The normalised side holds as many lines as the original, so a comparison of
+/// two normalised sides reports line numbers that index back into the originals.
+#[lore_macro::test_pub]
+pub(crate) fn normalise_text(text: &str, ignore_eol: bool, ignore_inline: bool) -> Cow<'_, str> {
+    if !ignore_eol && !ignore_inline {
+        return Cow::Borrowed(text);
+    }
+
+    // Normalising never lengthens a line, so one buffer the size of the input
+    // holds the result, and each line is written into it directly.
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        push_normalised_line(&mut out, line, ignore_eol, ignore_inline);
+    }
+    Cow::Owned(out)
+}
+
+/// Appends `line` to `out`, normalised. Keeps the trailing `\n` (if present)
+/// so the line count is preserved between original and normalised content.
+/// `\r` is treated as whitespace so the EOL/inline rules apply uniformly to LF
+/// and CRLF inputs.
+///
+/// Inline collapsing replaces runs of ASCII space, tab and CR with one space. It
+/// does not invent whitespace where there was none, and does not touch the
+/// terminator.
+fn push_normalised_line(out: &mut String, line: &str, ignore_eol: bool, ignore_inline: bool) {
     let (content, terminator) = match line.strip_suffix('\n') {
         Some(rest) => (rest, "\n"),
         None => (line, ""),
     };
 
-    let mut work = if ignore_inline {
-        collapse_inline_whitespace(content)
+    let start = out.len();
+    if ignore_inline {
+        let mut in_whitespace = false;
+        for c in content.chars() {
+            if c == ' ' || c == '\t' || c == '\r' {
+                if !in_whitespace {
+                    out.push(' ');
+                    in_whitespace = true;
+                }
+            } else {
+                out.push(c);
+                in_whitespace = false;
+            }
+        }
     } else {
-        content.to_string()
-    };
+        out.push_str(content);
+    }
 
     if ignore_eol {
-        let trimmed_len = work.trim_end_matches([' ', '\t', '\r']).len();
-        work.truncate(trimmed_len);
+        let trimmed_len = out[start..].trim_end_matches([' ', '\t', '\r']).len();
+        out.truncate(start + trimmed_len);
     }
 
-    work.push_str(terminator);
-    work
+    out.push_str(terminator);
 }
 
-/// Collapses runs of ASCII space/tab/CR to a single space. Does not invent
-/// whitespace where there was none, and does not touch newline characters
-/// (callers strip the terminator before invoking). Folding `\r` in keeps
-/// LF and CRLF line endings on equal footing for inline comparison.
-fn collapse_inline_whitespace(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_ws = false;
-    for c in s.chars() {
-        if c == ' ' || c == '\t' || c == '\r' {
-            if !in_ws {
-                out.push(' ');
-                in_ws = true;
-            }
-        } else {
-            out.push(c);
-            in_ws = false;
-        }
-    }
-    out
+/// One 1-based line of a side of a diff, and `""` past its end.
+fn line_at<'a>(lines: &[&'a str], number: usize) -> &'a str {
+    lines.get(number.saturating_sub(1)).copied().unwrap_or("")
 }
 
 /// Writes one unified-diff line. Every hunk-body line begins with its sentinel
@@ -1123,7 +1166,8 @@ fn write_patch_line(out: &mut String, sign: char, line: &str) {
 /// One side of a diff: either decoded display text, or a marker that the raw
 /// bytes were detected as binary (non-text) content. Binary content carries no
 /// text — it is never rendered through the diff/merge pipeline.
-enum DiffContent {
+#[lore_macro::test_pub]
+pub(crate) enum DiffContent {
     Text(String),
     Binary,
 }
@@ -1131,21 +1175,34 @@ enum DiffContent {
 impl DiffContent {
     /// An absent side (file missing on this revision / `/dev/null`). Treated as
     /// empty text, never binary.
+    #[lore_macro::test_pub]
     fn empty() -> Self {
         DiffContent::Text(String::new())
     }
 
-    fn is_binary(&self) -> bool {
+    #[lore_macro::test_pub]
+    pub(crate) fn is_binary(&self) -> bool {
         matches!(self, DiffContent::Binary)
     }
 
     /// The decoded text for a text side; `""` for binary. Callers short-circuit
     /// on `is_binary()` before reaching this, so the binary case is never read
     /// in practice.
-    fn text(&self) -> &str {
+    #[lore_macro::test_pub]
+    pub(crate) fn text(&self) -> &str {
         match self {
             DiffContent::Text(s) => s,
             DiffContent::Binary => "",
+        }
+    }
+
+    /// The decoded text for a text side, taken out of the content; empty for
+    /// binary.
+    #[lore_macro::test_pub]
+    pub(crate) fn into_text(self) -> String {
+        match self {
+            DiffContent::Text(s) => s,
+            DiffContent::Binary => String::new(),
         }
     }
 }
@@ -1159,6 +1216,7 @@ impl DiffContent {
 /// to preserve bytes. Everything else (null bytes, non-text MIME, Unreal
 /// packages, invalid UTF-8) is classified as binary, and its bytes are never
 /// decoded.
+#[lore_macro::test_pub]
 fn make_diff_content(bytes: &[u8]) -> DiffContent {
     if !bytes.is_empty() && !is_utf16_bom(bytes) && !infer_is_diffable_by_slice(bytes) {
         DiffContent::Binary
@@ -1177,6 +1235,8 @@ async fn diff_read_file(
         DiffSide::Working(operation) => {
             let content = operation
                 .content_source(relative_path)
+                .await
+                .forward::<DiffError>("naming the content of the file to diff")?
                 .read_all()
                 .await
                 .forward_any::<DiffError>("Failed reading file for diff")?;
@@ -1203,11 +1263,23 @@ async fn diff_read_file(
         (repository, state.clone())
     };
 
-    let Ok(node) = state.node(repository.clone(), node_link.node).await else {
-        return Err(DiffError::from(FileNotFound {
-            resource: relative_path.to_string(),
-        }));
-    };
+    read_node_content(repository, &state, node_link.node, relative_path).await
+}
+
+/// Read and classify the content of one file node in a revision.
+///
+/// The read falls through to the remote, so a sparse instance holding no local
+/// payload still answers. `relative_path` names the file in the errors alone.
+pub(crate) async fn read_node_content(
+    repository: Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node_id: NodeID,
+    relative_path: &RelativePath,
+) -> Result<DiffContent, DiffError> {
+    let node = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<DiffError>("reading the file's node")?;
 
     if !node.is_file() {
         return Err(DiffError::internal(format!(
@@ -1219,10 +1291,7 @@ async fn diff_read_file(
         repository.clone(),
         node.address,
         None,
-        read_options_from_repository(&repository)
-            .with_decompress()
-            .with_verify()
-            .with_remote(),
+        read_options_from_repository(&repository).with_decompress(),
     )
     .await
     .forward::<DiffError>("Failed reading data for diff")?;
@@ -1230,158 +1299,34 @@ async fn diff_read_file(
     Ok(make_diff_content(&content))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Read and classify the content of one file as the working tree holds it, and
+/// `None` where the working tree holds no file at that path.
+///
+/// A path the instance never materialized, one a view filter leaves out and one
+/// removed on disk are all no file, and so is a directory.
+pub(crate) async fn read_working_content(
+    repository: Arc<RepositoryContext>,
+    relative_path: &RelativePath,
+) -> Result<Option<DiffContent>, DiffError> {
+    with_operation(repository.file_system(), async |operation| {
+        let info = operation
+            .file_info(relative_path)
+            .await
+            .forward_any::<DiffError>("Failed reading working tree file information")?;
 
-    #[test]
-    fn make_diff_content_empty_is_text() {
-        let c = make_diff_content(b"");
-        assert!(!c.is_binary());
-        assert_eq!(c.text(), "");
-    }
+        if !info.is_file() {
+            return Ok(None);
+        }
 
-    #[test]
-    fn make_diff_content_valid_utf8_is_text() {
-        let c = make_diff_content(b"hello\nworld\n");
-        assert!(!c.is_binary());
-        assert_eq!(c.text(), "hello\nworld\n");
-    }
+        let content = operation
+            .content_source(relative_path)
+            .await
+            .forward::<DiffError>("naming the content of the working tree file")?
+            .read_all()
+            .await
+            .forward_any::<DiffError>("Failed reading file from the working tree")?;
 
-    #[test]
-    fn make_diff_content_utf16_le_bom_is_text() {
-        // UTF-16 BOM is exempt: the diff path renders it as readable text,
-        // matching the test_file_diff_utf16be smoke test.
-        let mut bytes = vec![0xFF, 0xFE];
-        bytes.extend("Hi\n".encode_utf16().flat_map(u16::to_le_bytes));
-        let c = make_diff_content(&bytes);
-        assert!(!c.is_binary(), "UTF-16 LE BOM must remain diffable as text");
-        assert_eq!(c.text(), "Hi\n");
-    }
-
-    #[test]
-    fn make_diff_content_null_bytes_is_binary() {
-        let c = make_diff_content(&[0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00]);
-        assert!(c.is_binary());
-    }
-
-    #[test]
-    fn make_diff_content_invalid_utf8_is_binary() {
-        let c = make_diff_content(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-        assert!(c.is_binary());
-    }
-
-    #[test]
-    fn diff_content_empty_constructor_is_text() {
-        let c = DiffContent::empty();
-        assert!(!c.is_binary());
-        assert_eq!(c.text(), "");
-    }
-
-    #[test]
-    fn normalise_line_strips_trailing_whitespace() {
-        assert_eq!(normalise_line("foo   \n", true, false), "foo\n");
-        assert_eq!(normalise_line("foo\t\t\n", true, false), "foo\n");
-        assert_eq!(normalise_line("foo", true, false), "foo");
-        assert_eq!(normalise_line("foo   ", true, false), "foo");
-    }
-
-    #[test]
-    fn normalise_line_collapses_runs() {
-        assert_eq!(normalise_line("a  b   c\n", false, true), "a b c\n");
-        assert_eq!(normalise_line("a\t\tb\n", false, true), "a b\n");
-        // Internal whitespace gone entirely is NOT invented back.
-        assert_eq!(normalise_line("abc\n", false, true), "abc\n");
-    }
-
-    #[test]
-    fn normalise_line_both_flags() {
-        assert_eq!(normalise_line("a  b   \n", true, true), "a b\n");
-    }
-
-    #[test]
-    fn normalise_line_crlf_trailing_treated_as_whitespace() {
-        // CRLF inputs (e.g. Python text-mode writes on Windows) must compare equal
-        // to LF inputs under ignore_eol — the trailing `\r` counts as EOL whitespace.
-        assert_eq!(normalise_line("foo   \r\n", true, false), "foo\n");
-        assert_eq!(normalise_line("foo\r\n", true, false), "foo\n");
-        // No-flag path keeps the `\r` intact.
-        assert_eq!(normalise_line("foo\r\n", false, false), "foo\r\n");
-    }
-
-    #[test]
-    fn ignore_eol_trailing_space_no_diff() {
-        let old = "foo\nbar\n";
-        let new = "foo  \nbar\n";
-        // With the flag on, no hunks should be produced.
-        assert!(format_patch_preserving_originals(old, new, 3, true, false).is_none());
-    }
-
-    #[test]
-    fn ignore_eol_preserves_originals_in_real_change() {
-        // Two lines: line 1 has trailing-whitespace-only diff, line 2 has a real diff.
-        let old = "foo  \nbar\nbaz\n";
-        let new = "foo  \nBAR\nbaz\n";
-        let out = format_patch_preserving_originals(old, new, 3, true, false)
-            .expect("real change should produce a hunk");
-        // The unchanged "foo  " line must keep its trailing whitespace in the options.
-        assert!(
-            out.contains(" foo  \n"),
-            "context line should show original whitespace:\n{out}"
-        );
-        assert!(out.contains("-bar\n"));
-        assert!(out.contains("+BAR\n"));
-    }
-
-    #[test]
-    fn ignore_inline_collapses_runs_no_diff() {
-        let old = "a b c\n";
-        let new = "a  b   c\n";
-        assert!(format_patch_preserving_originals(old, new, 3, false, true).is_none());
-    }
-
-    #[test]
-    fn ignore_inline_does_not_invent_whitespace() {
-        // "abc" → "a bc" introduces whitespace where none existed; must still diff.
-        let old = "abc\n";
-        let new = "a bc\n";
-        let out = format_patch_preserving_originals(old, new, 3, false, true)
-            .expect("introducing whitespace must still register as a change");
-        assert!(out.contains("-abc\n"));
-        assert!(out.contains("+a bc\n"));
-    }
-
-    #[test]
-    fn both_flags_combined_suppress_all_whitespace_only_diffs() {
-        let old = "foo\nbar  baz\n";
-        let new = "foo   \nbar baz\n";
-        assert!(format_patch_preserving_originals(old, new, 3, true, true).is_none());
-    }
-
-    #[test]
-    fn context_lines_respected_with_flags() {
-        let old = "a\nb\nc\nx\ne\nf\ng\n";
-        let new = "a\nb\nc\nX\ne\nf\ng\n";
-        let out = format_patch_preserving_originals(old, new, 0, true, false)
-            .expect("real change should produce a hunk");
-        // context=0 means no surrounding lines in the hunk.
-        assert!(out.contains("@@ -4 +4 @@\n"), "got:\n{out}");
-        assert!(out.contains("-x\n"));
-        assert!(out.contains("+X\n"));
-        // No surrounding context lines.
-        assert!(!out.contains(" c\n"));
-        assert!(!out.contains(" e\n"));
-    }
-
-    #[test]
-    fn missing_newline_marker_when_input_lacks_terminator() {
-        let old = "foo";
-        let new = "bar";
-        let out = format_patch_preserving_originals(old, new, 3, true, false)
-            .expect("differing single-line files should diff");
-        assert!(
-            out.contains("\\ No newline at end of file\n"),
-            "expected no-newline marker, got:\n{out}"
-        );
-    }
+        Ok(Some(make_diff_content(&content)))
+    })
+    .await
 }

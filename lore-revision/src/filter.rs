@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use bitflags::bitflags;
 use dashmap::DashMap;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::bitflagsops;
@@ -332,9 +331,9 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
 /// file asked for and nothing downstream can tell, which is the same reason
 /// [`load_filter`] refuses a file it cannot decode whole.
 ///
-/// The driver leaves the sibling behind on failure and gives its cleanup to the
-/// caller, so a failure removes it. Nothing reports it while it exists: it is
-/// named with [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
+/// A save whose write, sync or rename fails removes the sibling, and one stopped
+/// part way leaves it. Nothing reports it while it exists: it is named with
+/// [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
 /// working-tree scanners skip.
 pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
     let path = path.as_ref();
@@ -352,25 +351,19 @@ pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::R
         }
         out.push('\n');
     }
-    let temp_path = temp_sibling(path);
-    let saved = lore_io::IoDriver::global()
+    lore_io::IoDriver::global()
         .write_file_segments_atomic(
-            &temp_path,
+            temp_sibling(path),
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true),
             vec![out.into_bytes()],
+            true,
+            (),
         )
-        .await;
-
-    if saved.is_err() {
-        // The target is unchanged, so the sibling is all there is to clean up.
-        // Its own failure is not worth reporting over the one that got here.
-        let _ = lore_io::IoDriver::global().remove_file(&temp_path).await;
-    }
-    saved
+        .await
 }
 
 /// The temporary file [`save`] builds the new contents of `path` in, beside it
@@ -543,6 +536,7 @@ fn path_prefixes(full: &str, is_directory: bool) -> impl Iterator<Item = (&str, 
 /// one rule's line with another rule's depth and so answer for a rule that is
 /// neither. Only ever towards "a rule reaches here", which is the direction the
 /// index answers every uncertain case in.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RuleReach {
     /// One past the highest line of a rule recorded here; zero for none.
@@ -554,6 +548,7 @@ struct RuleReach {
 impl RuleReach {
     /// The reach of the one rule on line `line`, which matches at most `depth`
     /// path components.
+    #[lore_macro::test_pub]
     fn rule(line: usize, depth: u32) -> Self {
         Self {
             lines: line as u32 + 1,
@@ -573,6 +568,7 @@ impl RuleReach {
     /// The depth comparison is strict because every query asks about what lies
     /// *below* a path: a rule that cannot match more than `depth` components
     /// cannot match anything deeper than the directory being asked about.
+    #[lore_macro::test_pub]
     fn reaches(self, floor: u32, depth: u32) -> bool {
         self.lines > floor && self.depth > depth
     }
@@ -847,6 +843,7 @@ impl FilterInstance {
     /// `**/a/b` is not the same as `a/b`: it names `b` directly under any `a`, so
     /// it keeps the prefix and is matched against the whole path. A bare `**`
     /// names no component at all and is matched against the whole path too.
+    #[lore_macro::test_pub]
     fn compile(glob: &str) -> (String, bool, bool) {
         let leading_separator = glob.starts_with('/');
         let ending_separator = glob.ends_with('/');
@@ -891,6 +888,7 @@ impl FilterInstance {
     /// `filter_from_source_changes` builds a filter per three-way diff with up
     /// to `SOURCE_FILTER_THRESHOLD` rules in it, so a second scan per rule is
     /// paid there.
+    #[lore_macro::test_pub]
     fn depth_range(glob: &str, filename: bool) -> (u32, u32) {
         if filename {
             return (1, u32::MAX);
@@ -1250,7 +1248,7 @@ impl FilterInstance {
 
 /// Data for the event emitted when a path is excluded by a filter.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFilterExcludeEventData {
     /// Reason the path was excluded.
@@ -1754,81 +1752,5 @@ impl Filter {
             }
             None => false,
         }
-    }
-}
-
-/// The arithmetic behind a [`RuleIndex`] answer, which nothing outside the
-/// module can reach. The behaviour it produces is asserted in `tests/filter.rs`.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Both bounds over every construct the compiler can hand the index.
-    ///
-    /// The upper bound is the one that has to be an over-estimate: it decides
-    /// whether a rule is dropped from an answer, and a bound that is too small
-    /// drops content with nothing downstream able to tell. It is checked beside
-    /// the lower one, since a pair that crossed would describe a rule able to
-    /// match at no depth at all.
-    ///
-    /// The compiled glob is asserted too, because the bounds read the compiled
-    /// text rather than the authored rule, and the interesting rows differ in
-    /// how `compile` treats them: a leading separator is what decides whether
-    /// `*` is a name rule or a path one, and `**/a/b` keeps a prefix that
-    /// `**/name` loses.
-    #[test]
-    fn the_depth_bounds_agree_on_every_glob_shape() {
-        // Authored rule, compiled glob, name rule, fewest, most.
-        let cases: &[(&str, &str, bool, u32, u32)] = &[
-            ("/Engine/Intermediate", "engine/intermediate", false, 2, 2),
-            ("/*", "*", false, 1, 1),
-            ("/Some/**/Path", "some/**/path", false, 2, u32::MAX),
-            ("*.tmp", "*.tmp", true, 1, u32::MAX),
-            ("Thumbs.db", "thumbs.db", true, 1, u32::MAX),
-            ("**/a/b", "**/a/b", false, 2, u32::MAX),
-            ("**/node_modules", "node_modules", true, 1, u32::MAX),
-            ("/engine/**", "engine/**", false, 2, u32::MAX),
-            ("**", "**", false, 1, u32::MAX),
-            // A brace group expands to no more components than its text, so
-            // counting the text stays an upper bound over both alternatives.
-            ("/a{b,c/d}", "a{b,c/d}", false, 2, 2),
-        ];
-
-        for (rule, glob, filename, min, max) in cases {
-            let (compiled, compiled_filename, _) = FilterInstance::compile(rule);
-            assert_eq!(
-                (compiled.as_str(), compiled_filename),
-                (*glob, *filename),
-                "{rule} compiled to something else"
-            );
-            assert_eq!(
-                FilterInstance::depth_range(glob, *filename),
-                (*min, *max),
-                "{rule} has different bounds"
-            );
-            assert!(*min <= *max, "{rule} can match at no depth at all");
-        }
-    }
-
-    /// A reach holding no rule matters to no query, whatever it is asked, and
-    /// line zero still matters to a floor of zero.
-    ///
-    /// The default is what every unvisited node carries and what a filter with
-    /// no rules of that polarity carries throughout, which is the commonest
-    /// filter there is. Line zero is the boundary the count encoding turns on:
-    /// one off and either no rule is ever consulted or an empty index answers
-    /// for a rule it does not hold.
-    #[test]
-    fn an_empty_reach_reaches_nothing() {
-        let empty = RuleReach::default();
-        for floor in [0, 1, u32::MAX] {
-            for depth in [0, 1, u32::MAX] {
-                assert!(!empty.reaches(floor, depth), "floor {floor}, depth {depth}");
-            }
-        }
-        assert!(
-            RuleReach::rule(0, 1).reaches(0, 0),
-            "the first line of a filter has to clear a floor of zero"
-        );
     }
 }

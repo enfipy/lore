@@ -27,6 +27,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -108,10 +109,27 @@ pub fn validate_fragment_payload(
 /// where they do not, but only at ingress, and a store may already hold one from before that
 /// boundary existed: its payload is shorter than the content it claims, so it is not the content.
 pub(crate) fn payload_is_content(fragment: &Fragment) -> bool {
+    payload_is_plain(fragment) && fragment.size_payload as u64 == fragment.size_content
+}
+
+/// Whether the payload is neither a fragment list nor compressed.
+fn payload_is_plain(fragment: &Fragment) -> bool {
     let fragmented =
         (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented;
     let compressed = (fragment.flags & FragmentFlags::PayloadCompressed) != 0;
-    !fragmented && !compressed && fragment.size_payload as u64 == fragment.size_content
+    !fragmented && !compressed
+}
+
+/// Refuse a plain payload ([`payload_is_plain`]), which is the content, whose size differs from
+/// the content size it claims.
+pub(crate) fn validate_plain_payload_size(fragment: &Fragment) -> Result<(), StoreError> {
+    if payload_is_plain(fragment) && fragment.size_payload as u64 != fragment.size_content {
+        return Err(StoreError::internal(format!(
+            "uncompressed unfragmented fragment has mismatching size_payload {} and size_content {}",
+            fragment.size_payload, fragment.size_content
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse content the destination has no room for, rather than truncating it.
@@ -151,18 +169,128 @@ const FRAGMENT_FLAGS_DEFINED_COMPRESSORS: u32 = FragmentFlags::PayloadCompressed
 /// - Compressed fragments have `size_content <= FRAGMENT_SIZE_THRESHOLD`
 /// - Uncompressed, unfragmented fragments have `size_payload == size_content`
 ///
-/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) and
-/// the replication-store Put call this at ingress so malformed metadata fails
-/// fast with a specific error rather than propagating into the store layer.
+/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) call
+/// this at ingress so malformed metadata fails fast with a specific error
+/// rather than propagating into the store layer. A valid fragment passes in a
+/// few inlined instructions; the error is built in a cold function.
+#[inline]
 pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
-    validate_fragment_size(fragment)?;
+    if fragment_metadata_is_valid(fragment) {
+        return Ok(());
+    }
+    refuse_fragment_metadata(fragment)
+}
 
+/// Whether a put of `fragment`, with a payload of `payload_len` bytes when there is one, is one a
+/// store keeps: [`fragment_is_consistent`] passes the fragment, a fragment list's payload size is
+/// a whole number of references, and the payload is the size it says. One expression, so that a
+/// local store's put, which nearly always passes, spends a few instructions on it and calls
+/// nothing.
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn put_is_valid(fragment: &Fragment, payload_len: Option<usize>) -> bool {
+    fragment_is_consistent(fragment)
+        && (fragment.flags & FragmentFlags::PayloadFragmented.bits() == 0
+            || (fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>()))
+        && payload_len.is_none_or(|len| len == fragment.size_payload as usize)
+}
+
+/// Why a put [`put_is_valid`] refuses is refused. Unless `enforced`, only the size checks of
+/// [`validate_fragment_payload`], or of [`validate_fragment_size`] without a payload, are made.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+pub(crate) fn refuse_put(
+    fragment: &Fragment,
+    payload_len: Option<usize>,
+    enforced: bool,
+) -> Result<(), StoreError> {
+    if !enforced {
+        return match payload_len {
+            Some(len) => validate_fragment_payload(fragment, len),
+            None => validate_fragment_size(fragment),
+        };
+    }
+    refuse_inconsistency(fragment)?;
+    if fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0
+        && !(fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>())
+    {
+        return Err(StoreError::internal(format!(
+            "fragment list of {} bytes is not a whole number of references",
+            fragment.size_payload
+        )));
+    }
+    if let Some(len) = payload_len {
+        validate_fragment_payload(fragment, len)?;
+    }
+    Ok(())
+}
+
+/// The checks of [`validate_fragment_metadata`] as one expression, without saying which fails.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_metadata_is_valid(fragment: &Fragment) -> bool {
+    fragment.flags & !FragmentFlags::all().bits() == 0
+        && fragment.flags
+            & FragmentFlags::PayloadCompressed.bits()
+            & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
+            == 0
+        && fragment_is_consistent(fragment)
+}
+
+/// Whether nothing `fragment` says contradicts what this build knows, as one expression: no
+/// server-managed flag, at most one compression bit, not compressed and fragmented at once, and
+/// sizes within their bounds and agreeing with each other. A flag bit this build gives no meaning
+/// is not checked.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_is_consistent(fragment: &Fragment) -> bool {
+    let flags = fragment.flags;
+    let compressed = flags & FragmentFlags::PayloadCompressed.bits();
+    let fragmented = flags & FragmentFlags::PayloadFragmented.bits() != 0;
+    let size_payload = u64::from(fragment.size_payload);
+    let threshold = crate::FRAGMENT_SIZE_THRESHOLD as u64;
+    flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED == 0
+        && compressed & compressed.wrapping_sub(1) == 0
+        && (compressed == 0 || !fragmented)
+        && size_payload != 0
+        && size_payload <= threshold
+        && size_payload <= fragment.size_content
+        && (fragmented || fragment.size_content <= threshold)
+        && (compressed != 0 || fragmented || size_payload == fragment.size_content)
+}
+
+/// Which check of [`validate_fragment_metadata`] `fragment` fails, for one
+/// [`fragment_metadata_is_valid`] refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
     if fragment.flags & !FragmentFlags::all().bits() != 0 {
         return Err(StoreError::internal(format!(
             "fragment flags contain unknown bits: {:#x}",
             fragment.flags & !FragmentFlags::all().bits()
         )));
     }
+
+    let reserved = fragment.flags
+        & FragmentFlags::PayloadCompressed.bits()
+        & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS;
+    if reserved != 0 {
+        return Err(StoreError::internal(format!(
+            "fragment has reserved compression bit set: {reserved:#x}"
+        )));
+    }
+
+    refuse_inconsistency(fragment)
+}
+
+/// Which check of [`fragment_is_consistent`] `fragment` fails, for one it refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_inconsistency(fragment: &Fragment) -> Result<(), StoreError> {
+    validate_fragment_size(fragment)?;
 
     if fragment.flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED != 0 {
         return Err(StoreError::internal(format!(
@@ -175,12 +303,6 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
     if compressed_bits.count_ones() > 1 {
         return Err(StoreError::internal(format!(
             "fragment has multiple compression flags set: {compressed_bits:#x}"
-        )));
-    }
-    if compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS != 0 {
-        return Err(StoreError::internal(format!(
-            "fragment has reserved compression bit set: {:#x}",
-            compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
         )));
     }
 
@@ -215,14 +337,7 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
         }));
     }
 
-    if !is_compressed && !is_fragmented && fragment.size_payload as u64 != fragment.size_content {
-        return Err(StoreError::internal(format!(
-            "uncompressed unfragmented fragment has mismatching size_payload {} and size_content {}",
-            fragment.size_payload, fragment.size_content
-        )));
-    }
-
-    Ok(())
+    validate_plain_payload_size(fragment)
 }
 
 /// Validate a fragmented fragment's payload bytes as a well-formed list of
@@ -334,11 +449,83 @@ pub async fn query_one(
     Ok(result[0])
 }
 
+/// A claim on `store` for a task spawned to outlive the operation spawning it, which the span
+/// covering that operation no longer covers once it ends.
+///
+/// `joined` is what [`ImmutableStore::try_join_claim`] returned to the operation before it
+/// spawned the task: a guard on the span's flock, which holds it without a gap from the
+/// operation to the end of the work it spawned. Where the operation could not join, the task
+/// claims `store` here as its first step, see [`ImmutableStore::hold_for_task`]. Held until the
+/// task ends. `None` for a store with nothing on disk to claim, or where the claim cannot be
+/// taken, which leaves the task's operations to claim for themselves and fail as they would have.
+///
+/// The claim keeps the flock and covers no operation: once the span has ended, each of the
+/// task's operations takes a guard of its own, and an operation outside the task does not run on
+/// a claim that ends with the task.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn claim_for_task(
+    store: &Arc<dyn ImmutableStore>,
+    joined: Option<StoreGuard>,
+) -> impl Future<Output = Option<StoreGuard>> + '_ {
+    async move {
+        if joined.is_some() {
+            return joined;
+        }
+        store.clone().hold_for_task().await.ok().flatten()
+    }
+}
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
     fn is_local(&self) -> bool {
         false
+    }
+
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, or one repository command.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. There is no default answer: every store decides for itself, so a
+    /// wrapper around a store with files on disk delegates to it rather than answering
+    /// `None`, which would open a handle holding nothing that then reads and writes a
+    /// store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError>;
+
+    /// Joins the claim this process holds on this store, without waiting: a counted guard when
+    /// the store's flock is held and this store is current, `None` otherwise and for a store
+    /// with nothing on disk to claim.
+    ///
+    /// Taken by an operation for work it spawns to outlive it: see [`claim_for_task`]. A wrapper
+    /// delegates it as it delegates [`Self::hold_for_command`].
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
+    }
+
+    /// Claims this store for work spawned to outlive the operation that started it, where the
+    /// operation could not join its claim: as [`Self::hold_for_command`], but the guard keeps the
+    /// flock for that work and covers no operation, see [`claim_for_task`]. The default is
+    /// [`Self::hold_for_command`]; a store with files on disk, and a wrapper around one, override
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold_for_command`].
+    async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.hold_for_command().await
     }
 
     /// Whether this store refuses to serve a payload it only found under another partition.
@@ -399,17 +586,19 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
     ) -> Result<StoreGetData, StoreError>;
 
-    /// Read the payload stored under `address`, into `dst` when the payload is the content itself
-    /// and into a buffer of its own otherwise, reporting the fragment that describes it.
+    /// Read the payload stored under `address`, or the content a store expanded from it on receipt
+    /// ([`StoreGetData::content`]), into `dst` when it is the content itself and into a buffer of
+    /// its own otherwise, reporting the fragment that describes what was read.
     ///
-    /// One lookup settles where the payload belongs and reads it there, so a reader that already
-    /// has somewhere for the content to go pays no second lookup either way. What a returned
-    /// payload has to become — expanded, or walked as a fragment list — is the reader's to do; this
-    /// only decides where the stored bytes land. A payload `dst` has no room for is [`Oversized`];
-    /// a returned one is the reader's to size.
+    /// One lookup settles where the bytes belong and reads them there, so a reader that already has
+    /// somewhere for the content to go pays no second lookup either way. What returned bytes have
+    /// to become — expanded, or walked as a fragment list — is the reader's to do; this only
+    /// decides where they land. Bytes `dst` has no room for are [`Oversized`]; returned ones are
+    /// the reader's to size.
     ///
-    /// The default implementation goes through [`get`](ImmutableStore::get) and copies. A store
-    /// overrides it to read its index once and have the read itself land in `dst`.
+    /// The default implementation goes through [`get`](ImmutableStore::get) and copies the content
+    /// where the store expanded one, and the payload otherwise. A store overrides it to read its
+    /// index once and have the read itself land in `dst`.
     async fn get_into(
         self: Arc<Self>,
         partition: Partition,
@@ -417,26 +606,22 @@ pub trait ImmutableStore: Any + Send + Sync {
         dst: &mut crate::CallerBuffer,
     ) -> Result<(Fragment, PayloadRead), StoreError> {
         let data = self.get(partition, address).await?;
-        let fragment = data.fragment;
-        let payload = data
-            .payload
-            .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?;
+        let (fragment, payload) = match data.content {
+            Some(content) => content,
+            None => (
+                data.fragment,
+                data.payload
+                    .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?,
+            ),
+        };
         validate_fragment_payload(&fragment, payload.len())?;
 
         if !payload_is_content(&fragment) {
             return Ok((fragment, PayloadRead::Returned(payload)));
         }
 
-        let capacity = dst.len();
-        let Some(target) = dst.as_mut_slice().get_mut(..payload.len()) else {
-            return Err(StoreError::from(Oversized {
-                context: format!(
-                    "payload of {} bytes exceeds the {capacity} byte destination buffer",
-                    payload.len()
-                ),
-            }));
-        };
-        target.copy_from_slice(&payload);
+        validate_buffer_capacity(payload.len(), dst.len())?;
+        dst.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
         Ok((fragment, PayloadRead::IntoBuffer))
     }
 
@@ -550,6 +735,12 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Return the current resume point for compaction
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize>;
 
+    /// Load every part of the index the store otherwise loads on demand. The default loads
+    /// nothing.
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Stop eviction and compaction, returning once the passes in flight have given up.
     /// With `terminate` the stop stays raised and the store never collects again; without
     /// it the stop is lifted before returning, since a store is shared by path and a caller
@@ -593,18 +784,15 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Every store supporting `copy` supports both. The exact form is the one that can be answered
     /// with a keyed read, so a caller holding a context passes it.
     ///
-    /// `durable` controls the destination's `PayloadStoredDurable` flag: pass `true` only when
-    /// the caller has independent confirmation that the destination tuple is durably stored
-    /// (typically a successful remote round-trip). The source's own durable flag never
-    /// propagates — durability is a per-(partition, address) property and a local copy of an
-    /// already-durable source does not make the new destination tuple durable.
+    /// `behavior` carries what the caller knows that the store cannot see for itself; see
+    /// [`CopyBehavior`].
     async fn copy(
         self: Arc<Self>,
         source_partition: Partition,
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError>;
 
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>
@@ -621,479 +809,19 @@ impl Debug for dyn ImmutableStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use zerocopy::IntoBytes;
-
-    use super::*;
-    use crate::Hash;
-
-    fn make_fragment(size_payload: u32) -> Fragment {
-        Fragment {
-            flags: 0,
-            size_payload,
-            size_content: size_payload as u64,
-        }
-    }
-
-    #[test]
-    fn validate_size_accepts_zero() {
-        assert!(validate_fragment_size(&make_fragment(0)).is_ok());
-    }
-
-    #[test]
-    fn validate_size_accepts_exact_threshold() {
-        let fragment = make_fragment(crate::FRAGMENT_SIZE_THRESHOLD as u32);
-        assert!(validate_fragment_size(&fragment).is_ok());
-    }
-
-    #[test]
-    fn validate_size_rejects_over_threshold() {
-        let fragment = make_fragment(crate::FRAGMENT_SIZE_THRESHOLD as u32 + 1);
-        let err = validate_fragment_size(&fragment).expect_err("should reject oversize");
-        assert!(matches!(err, StoreError::Oversized(_)));
-    }
-
-    #[test]
-    fn validate_size_rejects_oversized_unfragmented_content() {
-        // size_payload within bounds but size_content over threshold: must be caught to
-        // prevent downstream callers (e.g. decompress) from pre-allocating a huge buffer.
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: 128,
-            size_content: crate::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
-        };
-        let err = validate_fragment_size(&fragment).expect_err("should reject oversize content");
-        assert!(matches!(err, StoreError::Oversized(_)));
-    }
-
-    #[test]
-    fn validate_payload_accepts_matching() {
-        let fragment = make_fragment(128);
-        assert!(validate_fragment_payload(&fragment, 128).is_ok());
-    }
-
-    #[test]
-    fn validate_payload_rejects_length_mismatch() {
-        let fragment = make_fragment(128);
-        let err = validate_fragment_payload(&fragment, 127).expect_err("should reject mismatch");
-        assert!(matches!(err, StoreError::Internal(_)));
-    }
-
-    #[test]
-    fn validate_payload_rejects_oversize_before_mismatch() {
-        // Oversize must be reported even when the buffer length also doesn't match,
-        // because the oversize check happens first.
-        let fragment = make_fragment(crate::FRAGMENT_SIZE_THRESHOLD as u32 + 1);
-        let err = validate_fragment_payload(&fragment, 0).expect_err("should reject oversize");
-        assert!(matches!(err, StoreError::Oversized(_)));
-    }
-
-    mod validate_metadata {
-        use super::*;
-
-        #[test]
-        fn accepts_uncompressed_unfragmented() {
-            assert!(validate_fragment_metadata(&make_fragment(128)).is_ok());
-        }
-
-        #[test]
-        fn rejects_zero_size_payload() {
-            let err = validate_fragment_metadata(&make_fragment(0)).expect_err("size_payload=0");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_oversize_payload() {
-            let fragment = make_fragment(crate::FRAGMENT_SIZE_THRESHOLD as u32 + 1);
-            let err = validate_fragment_metadata(&fragment).expect_err("oversize");
-            assert!(matches!(err, StoreError::Oversized(_)));
-        }
-
-        #[test]
-        fn rejects_size_payload_greater_than_size_content() {
-            let fragment = Fragment {
-                flags: 0,
-                size_payload: 100,
-                size_content: 50,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("payload > content");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_unknown_flag_bits() {
-            let fragment = Fragment {
-                flags: 1 << 31,
-                size_payload: 128,
-                size_content: 128,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("unknown flags");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_multiple_compression_flags() {
-            let fragment = Fragment {
-                flags: (FragmentFlags::PayloadCompressedLZ4 | FragmentFlags::PayloadCompressedZstd)
-                    .into(),
-                size_payload: 100,
-                size_content: 200,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("multi compression");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_reserved_compression_bit() {
-            // bit 4 is inside PayloadCompressed mask but not a defined compressor
-            let fragment = Fragment {
-                flags: 1 << 4,
-                size_payload: 100,
-                size_content: 200,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("reserved compression bit");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_obliterated_flag_on_ingress() {
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadObliterated.into(),
-                size_payload: 128,
-                size_content: 128,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("obliterated");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_do_not_replicate_flag_on_ingress() {
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadDoNotReplicate.into(),
-                size_payload: 128,
-                size_content: 128,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("do_not_replicate");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn accepts_local_cache_priority_on_ingress() {
-            // PayloadLocalCachePriority is a client-set write hint that must
-            // persist through the storage system; it must not be rejected at
-            // validation.
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadLocalCachePriority.into(),
-                size_payload: 128,
-                size_content: 128,
-            };
-            assert!(validate_fragment_metadata(&fragment).is_ok());
-        }
-
-        #[test]
-        fn accepts_payload_stored_flags() {
-            // PayloadStored* is set by peers during replication and cleared by the
-            // Put handler; it must not be rejected at validation.
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadStoredDurable.into(),
-                size_payload: 128,
-                size_content: 128,
-            };
-            assert!(validate_fragment_metadata(&fragment).is_ok());
-        }
-
-        #[test]
-        fn rejects_compressed_and_fragmented_combo() {
-            let fragment = Fragment {
-                flags: (FragmentFlags::PayloadCompressedLZ4 | FragmentFlags::PayloadFragmented)
-                    .into(),
-                size_payload: 80,
-                size_content: 200,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("compressed+fragmented");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_uncompressed_unfragmented_size_mismatch() {
-            let fragment = Fragment {
-                flags: 0,
-                size_payload: 100,
-                size_content: 200,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("size mismatch");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn accepts_compressed_with_shrinking_content() {
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadCompressedLZ4.into(),
-                size_payload: 100,
-                size_content: 200,
-            };
-            assert!(validate_fragment_metadata(&fragment).is_ok());
-        }
-
-        #[test]
-        fn rejects_compressed_with_oversize_content() {
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadCompressedLZ4.into(),
-                size_payload: 100,
-                size_content: crate::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
-            };
-            let err = validate_fragment_metadata(&fragment).expect_err("oversize content");
-            assert!(matches!(err, StoreError::Oversized(_)));
-        }
-
-        #[test]
-        fn accepts_fragmented_with_large_content() {
-            // Fragmented fragments address total file content that can far exceed
-            // FRAGMENT_SIZE_THRESHOLD; size_content is only bounded for non-fragmented
-            // fragments (where it drives the decompress allocation).
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadFragmented.into(),
-                size_payload: 80,
-                size_content: 10 * 1024 * 1024 * 1024, // 10 GiB
-            };
-            assert!(validate_fragment_metadata(&fragment).is_ok());
-        }
-    }
-
-    mod sanitise_behavior_flags {
-        use super::*;
-
-        mod do_not_replicate {
-            use super::*;
-
-            #[test]
-            fn strips_and_returns_true() {
-                let mut fragment = make_fragment(128);
-                fragment.flags |= FragmentFlags::PayloadDoNotReplicate;
-
-                let behaviour = sanitise_fragment_behavior_flags(&mut fragment);
-
-                assert!(behaviour.do_not_replicate);
-                assert_eq!(fragment.flags & FragmentFlags::PayloadDoNotReplicate, 0);
-            }
-
-            #[test]
-            fn returns_false_when_flag_absent() {
-                let mut fragment = make_fragment(128);
-
-                let behaviour = sanitise_fragment_behavior_flags(&mut fragment);
-
-                assert!(!behaviour.do_not_replicate);
-                assert_eq!(fragment.flags, 0);
-            }
-        }
-
-        #[test]
-        fn preserves_other_flags() {
-            let mut fragment = make_fragment(128);
-            fragment.flags |=
-                FragmentFlags::PayloadStoredDurable | FragmentFlags::PayloadDoNotReplicate;
-
-            let behaviour = sanitise_fragment_behavior_flags(&mut fragment);
-
-            assert!(behaviour.do_not_replicate);
-            assert_ne!(fragment.flags & FragmentFlags::PayloadStoredDurable, 0);
-            assert_eq!(fragment.flags & FragmentFlags::PayloadDoNotReplicate, 0);
-        }
-    }
-
-    mod validate_list {
-        use super::*;
-
-        fn make_refs_payload(refs: &[FragmentReference]) -> Bytes {
-            Bytes::copy_from_slice(refs.as_bytes())
-        }
-
-        fn make_fragmented(refs_len: usize, size_content: u64) -> Fragment {
-            Fragment {
-                flags: FragmentFlags::PayloadFragmented.into(),
-                size_payload: (refs_len * std::mem::size_of::<FragmentReference>()) as u32,
-                size_content,
-            }
-        }
-
-        #[test]
-        fn accepts_well_formed_list() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 2000);
-            let payload = make_refs_payload(&refs);
-            assert!(validate_fragment_list(&fragment, &payload).is_ok());
-        }
-
-        #[test]
-        fn rejects_non_multiple_of_ref_size() {
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadFragmented.into(),
-                size_payload: 41,
-                size_content: 1000,
-            };
-            let payload = Bytes::from(vec![0u8; 41]);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("non-multiple");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_payload_length_mismatch() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 1000);
-            // Report payload bytes but declare more payload via size_payload
-            let short_payload = Bytes::from(vec![0u8; fragment.size_payload as usize - 40]);
-            let err = validate_fragment_list(&fragment, &short_payload)
-                .expect_err("payload len mismatch");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_fewer_than_two_refs() {
-            let refs = [FragmentReference {
-                hash: Hash::default(),
-                offset_content: 0,
-            }];
-            let fragment = make_fragmented(refs.len(), 1000);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("<2 refs");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_non_increasing_offsets() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 2000);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("non-increasing");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_equal_offsets() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 2000);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("equal offsets");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_last_offset_at_content_end() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 2000,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 2000);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("last at end");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_last_offset_beyond_content_end() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 3000,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 2000);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("last beyond");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn rejects_content_end_overflow() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: u64::MAX - 10,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: u64::MAX,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 100);
-            let payload = make_refs_payload(&refs);
-            let err = validate_fragment_list(&fragment, &payload).expect_err("overflow");
-            assert!(matches!(err, StoreError::Internal(_)));
-        }
-
-        #[test]
-        fn accepts_non_zero_first_offset() {
-            // Interior/child-list case
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 10_000_000,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 10_500_000,
-                },
-            ];
-            let fragment = make_fragmented(refs.len(), 1_000_000);
-            let payload = make_refs_payload(&refs);
-            assert!(validate_fragment_list(&fragment, &payload).is_ok());
-        }
-    }
+/// What a caller of [`ImmutableStore::copy`] knows about the copy that the store it asks cannot
+/// establish for itself.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyBehavior {
+    /// Controls the destination's `PayloadStoredDurable` flag: pass `true` only with independent
+    /// confirmation that the destination tuple is durably stored, typically a successful remote
+    /// round trip. The source's own durable flag never propagates — durability is a
+    /// per-(partition, address) property, so copying an already-durable source does not make the
+    /// destination tuple durable.
+    pub durable: bool,
+    /// Whether the store must keep the copy to itself rather than passing it on to its own write
+    /// replicas. Set by a caller that has already taken responsibility for replicating it, since a
+    /// store fanning out on its own behalf can otherwise send the copy back to the region it came
+    /// from.
+    pub do_not_replicate: bool,
 }

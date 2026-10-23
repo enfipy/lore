@@ -276,7 +276,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,
@@ -301,7 +301,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,

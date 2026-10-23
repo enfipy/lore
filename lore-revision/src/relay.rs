@@ -26,9 +26,9 @@ use crate::util;
 /// optional `Bytes` keepalive that pins a buffer referenced by the
 /// event's payload for the duration of the callback invocation.
 ///
-/// The only event that uses the keepalive today is
-/// `LoreEvent::StorageGetData`, whose `LoreBytes` view points into the
-/// carried `Bytes`. The forwarder holds the `Bytes` clone while the
+/// The events that use the keepalive today are `LoreEvent::StorageGetData`
+/// and `LoreEvent::StorageGetFragment`, whose `LoreBytes` views point into
+/// the carried `Bytes`. The forwarder holds the `Bytes` clone while the
 /// callback runs, then drops it. Since `Bytes` is itself refcounted,
 /// the caller's task may drop its own clone as soon as `send_with_bytes`
 /// returns — the buffer stays alive until every registered keepalive
@@ -62,6 +62,7 @@ struct Holds {
     settled: bool,
 }
 
+#[lore_macro::test_pub]
 pub struct EventDispatcher {
     pub correlation_id: String,
     pub completed: CancellationToken,
@@ -143,6 +144,7 @@ impl EventDispatcher {
         }
     }
 
+    #[lore_macro::test_pub]
     fn sender(&self) -> Option<UnboundedSender<DispatchedEvent>> {
         self.weak_sender
             .as_ref()
@@ -272,216 +274,5 @@ impl EventDispatcher {
             location: Default::default(),
             message: message.into(),
         }
-    }
-}
-
-#[cfg(test)]
-mod complete_outcome_tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    use super::EventDispatcher;
-    use crate::event::LoreCompleteEventData;
-    use crate::event::LoreErrorDetail;
-    use crate::event::LoreEvent;
-    use crate::interface::LoreString;
-
-    // Captures the single `Complete` event a `complete` call emits. The
-    // callback is the real dispatch boundary, so the assertion reads the
-    // event a consumer would actually receive.
-    fn capture_complete(error: LoreErrorDetail) -> LoreCompleteEventData {
-        let captured: Arc<Mutex<Option<LoreCompleteEventData>>> = Arc::new(Mutex::new(None));
-        let sink = captured.clone();
-        let callback: crate::interface::LoreEventCallback =
-            Some(Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::Complete(data) = event {
-                    *sink.lock().unwrap() = Some(data.clone());
-                }
-            }));
-
-        let dispatcher = EventDispatcher::new(callback);
-        lore_base::runtime::runtime().block_on(dispatcher.complete(error));
-
-        let data = captured.lock().unwrap().take();
-        data.expect("complete must emit a Complete event")
-    }
-
-    #[test]
-    fn default_detail_completes_with_status_zero_and_empty_detail() {
-        let data = capture_complete(LoreErrorDetail::default());
-
-        assert_eq!(data.status, 0);
-        assert_eq!(data.error.error_code, 0);
-        assert!(data.error.message.is_empty());
-        assert!(data.error.trace_locations.is_empty());
-    }
-
-    #[test]
-    fn populated_detail_completes_with_its_code_and_carries_detail() {
-        let detail = LoreErrorDetail {
-            error_code: 13,
-            message: LoreString::from("not found"),
-            ..LoreErrorDetail::default()
-        };
-
-        let data = capture_complete(detail);
-
-        // `status` is the detail's `error_code`, so the two agree.
-        assert_eq!(data.status, 13);
-        assert_eq!(data.error.error_code, 13);
-        assert_eq!(data.error.message.as_str(), "not found");
-    }
-}
-
-#[cfg(test)]
-mod drain_tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use lore_base::lore_spawn;
-
-    use super::EventDispatcher;
-    use crate::event::LoreErrorDetail;
-    use crate::event::LoreEvent;
-    use crate::logging::LoreLogLevel;
-
-    /// A caller that reads what its callback collected once `complete` returns
-    /// must see everything sent ahead of `Complete`, however busy the other
-    /// tasks sharing the dispatcher are. A send in flight on another task used
-    /// to read as a subscription holding the channel open, so `drain` returned
-    /// without waiting and the CLI could print — or exit — before its events
-    /// arrived.
-    #[test]
-    fn complete_waits_for_delivery_while_another_task_is_sending() {
-        let delivered: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = delivered.clone();
-        let callback: crate::interface::LoreEventCallback =
-            Some(Box::new(move |event: &LoreEvent| {
-                // Lag behind the senders, so that the queue is never empty when
-                // `complete` looks.
-                std::thread::sleep(Duration::from_millis(1));
-                sink.lock().unwrap().push(event.clone());
-            }));
-        let dispatcher = Arc::new(EventDispatcher::new(callback));
-
-        // A task that logs while the command completes, the way a session
-        // release or a store flush does.
-        let done = Arc::new(AtomicBool::new(false));
-        let busy = {
-            let dispatcher = dispatcher.clone();
-            let done = done.clone();
-            lore_spawn!(async move {
-                while !done.load(Ordering::Relaxed) {
-                    dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
-                        LoreLogLevel::Trace,
-                        "busy".to_string(),
-                    )));
-                    tokio::task::yield_now().await;
-                }
-            })
-        };
-
-        for _ in 0..20 {
-            dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
-                LoreLogLevel::Info,
-                "before complete".to_string(),
-            )));
-        }
-        let status = lore_base::runtime::runtime().block_on(async {
-            let status = dispatcher.complete(LoreErrorDetail::default()).await;
-            done.store(true, Ordering::Relaxed);
-            let _ = busy.await;
-            status
-        });
-        assert_eq!(status, 0);
-
-        let delivered = delivered.lock().unwrap();
-        let complete_at = delivered
-            .iter()
-            .position(|event| matches!(event, LoreEvent::Complete(_)))
-            .expect("Complete must have been through the callback when complete returns");
-        let before = delivered[..complete_at]
-            .iter()
-            .filter(|event| {
-                matches!(event, LoreEvent::Log(log) if log.message.as_str() == "before complete")
-            })
-            .count();
-        assert_eq!(
-            before, 20,
-            "every event sent ahead of Complete arrives ahead of it"
-        );
-    }
-
-    /// A hold is what keeps `complete` from waiting: a subscription's events
-    /// come after the command has answered, and so does `End`.
-    #[test]
-    fn a_hold_lets_events_through_after_complete_and_ends_when_dropped() {
-        let delivered: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = delivered.clone();
-        let callback: crate::interface::LoreEventCallback =
-            Some(Box::new(move |event: &LoreEvent| {
-                sink.lock().unwrap().push(event.clone());
-            }));
-        let dispatcher = EventDispatcher::new(callback);
-        let hold = dispatcher.keep_open().expect("channel is open");
-
-        lore_base::runtime::runtime().block_on(async {
-            dispatcher.complete(LoreErrorDetail::default()).await;
-            dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
-                LoreLogLevel::Info,
-                "after complete".to_string(),
-            )));
-            drop(hold);
-            dispatcher.completed.cancelled().await;
-        });
-
-        let delivered = delivered.lock().unwrap();
-        let kinds: Vec<&str> = delivered
-            .iter()
-            .map(|event| match event {
-                LoreEvent::Complete(_) => "complete",
-                LoreEvent::Log(log) if log.message.as_str() == "after complete" => "after",
-                LoreEvent::End(_) => "end",
-                _ => "other",
-            })
-            .filter(|kind| *kind != "other")
-            .collect();
-        assert_eq!(kinds, ["complete", "after", "end"]);
-    }
-
-    /// A drain that has settled on waiting refuses a hold, whatever the channel's senders say.
-    /// A `send` holds an upgraded sender for the length of its push, so a hold granted on the
-    /// strength of one alone would keep open the channel the drain is waiting to see closed.
-    #[test]
-    fn a_hold_is_refused_behind_a_settled_drain() {
-        let callback: crate::interface::LoreEventCallback = Some(Box::new(|_event: &LoreEvent| {}));
-        let dispatcher = Arc::new(EventDispatcher::new(callback));
-
-        lore_base::runtime::runtime().block_on(async {
-            // Stands in for the upgrade a `send` holds while it pushes: a sender the dispatcher
-            // does not own and no hold accounts for.
-            let in_flight = dispatcher.sender().expect("channel is open");
-
-            let draining = {
-                let dispatcher = dispatcher.clone();
-                lore_spawn!(async move { dispatcher.drain().await })
-            };
-
-            // The forwarder is held for the length of the join, so a drain that has it is one
-            // that has settled and is waiting.
-            while dispatcher.forwarder.try_lock().is_ok() {
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                dispatcher.keep_open().is_none(),
-                "a hold behind a settled drain keeps open the channel it waits on"
-            );
-
-            drop(in_flight);
-            draining.await.expect("the draining task");
-        });
     }
 }

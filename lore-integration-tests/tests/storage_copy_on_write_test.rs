@@ -46,6 +46,7 @@ mod storage_copy_on_write_tests {
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -115,6 +116,16 @@ mod storage_copy_on_write_tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.is_local()
         }
@@ -184,7 +195,7 @@ mod storage_copy_on_write_tests {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.copies.fetch_add(1, Ordering::SeqCst);
             self.copy_sources
@@ -203,7 +214,7 @@ mod storage_copy_on_write_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }

@@ -11,11 +11,20 @@
 mod guard;
 mod log;
 mod metrics;
+#[cfg(not(feature = "test-util"))]
 mod protocol;
+#[cfg(feature = "test-util")]
+pub mod protocol;
+#[cfg(not(feature = "test-util"))]
 mod resource;
+#[cfg(feature = "test-util")]
+pub mod resource;
 pub mod resource_provider;
 mod tokio_bridge;
+#[cfg(not(feature = "test-util"))]
 mod trace;
+#[cfg(feature = "test-util")]
+pub mod trace;
 
 use std::fs::File;
 
@@ -49,6 +58,7 @@ use tracing_subscriber::registry::Registry;
 /// Defaults to warnings, so a server started without `RUST_LOG` reports the
 /// conditions an operator has to act on. An empty or unparsable set of
 /// directives leaves that default in force.
+#[lore_macro::test_pub]
 fn log_filter(directives: &str) -> EnvFilter {
     EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
@@ -242,37 +252,5 @@ impl TelemetryInitializer {
             .internal("Failed to initialize tracing subscriber")?;
 
         Ok(self.guard)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn max_level(directives: &str) -> Option<LevelFilter> {
-        <EnvFilter as Layer<Registry>>::max_level_hint(&log_filter(directives))
-    }
-
-    /// A standalone server start sets no `RUST_LOG`, and an operator running
-    /// one wants to see the warnings it emits.
-    #[test]
-    fn no_directives_enable_warnings() {
-        assert_eq!(max_level(""), Some(LevelFilter::WARN));
-    }
-
-    #[test]
-    fn a_directive_overrides_the_default() {
-        assert_eq!(max_level("info"), Some(LevelFilter::INFO));
-    }
-
-    /// A large deployment cuts the output back down to errors alone.
-    #[test]
-    fn errors_only_remains_available() {
-        assert_eq!(max_level("error"), Some(LevelFilter::ERROR));
-    }
-
-    #[test]
-    fn an_unparsable_directive_leaves_the_default_in_force() {
-        assert_eq!(max_level("=!=not a directive=!="), Some(LevelFilter::WARN));
     }
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_base::error::*;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
+use lore_error_set::ForwardAny;
 use lore_error_set::ForwardStrict;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
@@ -38,6 +39,7 @@ use crate::repository::RemoteState;
 use crate::repository::RepositoryConfig;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryPaths;
+use crate::repository::claim_opened_stores;
 use crate::repository::create_client_immutable_store;
 use crate::repository::create_client_mutable_store;
 use crate::repository::load_repository_config_from_dot_dir;
@@ -100,13 +102,28 @@ pub enum SwfsWorkError {
     MissingIdentity,
 }
 
+#[derive(Debug, Default)]
+struct InternalState {
+    repository_state: Option<Arc<State>>,
+}
+
+impl InternalState {
+    pub fn set_repository_state(&mut self, repository_state: Option<Arc<State>>) {
+        self.repository_state = repository_state;
+    }
+
+    pub fn current_read_state(&self) -> Option<Arc<State>> {
+        self.repository_state.clone()
+    }
+}
+
 /// Everything that defines a SWFS-mounted repository, excluding the result of the actual mount
 /// itself.
 #[derive(Debug)]
 pub struct MountResources {
     global_args: LoreGlobalArgs,
     repository: Arc<RepositoryContext>,
-    state: RwLock<Option<Arc<State>>>,
+    internal_state: RwLock<InternalState>,
     _instance_id: InstanceId,
     _name: String,
     pub name_nul_terminated: CString,
@@ -165,7 +182,7 @@ impl MountResources {
             .internal("Creating write directory for SWFS mount")?;
         let dot_directory = instance_directory.join(DOT_LORE);
 
-        let immutable_store = create_client_immutable_store(
+        let (immutable_store, opening) = create_client_immutable_store(
             config,
             &dot_directory,
             config
@@ -183,26 +200,35 @@ impl MountResources {
         .await
         .internal("Creating immutable store")?;
 
-        let mutable_store =
-            create_client_mutable_store(config, &dot_directory, immutable_store.clone())
-                .await
-                .internal("Creating mutable store")?;
+        // A mount uses its stores for as long as it is mounted, so it claims them for that
+        // long, as a command does for its duration; the operations it serves then take
+        // nothing of their own.
+        let (immutable_store, mutable_store, stores) =
+            claim_opened_stores(immutable_store, opening, |immutable_store| {
+                create_client_mutable_store(config, &dot_directory, immutable_store)
+            })
+            .await
+            .forward_any::<SwfsMountError>("Creating and claiming the stores for the mount")?;
 
         let name = hex::encode(instance_id.data());
 
-        let repository = Arc::new(RepositoryContext::new_with_state(
-            Some(RepositoryPaths::new(
-                mount_path.as_ref().to_path_buf(),
-                dot_directory,
-            )),
-            immutable_store,
-            mutable_store,
-            repository_id,
-            instance_id,
-            RemoteState::Offline,
-            Arc::new(Filter::default()),
-            Some(Arc::new(InvalidFilesystemProvider {})),
-        ));
+        let mutable_store: Arc<dyn lore_storage::MutableStore> = mutable_store;
+        let repository = Arc::new(
+            RepositoryContext::new_with_state(
+                Some(RepositoryPaths::new(
+                    mount_path.as_ref().to_path_buf(),
+                    dot_directory,
+                )),
+                immutable_store,
+                mutable_store,
+                repository_id,
+                instance_id,
+                RemoteState::Offline,
+                Arc::new(Filter::default()),
+                Some(Arc::new(InvalidFilesystemProvider {})),
+            )
+            .with_store_hold(stores),
+        );
         repository.set_disable_cache(false);
 
         let repo_path = mount_path
@@ -216,7 +242,7 @@ impl MountResources {
                 ..execution.globals().clone()
             },
             repository,
-            state: RwLock::new(None),
+            internal_state: RwLock::default(),
             _instance_id: instance_id,
             name_nul_terminated: CString::new(name.as_str())
                 .internal("Nul terminating mount name")?,
@@ -257,13 +283,17 @@ impl MountResources {
         LORE_CONTEXT.scope(execution_context, f).await
     }
 
-    fn current_state(&self) -> Result<Option<Arc<State>>, SwfsWorkError> {
-        Ok(self.state.read().clone())
+    pub fn repository(&self) -> Arc<RepositoryContext> {
+        self.repository.clone()
+    }
+
+    pub fn current_read_state(&self) -> Option<Arc<State>> {
+        self.internal_state.read().current_read_state()
     }
 
     pub async fn update_state(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
         let current_anchor = load_current_anchor(&self.repository).await;
-        *self.state.write() = match current_anchor {
+        let new_state = match current_anchor {
             Ok((current_revision, _)) => Some(
                 state::State::deserialize(self.repository.clone(), current_revision)
                     .await
@@ -271,6 +301,7 @@ impl MountResources {
             ),
             Err(_) => None,
         };
+        self.internal_state.write().set_repository_state(new_state);
         Ok(())
     }
 
@@ -279,8 +310,12 @@ impl MountResources {
         _token: SwfsExecutionToken,
         path: &RelativePath,
     ) -> Result<FileInfo, SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(FileInfo::NotExist);
+        let Some(state) = self.current_read_state() else {
+            return if path.is_empty() {
+                Ok(FileInfo::Directory)
+            } else {
+                Err(SwfsWorkError::internal("Node does not exist"))
+            };
         };
         let node = state
             .find_node(self.repository.clone(), path.as_str())
@@ -301,9 +336,12 @@ impl MountResources {
         file_range: Range<usize>,
         output_bytes: &mut [u8],
     ) -> Result<(usize, FileInfo), SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            crate::lore_debug!("SWFS read_file: no state available");
-            return Ok((0, FileInfo::NotExist));
+        let Some(state) = self.current_read_state() else {
+            return if swfs_path.is_root() {
+                Ok((0, FileInfo::Directory))
+            } else {
+                Err(SwfsWorkError::internal("Node does not exist"))
+            };
         };
         let node_path = swfs_path.node_path()?;
         crate::lore_trace!(
@@ -350,10 +388,9 @@ impl MountResources {
         _token: SwfsExecutionToken,
         swfs_path: SwfsPath<'_>,
     ) -> Result<SwfsFileArray, SwfsWorkError> {
-        let Some(state) = self.current_state()? else {
-            return Ok(SwfsFileArray::empty());
+        let Some(state) = self.current_read_state() else {
+            return Ok(SwfsFileArray::new(Vec::new()));
         };
-
         let node_path = swfs_path.node_path()?;
         let directory_node_id = if swfs_path.0 == "\\" {
             ROOT_NODE
@@ -378,11 +415,18 @@ impl MountResources {
                 .node(self.repository.clone(), child_id)
                 .await
                 .forward::<SwfsWorkError>("Finding child node in state")?;
+            child
+                .walk_step(child_id, directory_node_id, &mut cycle)
+                .forward::<SwfsWorkError>("Invalid node hierarchy in SWFS enumerate directory")?;
+            child_iter = child.sibling();
             let (child_node_name, child_node_path) = {
-                let child_node_name = state
-                    .node_name_ref(self.repository.clone(), child_id)
+                let Some(child_node_name) = state
+                    .node_name_ref_or_skip(self.repository.clone(), child_id)
                     .await
-                    .forward::<SwfsWorkError>("Finding child node name")?;
+                    .forward::<SwfsWorkError>("Finding child node name")?
+                else {
+                    continue;
+                };
                 let child_node_name: &str = child_node_name.as_ref();
                 (
                     CString::new(child_node_name).internal("Making CString from file name")?,
@@ -400,11 +444,6 @@ impl MountResources {
                 SwfsFile::new(child_node_name, &file_info, None)
                     .forward::<SwfsWorkError>("Constructing file info")?,
             );
-
-            child
-                .walk_step(child_id, directory_node_id, &mut cycle)
-                .forward::<SwfsWorkError>("Invalid node hierarchy in SWFS enumerate directory")?;
-            child_iter = child.sibling();
         }
 
         Ok(SwfsFileArray::new(files))

@@ -16,7 +16,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::RevisionListIdentifier;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::mpsc;
@@ -685,25 +684,31 @@ pub async fn diff3_with_source_cap(
     };
 
     for change in joined_changes {
-        tx.send(Ok(DiffItem::Change(change)))
+        let permit = tx
+            .reserve()
             .await
-            .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Change(change)));
     }
     for (source_change, target_change) in final_conflicts {
-        tx.send(Ok(DiffItem::Conflict(Box::new((
+        let permit = tx
+            .reserve()
+            .await
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Conflict(Box::new((
             source_change,
             target_change,
-        )))))
-        .await
-        .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+        )))));
     }
     Ok(summary)
 }
 
+#[lore_macro::test_pub]
 fn is_below(mount: &RelativePath, path: &RelativePath) -> bool {
     mount.covers(path) && mount != path
 }
 
+#[lore_macro::test_pub]
 fn push_unique_path(paths: &mut Vec<RelativePath>, path: &RelativePath) {
     if !paths.contains(path) {
         paths.push(path.clone());
@@ -1058,13 +1063,20 @@ async fn find_last_modified_revision(
     Ok((last_modified_revision, last_modified_revision_number))
 }
 
+/// Finds the last revision of `source_branch` that the target branch merged the file of `change`
+/// from, walking the file's history back from the target side of `change` to the branch point.
+///
+/// Each step reads the earlier revision's history at the node ID the history records for the file
+/// there, as a revision need not number the file as its first parent does. The walk ends at a
+/// revision that [adds the file without a merge](added_without_merge), the start revision included.
+#[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
 ) -> Result<Option<(Hash, u64)>, StateError> {
-    let (state_start, node_current) = if change.to.mapping.node.is_valid_node_id() {
+    let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
         (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
@@ -1122,6 +1134,14 @@ async fn find_last_merged_revision(
     // see if we arrive on source branch along any merge, and if that target revision
     // is later than the last modified revision we identified from the source branch file history
     let repository = change.to.mapping.repository.clone();
+    if node_current.is_valid_node_id()
+        && let Some(delta) = state_start
+            .node_delta(repository.clone(), node_current)
+            .await?
+        && added_without_merge(delta.action, delta.flags)
+    {
+        return Ok(None);
+    }
     let mut state_current = state_start.clone();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
@@ -1139,8 +1159,8 @@ async fn find_last_merged_revision(
                     "{} branch {} revision {} node {} history is a merge, {:?} check if other parent {} is from branch {}",
                     change.path().as_str(),
                     target_branch,
-                    node_current,
                     state_current.revision(),
+                    node_current,
                     node,
                     node.revision[1],
                     source_branch
@@ -1191,6 +1211,10 @@ async fn find_last_merged_revision(
                 );
             }
 
+            if added_without_merge(node.action[0], node.flags[0]) {
+                break;
+            }
+
             if let Ok(state_previous) =
                 state::State::deserialize(repository.clone(), node.revision[0]).await
             {
@@ -1210,6 +1234,7 @@ async fn find_last_merged_revision(
                         state_previous.revision()
                     );
                     state_current = state_previous;
+                    node_current = node.node[0];
                 }
             } else {
                 lore_warn!("Failed to deserialize state when walking source branch file history");
@@ -1224,6 +1249,13 @@ async fn find_last_merged_revision(
     }
 
     Ok(None)
+}
+
+/// Whether `action` and `flags` record a file added in its revision without a merge, which leaves
+/// no history of the file before that revision: a node reused for the file still holds the history
+/// of the file that had it before.
+fn added_without_merge(action: u16, flags: u16) -> bool {
+    action == FileAction::Add as u16 && flags & change::Flags::Merge.bits() == 0
 }
 
 pub struct TreeResult {
@@ -1253,7 +1285,7 @@ pub async fn tree(
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRevisionResolveTarget {
     /// A revision by its number on the branch.
@@ -1270,7 +1302,7 @@ pub enum LoreRevisionResolveTarget {
 /// a long stretch of history. A specifier that names no branch resolves to
 /// itself and reports nothing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionResolveEventData {
     /// Repository identifier in which repository
@@ -1685,7 +1717,7 @@ pub(crate) async fn resolve(
     signature: impl AsRef<str>,
     search_location: ResolveSearchLocation,
 ) -> Result<Hash, StateError> {
-    resolve_revision(repository, signature, search_location)
+    resolve_revision(repository, signature, None, search_location)
         .await
         .map(|(revision, _named_branch)| revision)
 }
@@ -1718,7 +1750,7 @@ pub async fn resolve_in_branch(
     search_location: ResolveSearchLocation,
 ) -> Result<ResolvedRevision, StateError> {
     let (revision, named_branch) =
-        resolve_revision(repository.clone(), signature, search_location).await?;
+        resolve_revision(repository.clone(), signature, None, search_location).await?;
 
     // Taken for the revision reached rather than the one named, since a `~<count>`
     // walk can cross the branch point into the branch this one was created from.
@@ -1729,11 +1761,14 @@ pub async fn resolve_in_branch(
 
 /// The revision a specifier names, and the branch it named to find it in.
 ///
-/// See [`resolve_in_branch`] for the specifier forms. The branch is reported as
-/// named rather than as the revision is taken on, which reads the revision.
-async fn resolve_revision(
+/// See [`resolve_in_branch`] for the specifier forms. A target given without a
+/// branch is taken on `implied_branch`, or on the branch the instance is on
+/// where that is `None`. The branch is reported as named rather than as the
+/// revision is taken on, which reads the revision.
+pub(crate) async fn resolve_revision(
     repository: Arc<RepositoryContext>,
     signature: impl AsRef<str>,
+    implied_branch: Option<BranchId>,
     search_location: ResolveSearchLocation,
 ) -> Result<(Hash, Option<(BranchId, Hash)>), StateError> {
     let original_input = signature.as_ref();
@@ -1773,15 +1808,19 @@ async fn resolve_revision(
         revision = parse_hash_signature(signature, original_input)?;
         lore_debug!("Resolved direct hash signature: {revision}");
     } else {
-        // An empty prefix is the branch the instance is on, which is what makes
-        // the `@` optional: no branch reads as a target, so a specifier carrying
-        // one and a specifier carrying none cannot be confused.
+        // An empty prefix names no branch, which is what makes the `@`
+        // optional: no branch reads as a target, so a specifier carrying one
+        // and a specifier carrying none cannot be confused.
         let (prefix, suffix) = signature.split_once("@").unwrap_or(("", signature));
         let target = branch_target(suffix, original_input)?;
 
         lore_debug!("Resolving branch {prefix} signature {signature}");
         let (branch, branch_metadata) = if prefix.is_empty() {
-            (current_anchor_branch(&repository).await?, Hash::default())
+            let branch = match implied_branch {
+                Some(branch) => branch,
+                None => current_anchor_branch(&repository).await?,
+            };
+            (branch, Hash::default())
         } else {
             let branch_status = branch::resolve(repository.clone(), prefix)
                 .await
@@ -1874,31 +1913,4 @@ async fn resolve_revision(
     }
 
     Ok((revision, named_branch))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn path(text: &str) -> RelativePath {
-        RelativePath::new_from_initial_path(text).expect("valid path")
-    }
-
-    #[test]
-    fn is_below_accepts_only_paths_inside_the_mount() {
-        assert!(is_below(&path("shared"), &path("shared/a.txt")));
-        assert!(is_below(&path("shared"), &path("shared/deep/a.txt")));
-        assert!(!is_below(&path("shared"), &path("shared")));
-        assert!(!is_below(&path("shared"), &path("shared-other/a.txt")));
-        assert!(!is_below(&path("shared"), &path("root.txt")));
-    }
-
-    #[test]
-    fn push_unique_path_holds_one_entry_per_path() {
-        let mut paths = Vec::new();
-        push_unique_path(&mut paths, &path("shared"));
-        push_unique_path(&mut paths, &path("shared"));
-        push_unique_path(&mut paths, &path("other"));
-        assert_eq!(paths.len(), 2);
-    }
 }

@@ -22,13 +22,14 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
+use crate::grpc::may_delete_repository;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -40,25 +41,16 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
-
-    // TODO(mjansson): Once the authz model has read/write/admin, replace
-    // the service-account bypass with a proper permission check.
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    let (_metadata, extensions, req) = request.into_parts();
 
     let id: RepositoryId = Context::from(req.id).into();
     let execution = setup_execution(module_path!(), correlation_id, user_id);
@@ -76,15 +68,16 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if let Some(auth_url) = auth_url {
-                repository_delete_auth_resource(auth_url, authorization, id).await?;
-            } else if metadata.creator != user_id && !bypass_protection {
+            if !may_delete_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
+                .await
+            {
                 info!(
-                    "Repository delete refused, user {user_id} is not creator {}",
+                    "Repository delete refused for user {user_id}, creator {}",
                     metadata.creator
                 );
                 return Err(Status::permission_denied("Not repository owner"));
             }
+            registry.remove(authorization, id).await?;
 
             repository::store_name_to_id(
                 repository.clone(),
@@ -157,110 +150,4 @@ pub async fn handler(
             }))
         })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_revision::repository::RepositoryMetadata;
-    use rand::random;
-
-    use super::*;
-    use crate::auth::jwt::AuthorizationToken;
-    use crate::store::test_store_create;
-
-    struct TestInstrumentProvider;
-
-    impl InstrumentProvider for TestInstrumentProvider {
-        fn namespace(&self) -> &'static str {
-            "test"
-        }
-    }
-
-    async fn seed_repository(
-        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-        mutable_store: Arc<dyn lore_storage::MutableStore>,
-        id: RepositoryId,
-        creator: &str,
-    ) {
-        let repository = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            id,
-        ));
-        let metadata_hash = repository::metadata_store(
-            repository.clone(),
-            RepositoryMetadata {
-                name: "the-repository".to_string(),
-                creator: creator.to_string(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("Failed to store repository metadata");
-        repository::metadata_store_hash(repository.clone(), metadata_hash)
-            .await
-            .expect("Failed to store repository metadata hash");
-        repository::store_name_to_id(repository, "the-repository", id)
-            .await
-            .expect("Failed to store repository name to id mapping");
-    }
-
-    fn delete_request(
-        id: RepositoryId,
-        token: AuthorizationToken,
-    ) -> Request<RepositoryDeleteRequest> {
-        let id_bytes: Context = id.into();
-        let mut request = Request::new(RepositoryDeleteRequest {
-            id: id_bytes.into(),
-        });
-        request.extensions_mut().insert(token);
-        request
-    }
-
-    /// The creator check compares the recorded creator against the token's
-    /// `identity_claim` value, so a deployment recording
-    /// `preferred_username` lets the same user, presenting the same claim,
-    /// delete — while the subject the provider minted alongside is not what
-    /// is compared.
-    #[tokio::test]
-    async fn the_creator_check_compares_the_identity_claim() {
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let id = random::<RepositoryId>();
-            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
-
-            let by_subject = AuthorizationToken {
-                user_id: "f7d3a1c2-0000-0000-0000-000000000000".to_string(),
-                preferred_username: Some("alice".to_string()),
-                ..Default::default()
-            };
-            let status = handler(
-                delete_request(id, by_subject.clone()),
-                None,
-                immutable_store.clone(),
-                mutable_store.clone(),
-                &TestInstrumentProvider,
-            )
-            .await
-            .expect_err("the subject is not the recorded creator");
-            assert_eq!(status.code(), tonic::Code::PermissionDenied);
-
-            let by_username = AuthorizationToken {
-                identity: Some("alice".to_string()),
-                ..by_subject
-            };
-            handler(
-                delete_request(id, by_username),
-                None,
-                immutable_store,
-                mutable_store,
-                &TestInstrumentProvider,
-            )
-            .await
-            .expect("the identity claim matches the recorded creator");
-        }))
-        .await;
-    }
 }

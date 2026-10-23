@@ -1,180 +1,103 @@
 use std::future::Future;
-use std::pin::pin;
 
+use lore_base::lore_spawn;
+use lore_error_set::internal::SupportsInternalError;
 use tokio::sync::mpsc;
+
+/// Items the channel holds before a producer's `send` starts waiting.
+///
+/// Backpressure is the point: a producer that runs ahead of its consumer is made to
+/// wait rather than allowed to buffer a whole result, which for a repository with no
+/// bound on its size is the difference between a fixed cost and an unbounded one.
+#[lore_macro::test_pub]
+const CAPACITY: usize = 256;
 
 /// Drain a streaming producer into a `Vec` alongside a summary value for
 /// callers that do not benefit from streaming.
 ///
 /// The producer takes an `mpsc::Sender` and emits `Ok(T)` items as it goes,
 /// returning `Ok(S)` on success (where `S` is some summary or metadata
-/// value — use `()` when there is none) or `Err(E)` on failure. Runs the
-/// producer concurrently with a receive loop in the same task via
-/// `tokio::select!`, so there is no `tokio::spawn` and no `JoinError`.
-/// When the producer completes first, the loop drains any remaining
-/// buffered items before returning.
+/// value — use `()` when there is none) or `Err(E)` on failure.
+///
+/// **The producer runs as its own task, so nothing here can cancel it.** A
+/// `JoinHandle` released without being awaited leaves its task running, where a
+/// future dropped where it stood takes with it every task that future had spawned
+/// into a `JoinSet`. That difference is the whole reason for the spawn: it holds
+/// whether this function returns early, and whether its own caller is dropped.
+///
+/// A producer whose consumer has gone away is stopped by the channel rather than by
+/// cancellation — its next `send` fails, which is a result it can report.
 ///
 /// Returns `Ok((S, Vec<T>))` — the summary first, then every item the
-/// producer emitted. First error wins: a producer error or an `Err(E)`
-/// item short-circuits the drain and propagates up.
+/// producer emitted.
+///
+/// **A failure stops the producer without cancelling it.** The first error closes
+/// the channel, so the producer's next `send` fails — a result it handles like any
+/// other, which ends the work it would have started next. The receive loop goes on
+/// draining what was already sent and then waits for the producer, so work it had
+/// already started — tasks it spawned included — runs to completion and reports,
+/// and the error reaches the caller only once nothing is still in flight.
+///
+/// Draining to the end is also what keeps the join from waiting forever. The
+/// channel is bounded, so items left in it leave the producer blocked in `send`
+/// and this function blocked on the producer.
+///
+/// Items drained after the first error are dropped rather than accumulated: the
+/// caller is given an error, never a partial `Vec`, so keeping them would grow a
+/// buffer nobody reads.
+///
+/// An item error wins over the producer's own result. It is the earlier failure,
+/// and a producer that reports its items' errors through the channel may well
+/// return `Ok` regardless.
 pub async fn collect_stream_with_summary<T, S, E, Fut>(
     f: impl FnOnce(mpsc::Sender<Result<T, E>>) -> Fut,
 ) -> Result<(S, Vec<T>), E>
 where
-    Fut: Future<Output = Result<S, E>>,
+    Fut: Future<Output = Result<S, E>> + Send + 'static,
+    T: Send + 'static,
+    S: Send + 'static,
+    E: SupportsInternalError + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::channel(256);
-    let mut driver = pin!(f(tx));
+    let (tx, mut rx) = mpsc::channel(CAPACITY);
+    let producer = lore_spawn!(f(tx));
     let mut out = Vec::new();
-    let summary = loop {
-        tokio::select! {
-            biased;
-            item = rx.recv() => match item {
-                Some(item) => out.push(item?),
-                None => break (&mut driver).await?,
-            },
-            result = &mut driver => {
-                let summary = result?;
-                while let Some(item) = rx.recv().await {
-                    out.push(item?);
-                }
-                break summary;
-            }
+    let mut failure = None;
+    // Drained to the end even once a failure is in hand: the producer sends into a
+    // bounded channel, so items left in it would block the producer and the join
+    // below with it. Closed at the first failure, so the producer's next send fails
+    // and it stops producing items nobody will read.
+    while let Some(item) = rx.recv().await {
+        absorb(item, &mut out, &mut failure);
+        if failure.is_some() {
+            rx.close();
         }
+    }
+    let summary = match producer.await {
+        Ok(summary) => summary,
+        Err(join) => match join.try_into_panic() {
+            // A panic in the producer stays the caller's panic, exactly as it would
+            // be if the producer ran here rather than in a task of its own.
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Reached only if something aborts the task, which nothing here does;
+            // the runtime shutting down can.
+            Err(join) => Err(E::internal_with_context(
+                join,
+                "streaming producer task did not finish",
+            )),
+        },
     };
-    Ok((summary, out))
+    match failure {
+        Some(err) => Err(err),
+        None => Ok((summary?, out)),
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn happy_path_emits_in_order() {
-        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
-            for n in 0..10 {
-                tx.send(Ok(n)).await.unwrap();
-            }
-            Ok(())
-        })
-        .await;
-        assert_eq!(result.unwrap().1, (0..10).collect::<Vec<u32>>());
-    }
-
-    #[tokio::test]
-    async fn empty_producer_yields_empty_vec() {
-        let result: Result<((), Vec<u32>), ()> =
-            collect_stream_with_summary(|_tx| async move { Ok(()) }).await;
-        assert_eq!(result.unwrap().1, Vec::<u32>::new());
-    }
-
-    #[tokio::test]
-    async fn item_error_short_circuits() {
-        let result: Result<((), Vec<u32>), &'static str> =
-            collect_stream_with_summary(|tx| async move {
-                tx.send(Ok(1)).await.unwrap();
-                tx.send(Err("nope")).await.unwrap();
-                tx.send(Ok(2)).await.unwrap();
-                Ok(())
-            })
-            .await;
-        assert_eq!(result, Err("nope"));
-    }
-
-    #[tokio::test]
-    async fn producer_error_propagates() {
-        let result: Result<((), Vec<u32>), &'static str> =
-            collect_stream_with_summary(|tx| async move {
-                tx.send(Ok(1)).await.unwrap();
-                Err("boom")
-            })
-            .await;
-        assert_eq!(result, Err("boom"));
-    }
-
-    #[tokio::test]
-    async fn drains_after_producer_finishes() {
-        // Producer fills the channel and returns; the drain must collect
-        // the remaining buffered items rather than dropping them.
-        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
-            for n in 0..50 {
-                tx.send(Ok(n)).await.unwrap();
-            }
-            Ok(())
-        })
-        .await;
-        assert_eq!(result.unwrap().1, (0..50).collect::<Vec<u32>>());
-    }
-
-    #[tokio::test]
-    async fn large_burst_exercises_channel_backpressure() {
-        // Producer emits more items than the channel's capacity (256), so
-        // `tx.send` must await the receiver between batches. The driver and
-        // receiver share a task, so this proves the `tokio::select!` shape
-        // makes progress on both branches without deadlock.
-        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
-            for n in 0..1000 {
-                tx.send(Ok(n)).await.unwrap();
-            }
-            Ok(())
-        })
-        .await;
-        assert_eq!(result.unwrap().1, (0..1000).collect::<Vec<u32>>());
-    }
-
-    #[tokio::test]
-    async fn producer_error_after_dropping_tx_still_yields_error() {
-        // Producer drops the sender, yields once so the receive loop observes
-        // the channel close, then returns an error. The driver's error must
-        // win even though `rx.recv()` returned `None` first.
-        let result: Result<((), Vec<u32>), &'static str> =
-            collect_stream_with_summary(|tx| async move {
-                drop(tx);
-                tokio::task::yield_now().await;
-                Err("boom")
-            })
-            .await;
-        assert_eq!(result, Err("boom"));
-    }
-
-    #[tokio::test]
-    async fn producer_error_after_items_still_yields_error() {
-        // Producer emits a few items, then errors. The returned `Err`
-        // takes priority over partial item accumulation; the caller does
-        // not see a partial `Vec`.
-        let result: Result<((), Vec<u32>), &'static str> =
-            collect_stream_with_summary(|tx| async move {
-                tx.send(Ok(1)).await.unwrap();
-                tx.send(Ok(2)).await.unwrap();
-                Err("boom")
-            })
-            .await;
-        assert_eq!(result, Err("boom"));
-    }
-
-    #[tokio::test]
-    async fn with_summary_returns_summary_and_items() {
-        let result: Result<(&'static str, Vec<u32>), ()> =
-            collect_stream_with_summary(|tx| async move {
-                for n in 0..5 {
-                    tx.send(Ok(n)).await.unwrap();
-                }
-                Ok("done")
-            })
-            .await;
-        let (summary, items) = result.unwrap();
-        assert_eq!(summary, "done");
-        assert_eq!(items, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[tokio::test]
-    async fn with_summary_producer_error_propagates() {
-        let result: Result<(&'static str, Vec<u32>), &'static str> =
-            collect_stream_with_summary(|tx| async move {
-                tx.send(Ok(1)).await.unwrap();
-                Err("boom")
-            })
-            .await;
-        assert_eq!(result, Err("boom"));
+/// Records one streamed item, keeping the first failure and discarding everything
+/// that follows it.
+fn absorb<T, E>(item: Result<T, E>, out: &mut Vec<T>, failure: &mut Option<E>) {
+    match item {
+        Ok(item) if failure.is_none() => out.push(item),
+        Err(err) if failure.is_none() => *failure = Some(err),
+        Ok(_) | Err(_) => {}
     }
 }

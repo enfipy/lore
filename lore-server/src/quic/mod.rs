@@ -26,7 +26,10 @@ pub mod replication_store_service;
 pub mod storage_service;
 pub mod storage_service_v4;
 pub mod stream_handler;
+#[cfg(not(feature = "test-util"))]
 mod stream_observer;
+#[cfg(feature = "test-util")]
+pub mod stream_observer;
 
 #[derive(Error, Debug)]
 pub enum StreamHandlerError {
@@ -116,6 +119,7 @@ pub(crate) const CWND_BYTES_BUCKETS: &[f64] = &[
 ///
 /// Shared by everything recording one, so that the connection statistics and the request
 /// statistics stay joinable on it.
+#[lore_macro::test_pub]
 pub(crate) const SERVICE_LABEL_KEY: &str = "quic_service_name";
 
 /// Sentinel rendered into a per-RPC span field when the value is not present.
@@ -201,7 +205,7 @@ pub struct ProtocolErrorInfo {
 }
 
 /// Compiled for `integration_tests` too, so the suite can stand up a real QUIC storage server.
-#[cfg(any(test, feature = "integration_tests"))]
+#[cfg(any(feature = "test-util", feature = "integration_tests"))]
 pub mod tests {
     use std::env;
     use std::path::PathBuf;

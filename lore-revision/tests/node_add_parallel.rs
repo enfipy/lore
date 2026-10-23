@@ -71,7 +71,7 @@ mod tests {
                     .with_write_token(write_token.share()),
                 );
 
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 // Non-root directory parent (flags == 0 is a directory).
                 let parent_name = "parent";
@@ -213,7 +213,7 @@ mod tests {
                     .with_write_token(write_token.share()),
                 );
 
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let start = Arc::new(tokio::sync::Barrier::new(ALLOCATED_NODES));
                 let mut adders: JoinSet<NodeID> = JoinSet::new();
                 for index in 0..ALLOCATED_NODES {
@@ -294,7 +294,7 @@ mod tests {
                 );
 
                 for round in 0..TREE_INSTALL_ROUNDS {
-                    let state = Arc::new(State::new());
+                    let state = State::new();
                     let start = Arc::new(tokio::sync::Barrier::new(TREE_INSTALL_TASKS));
                     let mut tasks: JoinSet<()> = JoinSet::new();
                     for _ in 0..TREE_INSTALL_TASKS {

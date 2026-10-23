@@ -110,6 +110,7 @@ fn merge_side(
 ///
 /// The three are read at once: none of them waits on another, and a merge is as slow as the
 /// slowest of them rather than the sum.
+#[lore_macro::test_pub]
 pub(crate) async fn merge3_text_in_operation(
     operation: &InstanceOperationImpl,
     base: &RelativePath,
@@ -118,9 +119,12 @@ pub(crate) async fn merge3_text_in_operation(
     result: &RelativePath,
     mode: MergeTextMode<'_>,
 ) -> Result<bool, FsError> {
-    let base_source = operation.content_source(base);
-    let mine_source = operation.content_source(mine);
-    let theirs_source = operation.content_source(theirs);
+    let (base_source, mine_source, theirs_source) = tokio::try_join!(
+        operation.content_source(base),
+        operation.content_source(mine),
+        operation.content_source(theirs)
+    )
+    .forward::<FsError>("naming the sides of the merge")?;
 
     let base_read = lore_spawn!(async move { base_source.read_all().await });
     let mine_read = lore_spawn!(async move { mine_source.read_all().await });
@@ -170,105 +174,4 @@ pub async fn merge3_text_by_pathbuf(
     }
 
     Ok(conflicted)
-}
-
-#[cfg(test)]
-// Fixtures build filesystem state directly; what these test is how the merge reads and writes it.
-#[allow(clippy::disallowed_methods)]
-mod tests {
-    use super::*;
-    use crate::fs::filesystem_provider::FilesystemProvider;
-    use crate::fs::os::OsFilesystem;
-    use crate::repository::RepositoryWriteToken;
-
-    /// The three sides a merge reads, written under `root`.
-    fn sides(root: &std::path::Path, base: &str, mine: &str, theirs: &str) {
-        std::fs::write(root.join("base"), base).expect("write base");
-        std::fs::write(root.join("mine"), mine).expect("write mine");
-        std::fs::write(root.join("theirs"), theirs).expect("write theirs");
-    }
-
-    fn relative(path: &str) -> RelativePath {
-        RelativePath::new_from_initial_path(path).expect("relative path")
-    }
-
-    async fn os_operation(root: &std::path::Path) -> std::sync::Arc<InstanceOperationImpl> {
-        FilesystemProvider::begin_operation(&OsFilesystem::new(root))
-            .await
-            .expect("beginning an operation over the OS filesystem")
-    }
-
-    #[tokio::test]
-    async fn a_merge_writes_its_result_at_the_path_the_operation_names() {
-        let dir = lore_base::test_util::TempDir::new("lore-merge-test-");
-        sides(dir.path(), "one\n", "one\ntwo\n", "one\n");
-        let operation = os_operation(dir.path()).await;
-        let token = RepositoryWriteToken::acquire(dir.path()).await;
-
-        let conflicted = merge3_text_in_operation(
-            &operation,
-            &relative("base"),
-            &relative("mine"),
-            &relative("theirs"),
-            &relative("result"),
-            MergeTextMode::Write(&token),
-        )
-        .await
-        .expect("the merge must run");
-
-        assert!(!conflicted);
-        assert_eq!(
-            "one\ntwo\n",
-            std::fs::read_to_string(dir.path().join("result")).expect("read the result")
-        );
-    }
-
-    /// A conflict is an outcome rather than a failure, and the result carries the markers.
-    #[tokio::test]
-    async fn a_conflicting_merge_writes_the_marked_result() {
-        let dir = lore_base::test_util::TempDir::new("lore-merge-test-");
-        sides(dir.path(), "one\n", "mine\n", "theirs\n");
-        let operation = os_operation(dir.path()).await;
-        let token = RepositoryWriteToken::acquire(dir.path()).await;
-
-        let conflicted = merge3_text_in_operation(
-            &operation,
-            &relative("base"),
-            &relative("mine"),
-            &relative("theirs"),
-            &relative("result"),
-            MergeTextMode::Write(&token),
-        )
-        .await
-        .expect("the merge must run");
-
-        assert!(conflicted);
-        let result = std::fs::read_to_string(dir.path().join("result")).expect("read the result");
-        assert!(result.contains("mine") && result.contains("theirs"));
-    }
-
-    /// A dry run reports the conflict and leaves the result path alone.
-    #[tokio::test]
-    async fn a_dry_run_writes_nothing() {
-        let dir = lore_base::test_util::TempDir::new("lore-merge-test-");
-        sides(dir.path(), "one\n", "mine\n", "theirs\n");
-        let operation = os_operation(dir.path()).await;
-
-        let conflicted = merge3_text_in_operation(
-            &operation,
-            &relative("base"),
-            &relative("mine"),
-            &relative("theirs"),
-            &relative("result"),
-            MergeTextMode::DryRun,
-        )
-        .await
-        .expect("the merge must run");
-
-        assert!(conflicted);
-        assert!(
-            !dir.path().join("result").exists(),
-            "nothing must be written"
-        );
-    }
 }

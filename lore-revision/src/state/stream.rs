@@ -18,16 +18,23 @@ use crate::state::StateError;
 /// its own failure, reported where it ends rather than in place of a change.
 pub type ChangeSender = mpsc::Sender<NodeChange>;
 
-/// Emits one change to the caller reading them.
+/// Emits the change `build` makes to the caller reading them, once the channel has room for it.
 ///
-/// A closed channel is a caller that has stopped listening, which the walk learns of here: the
-/// error unwinds it, and a caller that closed deliberately already has its answer and discards
-/// that verdict.
-pub(crate) async fn emit(changes: &ChangeSender, change: NodeChange) -> Result<(), StateError> {
-    changes
-        .send(change)
+/// `build` runs after the wait for room, so a walk waiting to emit holds what it builds the
+/// change from rather than the change. A closed channel is a caller that has stopped listening,
+/// which the walk learns of here: the error unwinds it, and a caller that closed deliberately
+/// already has its answer and discards that verdict.
+#[lore_macro::test_pub]
+pub(crate) async fn emit(
+    changes: &ChangeSender,
+    build: impl FnOnce() -> NodeChange,
+) -> Result<(), StateError> {
+    let permit = changes
+        .reserve()
         .await
-        .map_err(|_closed| StateError::internal("Diff receiver dropped"))
+        .map_err(|_closed| StateError::internal("Diff receiver dropped"))?;
+    permit.send(build());
+    Ok(())
 }
 
 /// How many changes a diff may run ahead of the caller reading them, for a caller with no depth
@@ -134,8 +141,8 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
     /// Either way the walk has unwound when this answers, so what it captured is released before
     /// the caller acts on the answer.
     pub async fn any(mut self, wanted: impl Fn(&NodeChange) -> bool) -> Result<bool, StateError> {
-        while let Some(change) = self.next().await {
-            if wanted(&change) {
+        while let Some(found) = self.next().await.map(|change| wanted(&change)) {
+            if found {
                 self.abandon().await;
                 return Ok(true);
             }
@@ -179,156 +186,5 @@ async fn joined<Summary: Default>(
             .internal("Diff task failed")
             .map_err(StateError::from)?,
         None => Ok(Summary::default()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use lore_base::lore_spawn;
-    use lore_base::runtime::LORE_CONTEXT;
-    use tokio::sync::oneshot;
-
-    use super::*;
-    use crate::change::FileAction;
-    use crate::change::Flags;
-    use crate::change::NodeChangeState;
-    use crate::fs::filesystem_provider::tests::setup_test_execution;
-    use crate::fs::filesystem_provider::tests::test_store_create;
-    use crate::lore::Address;
-    use crate::node::NodeFlags;
-    use crate::repository::RepositoryContext;
-    use crate::repository::test_helpers::default_repository_creation_args;
-    use crate::state::NodeMapping;
-    use crate::state::State;
-
-    /// Records that the walk holding it has unwound. Stands for what a real walk captures and
-    /// holds until it ends, such as the repository and the filesystem operation it reads through.
-    struct Guard(Arc<AtomicBool>);
-
-    impl Guard {
-        /// A guard, and the flag that reads whether it has dropped.
-        fn new() -> (Guard, Arc<AtomicBool>) {
-            let released = Arc::new(AtomicBool::new(false));
-            (Guard(released.clone()), released)
-        }
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    /// A change for a walk to emit. What it holds does not matter: the predicates below answer
-    /// without reading it.
-    async fn a_change() -> NodeChange {
-        let (immutable_store, mutable_store, _execution) =
-            test_store_create().await.expect("making test stores");
-        let repository = Arc::new(RepositoryContext::new(default_repository_creation_args(
-            immutable_store,
-            mutable_store,
-        )));
-        let side = NodeChangeState {
-            mapping: NodeMapping::root(repository, Arc::new(State::new())),
-            observed: None,
-            flags: NodeFlags::NoFlags,
-            address: Address::default(),
-            mode: 0,
-        };
-        NodeChange {
-            action: FileAction::Keep,
-            flags: Flags::None,
-            from: side.clone(),
-            to: side,
-        }
-    }
-
-    /// `any` answers at the first change the caller accepts and cuts the walk short there. The
-    /// walk holds what it captured until its next emit reaches the closed channel, so an answer
-    /// ahead of that lets the caller tear down what the walk is still reading through.
-    ///
-    /// The walk emits the change `any` accepts, parks on the closed channel, which is `any`
-    /// having decided, and unwinds at the emit that finds the channel closed, which is the
-    /// report `any` discards rather than answers with.
-    #[tokio::test]
-    async fn any_answers_once_the_walk_it_cut_short_has_unwound() {
-        LORE_CONTEXT
-            .scope(setup_test_execution(), async {
-                let change = a_change().await;
-                let (guard, released) = Guard::new();
-                let (decided, decided_by_any) = oneshot::channel();
-                let (release, released_by_test) = oneshot::channel();
-
-                let stream = ChangeStream::spawn(async move |changes| {
-                    let _guard = guard;
-                    emit(&changes, change.clone()).await?;
-                    changes.closed().await;
-                    decided.send(()).expect("the test reads the decision");
-                    released_by_test.await.expect("the test releases the walk");
-                    emit(&changes, change).await?;
-                    Ok(())
-                });
-
-                let answered = {
-                    let released = released.clone();
-                    lore_spawn!(async move {
-                        let found = stream.any(|_change| true).await;
-                        (found, released.load(Ordering::Acquire))
-                    })
-                };
-
-                tokio::time::timeout(Duration::from_secs(5), decided_by_any)
-                    .await
-                    .expect("any decides rather than reading on")
-                    .expect("the walk reads the closed channel");
-                assert!(
-                    !released.load(Ordering::Acquire),
-                    "the walk holds its guard until it unwinds"
-                );
-                release.send(()).expect("the walk waits to be released");
-
-                let (found, released_when_answered) =
-                    answered.await.expect("the task reading the walk");
-                assert!(found.expect("a walk cut short reports no failure"));
-                assert!(
-                    released_when_answered,
-                    "any answered before the walk it cut short had unwound"
-                );
-            })
-            .await;
-    }
-
-    /// A walk offering nothing the caller accepts is read to its end rather than cut short, so
-    /// `any` answers on what the walk reported and the walk has unwound by then either way.
-    #[tokio::test]
-    async fn any_reads_to_the_end_of_a_walk_it_accepts_nothing_from() {
-        LORE_CONTEXT
-            .scope(setup_test_execution(), async {
-                let change = a_change().await;
-                let (guard, released) = Guard::new();
-
-                let stream = ChangeStream::spawn(async move |changes| {
-                    let _guard = guard;
-                    emit(&changes, change).await?;
-                    Ok(())
-                });
-
-                let found = stream
-                    .any(|_change| false)
-                    .await
-                    .expect("a walk that ran to its end reports no failure");
-
-                assert!(!found);
-                assert!(
-                    released.load(Ordering::Acquire),
-                    "any answered before the walk had unwound"
-                );
-            })
-            .await;
     }
 }

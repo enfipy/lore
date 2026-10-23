@@ -296,7 +296,7 @@ Also see: sync.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`.
+A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
 Also see: shared store, working tree.
 
@@ -316,7 +316,7 @@ Also see: revision, branch.
 
 ### Revision identifier
 
-How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch the instance is on.
+How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without a branch applying to the branch the instance is on, or in `lore branch switch` to the branch switched to.
 
 A revision identifies the branch it was created on. A branch point can also identify the child branch by naming that child branch.
 

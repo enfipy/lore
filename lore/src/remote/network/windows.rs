@@ -83,7 +83,27 @@ pub struct UdsListener {
     socket: OwnedSocket,
 }
 
+/// A socket name to bind, not claimed: nothing reserves the name here, and
+/// [`UdsListener::new`] unlinks a socket already bound to it, so a second service can take the
+/// name from a running one.
+pub struct UdsListenerClaim {
+    name: String,
+}
+
+impl UdsListenerClaim {
+    pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
+        UdsListener::new(&self.name)
+    }
+}
+
 impl UdsListener {
+    /// Always succeeds: see [`UdsListenerClaim`].
+    pub fn claim(name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
+        Ok(Some(UdsListenerClaim {
+            name: name.to_string(),
+        }))
+    }
+
     pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
         let wide_file_name = uds_sock_path(name);
         // Ahead of the delete, so an address that cannot be built does not first
@@ -255,6 +275,7 @@ fn uds_sock_path(socket_name: &str) -> Vec<u16> {
 
 /// Bytes an address holds for a socket path, including its terminator. The
 /// field is fixed at this size, as the Unix one is.
+#[lore_macro::test_pub]
 const SUN_PATH_CAPACITY: usize = 108;
 
 /// Builds the address a socket is bound to or connected on, or says why the
@@ -276,6 +297,7 @@ fn uds_sockaddr(name: &str) -> Result<SOCKADDR_UN, String> {
 /// Takes the path rather than reading it, so the bound can be tested: the
 /// longest usable path is one byte short of the array, since the terminator
 /// needs a byte of its own.
+#[lore_macro::test_pub]
 fn sockaddr_for_path(path: &str) -> Result<SOCKADDR_UN, String> {
     let path_bytes = path.as_bytes();
     if path_bytes.len() >= SUN_PATH_CAPACITY {
@@ -298,65 +320,4 @@ fn sockaddr_for_path(path: &str) -> Result<SOCKADDR_UN, String> {
         sun_family: WinSock::AF_UNIX,
         sun_path,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn written_path(addr: &SOCKADDR_UN) -> String {
-        let bytes: Vec<u8> = addr
-            .sun_path
-            .iter()
-            .take_while(|byte| **byte != 0)
-            .map(|byte| *byte as u8)
-            .collect();
-        String::from_utf8(bytes).expect("the path was written as UTF-8")
-    }
-
-    #[test]
-    fn a_path_that_fits_is_written_with_its_terminator() {
-        let path = r"C:\Temp\lore_service";
-
-        let addr = sockaddr_for_path(path).expect("a short path must fit");
-
-        assert_eq!(addr.sun_family, WinSock::AF_UNIX);
-        assert_eq!(written_path(&addr), path);
-        assert_eq!(addr.sun_path[path.len()], 0, "the path must be terminated");
-    }
-
-    /// A temporary directory or configured socket name long enough to overrun
-    /// `sun_path` is reported rather than overrunning the copy.
-    #[test]
-    fn a_path_longer_than_the_address_is_refused() {
-        let path = format!(r"C:\Temp\{}", "n".repeat(200));
-
-        // `SOCKADDR_UN` has no `Debug`, so the success arm is unwrapped by hand
-        // rather than through `expect_err`.
-        let Err(error) = sockaddr_for_path(&path) else {
-            panic!("an overlong path must be refused");
-        };
-
-        assert!(error.contains("more than"), "{error}");
-        assert!(
-            error.contains(&path),
-            "the failure must name the path: {error}"
-        );
-    }
-
-    /// The terminator needs a byte of its own, so the longest usable path is one
-    /// short of the array rather than exactly its length.
-    #[test]
-    fn a_path_that_exactly_fills_the_address_is_refused() {
-        let exact = "a".repeat(SUN_PATH_CAPACITY);
-
-        assert!(
-            sockaddr_for_path(&exact).is_err(),
-            "a path filling every byte leaves no room to terminate it"
-        );
-        assert!(
-            sockaddr_for_path(&exact[1..]).is_ok(),
-            "one byte shorter must fit"
-        );
-    }
 }

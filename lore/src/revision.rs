@@ -7,6 +7,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::branch::merge::MergeError;
+use lore_revision::commit::CommitError;
 use lore_revision::commit::CommitOptions;
 use lore_revision::find::FindError;
 use lore_revision::find::FindOptions;
@@ -31,8 +32,6 @@ use lore_revision::revision::info::InfoOptions;
 use lore_revision::revision::restore::RestoreOptions;
 use lore_revision::revision::sync;
 use lore_revision::revision::sync::SyncOptions;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -40,10 +39,11 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
 use crate::util::convert_user_paths;
+use crate::util::path_messages;
 
 /// Arguments for committing staged changes into a new revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(commit_local)]
 pub struct LoreRevisionCommitArgs {
     /// Commit message
@@ -51,19 +51,14 @@ pub struct LoreRevisionCommitArgs {
     /// If set, commit only this linked repository (mount path relative to repo root)
     pub link: LoreString,
     /// Array of link relative paths that have specific messages
-    #[serde(default)]
     pub link_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each link path (parallel array with `link_paths`)
-    #[serde(default)]
     pub link_messages: LoreArray<LoreString>,
     /// If set, commit only this layer (mount path relative to repo root)
-    #[serde(default)]
     pub layer: LoreString,
     /// Array of layer mount paths that have specific messages
-    #[serde(default)]
     pub layer_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
-    #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
 }
 
@@ -101,11 +96,12 @@ pub async fn commit(
     dispatch_call(globals, args, callback, commit_local).await
 }
 
-async fn commit_local(
+#[lore_macro::test_pub]
+fn commit_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCommitArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -119,40 +115,16 @@ async fn commit_local(
             } else {
                 Some(link_str)
             };
-            let paths = args.link_paths.as_slice();
-            let messages = args.link_messages.as_slice();
-            if paths.len() != messages.len() {
-                lore_revision::lore_warn!(
-                    "link_paths length ({}) does not match link_messages length ({}), ignoring per-link messages",
-                    paths.len(),
-                    messages.len()
-                );
-            }
-            let link_messages: std::collections::HashMap<String, String> = paths
-                .iter()
-                .zip(messages.iter())
-                .map(|(path, msg)| (path.to_string(), msg.to_string()))
-                .collect();
+            let link_messages = path_messages("link", &args.link_paths, &args.link_messages)
+                .forward::<CommitError>("Invalid link message path")?;
             let layer_str = args.layer.to_string();
             let layer = if layer_str.is_empty() {
                 None
             } else {
                 Some(layer_str)
             };
-            let layer_paths = args.layer_paths.as_slice();
-            let layer_msg_values = args.layer_messages.as_slice();
-            if layer_paths.len() != layer_msg_values.len() {
-                lore_revision::lore_warn!(
-                    "layer_paths length ({}) does not match layer_messages length ({}), ignoring per-layer messages",
-                    layer_paths.len(),
-                    layer_msg_values.len()
-                );
-            }
-            let layer_messages: std::collections::HashMap<String, String> = layer_paths
-                .iter()
-                .zip(layer_msg_values.iter())
-                .map(|(path, msg)| (path.to_string(), msg.to_string()))
-                .collect();
+            let layer_messages = path_messages("layer", &args.layer_paths, &args.layer_messages)
+                .forward::<CommitError>("Invalid layer message path")?;
             let options = CommitOptions {
                 message,
                 link,
@@ -170,10 +142,9 @@ async fn commit_local(
             lore_revision::commit::commit_boxed(repository, &token, options).await
         },
     )
-    .await
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoreRevisionCommitWithMetadataArgs {
     // Message
     pub message: LoreString,
@@ -221,7 +192,7 @@ pub async fn commit_with_metadata(
 
 /// Arguments for amending the most recent revision's commit message.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(amend_local)]
 pub struct LoreRevisionAmendArgs {
     /// New commit message
@@ -257,11 +228,11 @@ pub async fn amend(
     dispatch_call(globals, args, callback, amend_local).await
 }
 
-async fn amend_local(
+fn amend_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionAmendArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -275,12 +246,11 @@ async fn amend_local(
             lore_revision::revision::amend::amend_revision_boxed(repository, &token, options).await
         },
     )
-    .await
 }
 
 /// Arguments for retrieving metadata and file information for a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreRevisionInfoArgs {
     /// Revision to get info for; empty for current
@@ -321,11 +291,11 @@ pub async fn info(
     dispatch_call(globals, args, callback, info_local).await
 }
 
-async fn info_local(
+fn info_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, info, move |repository, args| {
         let options = InfoOptions {
             signature: args.revision.into(),
@@ -334,12 +304,11 @@ async fn info_local(
         };
         lore_revision::revision::info::info_boxed(repository, options)
     })
-    .await
 }
 
 /// Arguments for clearing all metadata from the current revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_local)]
 pub struct LoreRevisionMetadataClearArgs {}
 
@@ -371,11 +340,11 @@ pub async fn metadata_clear(
     dispatch_call(globals, args, callback, metadata_clear_local).await
 }
 
-async fn metadata_clear_local(
+fn metadata_clear_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -385,12 +354,11 @@ async fn metadata_clear_local(
             metadata::clear::clear_revision_boxed(repository, &token).await
         },
     )
-    .await
 }
 
 /// Arguments for retrieving a single metadata value by key from a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_get_local)]
 pub struct LoreRevisionMetadataGetArgs {
     /// Metadata key to look up
@@ -427,12 +395,12 @@ pub async fn metadata_get(
     dispatch_call(globals, args, callback, metadata_get_local).await
 }
 
-async fn metadata_get_local(
+fn metadata_get_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, metadata_get, metadata_get_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, metadata_get, metadata_get_impl)
 }
 
 async fn metadata_get_impl(
@@ -444,7 +412,7 @@ async fn metadata_get_impl(
 
 /// Arguments for listing all metadata key/value pairs of a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_list_local)]
 pub struct LoreRevisionMetadataListArgs {
     /// Revision to list metadata for; empty for current
@@ -479,11 +447,11 @@ pub async fn metadata_list(
     dispatch_call(globals, args, callback, metadata_list_local).await
 }
 
-async fn metadata_list_local(
+fn metadata_list_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -498,12 +466,11 @@ async fn metadata_list_local(
             metadata::list::list_revision(repository, revision)
         },
     )
-    .await
 }
 
 /// Arguments for setting metadata key/value pairs on the current revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_local)]
 pub struct LoreRevisionMetadataSetArgs {
     /// Metadata keys (parallel with `values` and `formats`)
@@ -536,11 +503,11 @@ pub async fn metadata_set(
     dispatch_call(globals, args, callback, metadata_set_local).await
 }
 
-async fn metadata_set_local(
+fn metadata_set_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -548,7 +515,6 @@ async fn metadata_set_local(
         metadata_set,
         |repository, token, args| async move { metadata_set_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn metadata_set_impl(
@@ -588,7 +554,7 @@ async fn metadata_set_impl(
 
 /// Arguments for retrieving the revision history of a branch or revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(history_local)]
 pub struct LoreRevisionHistoryArgs {
     /// Start from this revision; empty for current
@@ -633,11 +599,11 @@ pub async fn history(
     dispatch_call(globals, args, callback, history_local).await
 }
 
-async fn history_local(
+fn history_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionHistoryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, history, move |repository, args| {
         let options = HistoryOptions {
             revision: args.revision.into(),
@@ -648,12 +614,11 @@ async fn history_local(
         };
         lore_revision::revision::history::history_boxed(repository, options)
     })
-    .await
 }
 
 /// Arguments for restoring the current branch to a previously synced revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(restore_local)]
 pub struct LoreRevisionRestoreArgs {
     /// Commit message for the restored revision
@@ -705,11 +670,11 @@ pub async fn restore(
     dispatch_call(globals, args, callback, restore_local).await
 }
 
-async fn restore_local(
+fn restore_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRestoreArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -722,12 +687,11 @@ async fn restore_local(
             lore_revision::revision::restore::restore_boxed(repository, &token, options).await
         },
     )
-    .await
 }
 
 /// Arguments for synchronizing the working directory to a target revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(sync_local)]
 pub struct LoreRevisionSyncArgs {
     /// Revision to synchronize to; empty for branch tip
@@ -746,7 +710,6 @@ pub struct LoreRevisionSyncArgs {
     pub dependency_depth_limit: u32,
     /// View filter file to leave the working files materialized under; empty to keep the view the
     /// instance holds
-    #[serde(default)]
     pub view: LoreString,
 }
 
@@ -803,11 +766,11 @@ pub async fn sync(
     dispatch_call(globals, args, callback, sync_local).await
 }
 
-async fn sync_local(
+fn sync_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionSyncArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -852,12 +815,12 @@ async fn sync_local(
             sync::sync_boxed(repository, &token, options).await
         },
     )
-    .await
 }
 
 /// Arguments for bisecting the revision range between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(bisect_local)]
 pub struct LoreRevisionBisectArgs {
     /// Starting (known-good) revision of the bisect range
     pub start: LoreString,
@@ -865,11 +828,51 @@ pub struct LoreRevisionBisectArgs {
     pub end: LoreString,
 }
 
+/// Takes one step of a bisect between two revisions, syncing the working tree to the revision
+/// halfway between them.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Bisect Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionBisect`](crate::interface::LoreEvent::RevisionBisect) | Emitted once the working tree is synced to the selected revision, with the revision numbers of the range and whether the search is done |
+///
+/// ## Sync Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionSyncTarget`](crate::interface::LoreEvent::RevisionSyncTarget) | Emitted once after resolving the selected revision |
+/// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file deleted, modified, added, or merged during sync |
+/// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization and once at completion |
+/// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted once at the end with the resulting revision |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision |
+/// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
 pub async fn bisect(
     globals: LoreGlobalArgs,
     args: LoreRevisionBisectArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    dispatch_call(globals, args, callback, bisect_local).await
+}
+
+fn bisect_local(
+    globals: LoreGlobalArgs,
+    args: LoreRevisionBisectArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -883,12 +886,11 @@ pub async fn bisect(
             bisect::bisect_boxed(repository, &token, options).await
         },
     )
-    .await
 }
 
 /// Arguments for finding revisions by metadata or revision number.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(find_local)]
 pub struct LoreRevisionFindArgs {
     /// Metadata key to search for; non-empty selects key/value search
@@ -927,12 +929,12 @@ pub async fn find(
     dispatch_call(globals, args, callback, find_local).await
 }
 
-pub async fn find_local(
+pub fn find_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionFindArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, find, find_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, find, find_impl)
 }
 
 async fn find_impl(
@@ -956,7 +958,7 @@ async fn find_impl(
 
 /// Arguments for computing file-level differences between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(diff_local)]
 pub struct LoreRevisionDiffArgs {
     /// Source revision to diff from
@@ -996,12 +998,12 @@ pub async fn diff(
     dispatch_call(globals, args, callback, diff_local).await
 }
 
-async fn diff_local(
+fn diff_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, diff, diff_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, diff, diff_impl)
 }
 
 async fn diff_impl(
@@ -1046,22 +1048,58 @@ async fn diff_impl(
 
 /// Arguments for cherry-picking a revision onto the current branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_local)]
 pub struct LoreRevisionCherryPickArgs {
     /// Revision to cherry pick
     pub revision: LoreString,
-    /// Message to use for an auto-commit if no conflicts arise
+    /// Message to use for an auto-commit if no conflicts arise; empty uses the
+    /// picked revision's message
     pub message: LoreString,
     /// Disable auto-commit even if no conflicts arise
     pub no_commit: u8,
     /// Metadata keys to carry from the picked revision onto the revision this
     /// creates. Empty carries nothing; the single entry `*` carries every key
     /// that is not reserved to the cherry-pick itself.
-    #[serde(default)]
     pub inherit_metadata: LoreArray<LoreString>,
 }
 
+/// Cherry-picks a revision onto the current branch, applying its changes to the working directory.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Cherry-Pick Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::CherryPickStartBegin`](crate::interface::LoreEvent::CherryPickStartBegin) | Emitted when cherry-pick begins, includes picked revision info |
+/// | [`LoreEvent::CherryPickStartEnd`](crate::interface::LoreEvent::CherryPickStartEnd) | Emitted when cherry-pick completes, includes conflict flag |
+/// | [`LoreEvent::CherryPickConflictFile`](crate::interface::LoreEvent::CherryPickConflictFile) | Emitted for each file with an unresolved cherry-pick conflict |
+/// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during the `apply_diff` phase |
+/// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file modified during cherry-pick realization |
+/// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged for deletion during cherry-pick |
+///
+/// ## Commit Events (when `no_commit` is false and no conflicts arise)
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionCommitBegin`](crate::interface::LoreEvent::RevisionCommitBegin) | Emitted when auto-commit starts |
+/// | [`LoreEvent::RevisionCommitProgress`](crate::interface::LoreEvent::RevisionCommitProgress) | Emitted during auto-commit |
+/// | [`LoreEvent::RevisionCommitEnd`](crate::interface::LoreEvent::RevisionCommitEnd) | Emitted when auto-commit completes |
+/// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed cherry-pick revision |
+/// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the auto-commit |
+/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during auto-commit |
 pub async fn cherry_pick(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickArgs,
@@ -1070,11 +1108,11 @@ pub async fn cherry_pick(
     dispatch_call(globals, args, callback, cherry_pick_local).await
 }
 
-pub async fn cherry_pick_local(
+fn cherry_pick_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1104,12 +1142,11 @@ pub async fn cherry_pick_local(
                 .await
         },
     )
-    .await
 }
 
 /// Arguments for aborting a cherry-pick operation in progress.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_abort_local)]
 pub struct LoreRevisionCherryPickAbortArgs {}
 
@@ -1121,11 +1158,11 @@ pub async fn cherry_pick_abort(
     dispatch_call(globals, args, callback, cherry_pick_abort_local).await
 }
 
-async fn cherry_pick_abort_local(
+fn cherry_pick_abort_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1133,12 +1170,11 @@ async fn cherry_pick_abort_local(
         cherry_pick_abort,
         move |repository, _token, _args| revision::cherry_pick::cherry_pick_abort_boxed(repository),
     )
-    .await
 }
 
 /// Arguments for marking cherry-pick paths as unresolved again.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_unresolve_local)]
 pub struct LoreRevisionCherryPickUnresolveArgs {
     /// Repository-relative paths to mark unresolved
@@ -1153,11 +1189,11 @@ pub async fn cherry_pick_unresolve(
     dispatch_call(globals, args, callback, cherry_pick_unresolve_local).await
 }
 
-async fn cherry_pick_unresolve_local(
+fn cherry_pick_unresolve_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1167,12 +1203,11 @@ async fn cherry_pick_unresolve_local(
             revision::cherry_pick::cherry_pick_unresolve_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for restarting cherry-pick conflict resolution for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_restart_local)]
 pub struct LoreRevisionCherryPickRestartArgs {
     /// Repository-relative paths to re-materialize for resolution
@@ -1187,11 +1222,11 @@ pub async fn cherry_pick_restart(
     dispatch_call(globals, args, callback, cherry_pick_restart_local).await
 }
 
-async fn cherry_pick_restart_local(
+fn cherry_pick_restart_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1201,12 +1236,11 @@ async fn cherry_pick_restart_local(
             revision::cherry_pick::cherry_pick_restart_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for marking cherry-pick conflicts as resolved for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_local)]
 pub struct LoreRevisionCherryPickResolveArgs {
     /// Repository-relative paths to mark resolved
@@ -1221,11 +1255,11 @@ pub async fn cherry_pick_resolve(
     dispatch_call(globals, args, callback, cherry_pick_resolve_local).await
 }
 
-async fn cherry_pick_resolve_local(
+fn cherry_pick_resolve_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1235,12 +1269,11 @@ async fn cherry_pick_resolve_local(
             revision::cherry_pick::cherry_pick_resolve_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for resolving cherry-pick conflicts by keeping the "mine" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_mine_local)]
 pub struct LoreRevisionCherryPickResolveMineArgs {
     /// Repository-relative paths to resolve in favor of "mine"
@@ -1255,11 +1288,11 @@ pub async fn cherry_pick_resolve_mine(
     dispatch_call(globals, args, callback, cherry_pick_resolve_mine_local).await
 }
 
-async fn cherry_pick_resolve_mine_local(
+fn cherry_pick_resolve_mine_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1271,12 +1304,11 @@ async fn cherry_pick_resolve_mine_local(
                 .forward::<MergeError>("resolving cherry-pick with mine")
         },
     )
-    .await
 }
 
 /// Arguments for resolving cherry-pick conflicts by keeping the "theirs" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_theirs_local)]
 pub struct LoreRevisionCherryPickResolveTheirsArgs {
     /// Repository-relative paths to resolve in favor of "theirs"
@@ -1291,11 +1323,11 @@ pub async fn cherry_pick_resolve_theirs(
     dispatch_call(globals, args, callback, cherry_pick_resolve_theirs_local).await
 }
 
-async fn cherry_pick_resolve_theirs_local(
+fn cherry_pick_resolve_theirs_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1307,12 +1339,11 @@ async fn cherry_pick_resolve_theirs_local(
                 .forward::<MergeError>("resolving cherry-pick with theirs")
         },
     )
-    .await
 }
 
 /// Arguments for reverting the working directory to a specified revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_local)]
 pub struct LoreRevisionRevertArgs {
     /// Revision to revert
@@ -1367,11 +1398,11 @@ pub async fn revert(
     dispatch_call(globals, args, callback, revert_local).await
 }
 
-pub async fn revert_local(
+pub fn revert_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1394,12 +1425,11 @@ pub async fn revert_local(
             revision::revert::revert_boxed(repository, &token, target_revision, options).await
         },
     )
-    .await
 }
 
 /// Arguments for aborting a revert operation in progress.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_abort_local)]
 pub struct LoreRevisionRevertAbortArgs {}
 
@@ -1433,11 +1463,11 @@ pub async fn revert_abort(
     dispatch_call(globals, args, callback, revert_abort_local).await
 }
 
-async fn revert_abort_local(
+fn revert_abort_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1445,12 +1475,11 @@ async fn revert_abort_local(
         revert_abort,
         move |repository, _token, _args| revision::revert::revert_abort_boxed(repository),
     )
-    .await
 }
 
 /// Arguments for marking revert paths as unresolved again.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_unresolve_local)]
 pub struct LoreRevisionRevertUnresolveArgs {
     /// Repository-relative paths to mark unresolved
@@ -1486,11 +1515,11 @@ pub async fn revert_unresolve(
     dispatch_call(globals, args, callback, revert_unresolve_local).await
 }
 
-async fn revert_unresolve_local(
+fn revert_unresolve_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1500,12 +1529,11 @@ async fn revert_unresolve_local(
             revision::revert::revert_unresolve_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for restarting revert conflict resolution for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_restart_local)]
 pub struct LoreRevisionRevertRestartArgs {
     /// Repository-relative paths to re-materialize for resolution
@@ -1542,11 +1570,11 @@ pub async fn revert_restart(
     dispatch_call(globals, args, callback, revert_restart_local).await
 }
 
-async fn revert_restart_local(
+fn revert_restart_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1556,12 +1584,11 @@ async fn revert_restart_local(
             revision::revert::revert_restart_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for marking revert conflicts as resolved for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_local)]
 pub struct LoreRevisionRevertResolveArgs {
     /// Repository-relative paths to mark resolved
@@ -1597,11 +1624,11 @@ pub async fn revert_resolve(
     dispatch_call(globals, args, callback, revert_resolve_local).await
 }
 
-async fn revert_resolve_local(
+fn revert_resolve_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1611,12 +1638,11 @@ async fn revert_resolve_local(
             revision::revert::revert_resolve_boxed(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 /// Arguments for resolving revert conflicts by keeping the "mine" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_mine_local)]
 pub struct LoreRevisionRevertResolveMineArgs {
     /// Repository-relative paths to resolve in favor of "mine"
@@ -1652,11 +1678,11 @@ pub async fn revert_resolve_mine(
     dispatch_call(globals, args, callback, revert_resolve_mine_local).await
 }
 
-async fn revert_resolve_mine_local(
+fn revert_resolve_mine_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1668,12 +1694,11 @@ async fn revert_resolve_mine_local(
                 .forward::<MergeError>("resolving revert with mine")
         },
     )
-    .await
 }
 
 /// Arguments for resolving revert conflicts by keeping the "theirs" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_theirs_local)]
 pub struct LoreRevisionRevertResolveTheirsArgs {
     /// Repository-relative paths to resolve in favor of "theirs"
@@ -1709,11 +1734,11 @@ pub async fn revert_resolve_theirs(
     dispatch_call(globals, args, callback, revert_resolve_theirs_local).await
 }
 
-async fn revert_resolve_theirs_local(
+fn revert_resolve_theirs_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionRevertResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1725,107 +1750,4 @@ async fn revert_resolve_theirs_local(
                 .forward::<MergeError>("resolving revert with theirs")
         },
     )
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cherry_pick_args_old_payload_missing_inherit_metadata_uses_default() {
-        // Old IPC client payload with no inherit_metadata field. The new field
-        // must be `#[serde(default)]` so old clients keep working.
-        let full = LoreRevisionCherryPickArgs {
-            revision: "main@3".into(),
-            message: "pick".into(),
-            no_commit: 0,
-            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
-        };
-        let mut payload = serde_json::to_value(&full).expect("args must serialise");
-        payload
-            .as_object_mut()
-            .expect("args serialise to an object")
-            .remove("inherit_metadata")
-            .expect("the field must be present before it is removed");
-
-        let args: LoreRevisionCherryPickArgs =
-            serde_json::from_value(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.revision.as_str(), "main@3");
-        assert_eq!(args.message.as_str(), "pick");
-        assert!(args.inherit_metadata.as_slice().is_empty());
-    }
-
-    #[test]
-    fn sync_args_old_payload_missing_view_uses_default() {
-        // Old IPC client payload with no view field. The new field must be
-        // `#[serde(default)]` so old clients keep working.
-        let full = LoreRevisionSyncArgs {
-            revision: "main@3".into(),
-            view: "views/engine.filter".into(),
-            ..Default::default()
-        };
-        let mut payload = serde_json::to_value(&full).expect("args must serialise");
-        payload
-            .as_object_mut()
-            .expect("args serialise to an object")
-            .remove("view")
-            .expect("the field must be present before it is removed");
-
-        let args: LoreRevisionSyncArgs =
-            serde_json::from_value(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.revision.as_str(), "main@3");
-        assert!(
-            args.view.is_empty(),
-            "an omitted view keeps the view the instance holds"
-        );
-    }
-
-    #[test]
-    fn commit_args_old_payload_missing_layer_fields_uses_defaults() {
-        // Old IPC client payload with no layer_* fields. The new fields must be
-        // `#[serde(default)]` so old clients keep working.
-        let payload = r#"{
-            "message": "main",
-            "link": "",
-            "link_paths": [],
-            "link_messages": []
-        }"#;
-
-        let args: LoreRevisionCommitArgs =
-            serde_json::from_str(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.message.as_str(), "main");
-        assert_eq!(args.link.as_str(), "");
-        assert_eq!(args.layer.as_str(), "");
-        assert!(args.layer_paths.as_slice().is_empty());
-        assert!(args.layer_messages.as_slice().is_empty());
-    }
-
-    #[test]
-    fn commit_args_new_payload_carries_layer_fields() {
-        let payload = r#"{
-            "message": "main",
-            "link": "",
-            "link_paths": [],
-            "link_messages": [],
-            "layer": "external/lib",
-            "layer_paths": ["external/lib"],
-            "layer_messages": ["layer-specific message"]
-        }"#;
-
-        let args: LoreRevisionCommitArgs =
-            serde_json::from_str(payload).expect("new payload must deserialise");
-
-        assert_eq!(args.layer.as_str(), "external/lib");
-        assert_eq!(args.layer_paths.as_slice().len(), 1);
-        assert_eq!(args.layer_paths.as_slice()[0].as_str(), "external/lib");
-        assert_eq!(args.layer_messages.as_slice().len(), 1);
-        assert_eq!(
-            args.layer_messages.as_slice()[0].as_str(),
-            "layer-specific message"
-        );
-    }
 }

@@ -74,6 +74,7 @@ pub(crate) fn check_whole_file_len(len: usize) -> std::io::Result<()> {
 }
 
 /// Backend selection for an [`IoDriver`].
+#[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     /// Probe for the best available backend.
@@ -98,10 +99,13 @@ pub(crate) enum DriverInner {
 
 /// The backend names [`backend_kind_from_value`] accepts, for the error it reports when a value
 /// is not one of them.
+#[lore_macro::test_pub]
 #[cfg(target_os = "linux")]
 const SUPPORTED_BACKENDS: &str = "auto, psync, uring";
+#[lore_macro::test_pub]
 #[cfg(target_family = "windows")]
 const SUPPORTED_BACKENDS: &str = "auto, psync, iocp";
+#[lore_macro::test_pub]
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 const SUPPORTED_BACKENDS: &str = "auto, psync";
 
@@ -126,6 +130,7 @@ fn probe() -> DriverInner {
 
 /// Parses a `LORE_IO_BACKEND` value. Separate from reading the variable so the accepted set and
 /// the error are testable without a process-global environment.
+#[lore_macro::test_pub]
 fn backend_kind_from_value(value: &str) -> std::io::Result<BackendKind> {
     match value.to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(BackendKind::Auto),
@@ -146,6 +151,7 @@ fn backend_kind_from_value(value: &str) -> std::io::Result<BackendKind> {
 /// Cloning is cheap and clones share the backend. Most code uses
 /// [`IoDriver::global`]; tests and benchmarks construct instances per
 /// backend.
+#[lore_macro::test_pub]
 #[derive(Clone)]
 pub struct IoDriver {
     inner: Arc<DriverInner>,
@@ -247,6 +253,20 @@ impl IoDriver {
         Ok(IoFile::new(self.clone(), Arc::new(file)))
     }
 
+    /// Prepares `file`, which the caller opened, for this driver's operations as an open prepares
+    /// the files it opens: `iocp` binds it to the completion port, and the other backends need
+    /// nothing.
+    pub(crate) fn register(&self, file: &File) -> std::io::Result<()> {
+        match &*self.inner {
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.register(file),
+            _ => {
+                let _ = file;
+                Ok(())
+            }
+        }
+    }
+
     /// Opens a file and reads its first `head_len` bytes (or the whole
     /// file when smaller) in a single backend dispatch — open, stat,
     /// read. Returns the open file, its metadata, and the head bytes.
@@ -276,49 +296,50 @@ impl IoDriver {
         Ok((IoFile::new(self.clone(), Arc::new(file)), metadata, head))
     }
 
-    /// The storage layer's atomic durable whole-file write as a single
-    /// backend dispatch: creates `temporary_path` (per `options`), writes
-    /// the gathered contents of all segments, syncs file data and
-    /// metadata, renames over `final_path`, and best-effort syncs the
-    /// parent directory.
+    /// The storage layer's atomic whole-file write as a single job on the syscall pool, whatever
+    /// the backend: creates `temporary_path` (per `options`), writes the gathered contents of all
+    /// segments, with `durable` syncs file data and metadata, renames over `final_path`, and with
+    /// `durable` best-effort syncs the parent directory.
     ///
-    /// On error the temporary file may be left behind; callers own its
-    /// cleanup.
+    /// A write, sync or rename that fails removes the temporary file in the
+    /// same dispatch, and its error is the one returned: a failure to remove
+    /// the file is not reported over it. `temporary_path` is the write's alone
+    /// while it runs, as another write there would be removed or renamed with it.
     ///
     /// The segments are consumed rather than handed back, and dropped as soon as the kernel has
     /// the bytes — before the sync and the rename, which touch the page cache and the directory
     /// rather than the caller's memory. A caller holding a lock to keep the segments stable
     /// therefore holds it across the gather alone. The drop happens on the thread running the
     /// operation, so anything it releases is released there.
-    pub async fn write_file_segments_atomic<B: StableBufList>(
+    ///
+    /// Takes the paths by value so a caller building them for the call hands them over rather than
+    /// having them copied.
+    ///
+    /// `completion` is dropped on the thread running the operation once the operation has ended,
+    /// the rename and the directory sync included, whether or not the call is still awaited. The
+    /// operation runs to its end after the call is dropped, so a caller that may drop it part way
+    /// passes a value whose drop says the write has landed.
+    pub async fn write_file_segments_atomic<B: StableBufList, C: Send + 'static>(
         &self,
-        temporary_path: impl AsRef<Path>,
-        final_path: impl AsRef<Path>,
+        temporary_path: impl Into<PathBuf>,
+        final_path: impl Into<PathBuf>,
         options: &OpenOptions,
         buffers: B,
+        durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
-        let std_options = options.to_std();
-        let temporary_path = temporary_path.as_ref().to_path_buf();
-        let final_path = final_path.as_ref().to_path_buf();
-        match &*self.inner {
-            DriverInner::Psync(driver) => {
-                driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
-                    .await
-            }
-            #[cfg(target_os = "linux")]
-            DriverInner::Uring(driver) => {
-                driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
-                    .await
-            }
-            #[cfg(target_family = "windows")]
-            DriverInner::Iocp(driver) => {
-                driver
-                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
-                    .await
-            }
-        }
+        // Every backend runs this on the syscall pool, as one job, so it goes there directly:
+        // dispatched through a backend, its arguments would be carried at each level.
+        PsyncDriver
+            .write_file_segments_atomic(
+                options.to_std(),
+                temporary_path.into(),
+                final_path.into(),
+                buffers,
+                durable,
+                completion,
+            )
+            .await
     }
 
     /// Creates (or truncates, per `options`) `path` and writes the
@@ -533,14 +554,15 @@ impl IoDriver {
         }
     }
 
-    pub(crate) async fn set_len_raw(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
-        match &*self.inner {
-            DriverInner::Psync(driver) => driver.set_len(file, len).await,
-            #[cfg(target_os = "linux")]
-            DriverInner::Uring(driver) => driver.set_len(file, len).await,
-            #[cfg(target_family = "windows")]
-            DriverInner::Iocp(driver) => driver.set_len(file, len).await,
-        }
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub(crate) async fn set_len_raw<C: Send + 'static>(
+        &self,
+        file: Arc<File>,
+        len: u64,
+        completion: C,
+    ) -> std::io::Result<()> {
+        PsyncDriver.set_len(file, len, completion).await
     }
 
     /// Reads an entire file into pooled memory as a single backend
@@ -716,88 +738,5 @@ impl IoDriver {
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.sync(file, data_only).await,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_recognised_backend_value_selects_it() {
-        assert_eq!(
-            backend_kind_from_value("psync").unwrap(),
-            BackendKind::Psync
-        );
-        assert_eq!(
-            backend_kind_from_value("PSYNC").unwrap(),
-            BackendKind::Psync
-        );
-        assert_eq!(backend_kind_from_value("auto").unwrap(), BackendKind::Auto);
-        assert_eq!(backend_kind_from_value("").unwrap(), BackendKind::Auto);
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            backend_kind_from_value("uring").unwrap(),
-            BackendKind::Uring
-        );
-        #[cfg(target_family = "windows")]
-        assert_eq!(backend_kind_from_value("iocp").unwrap(), BackendKind::Iocp);
-    }
-
-    /// A backend this build has no code for is rejected rather than silently falling back, so a
-    /// value that works on one platform does not quietly mean something else on another.
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn a_backend_absent_from_this_build_is_rejected() {
-        let error = backend_kind_from_value("uring")
-            .expect_err("a backend this platform has no code for must not be accepted");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    /// The mirror of the case above: the Windows completion backend must not be selectable on a
-    /// platform that has no code for it either.
-    #[test]
-    #[cfg(not(target_family = "windows"))]
-    fn the_completion_port_backend_is_rejected_off_windows() {
-        let error = backend_kind_from_value("iocp")
-            .expect_err("a backend this platform has no code for must not be accepted");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    /// The value names the accepted set, because the caller reaching for this variable is
-    /// diagnosing something and a bare rejection tells them nothing.
-    #[test]
-    fn an_unrecognised_backend_value_is_a_reportable_error() {
-        let error = backend_kind_from_value("iouring")
-            .expect_err("a backend that does not exist must not be accepted");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        let message = format!("{error}");
-        assert!(message.contains("iouring"), "{message}");
-        assert!(
-            message.contains(&format!("supported: {SUPPORTED_BACKENDS}")),
-            "{message}"
-        );
-    }
-
-    /// Whatever the environment holds, the process-wide driver resolves rather than panicking.
-    /// Which backend it lands on depends on the machine, so the name is only checked against the
-    /// set this build can produce.
-    #[test]
-    fn the_global_driver_always_resolves() {
-        let name = IoDriver::global().backend_name();
-        assert!(["psync", "uring", "iocp"].contains(&name), "{name}");
-    }
-
-    /// The probe never fails: a machine that cannot give it a ring gets the portable backend.
-    #[test]
-    fn the_probe_always_yields_a_backend() {
-        let driver = IoDriver::new(BackendKind::Auto).expect("auto must always resolve");
-        assert!(
-            ["psync", "uring", "iocp"].contains(&driver.backend_name()),
-            "{driver:?}"
-        );
     }
 }

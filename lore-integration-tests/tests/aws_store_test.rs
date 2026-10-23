@@ -42,6 +42,7 @@ mod aws_store_tests {
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
     use rand::random;
 
@@ -77,6 +78,16 @@ mod aws_store_tests {
 
     #[async_trait]
     impl ImmutableStore for LocalStore {
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
         async fn get_metadata(
             self: Arc<Self>,
             _partition: Partition,
@@ -173,7 +184,7 @@ mod aws_store_tests {
             _source_address: Address,
             _destination_partition: Partition,
             _destination_context: Context,
-            _durable: bool,
+            _behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             Err(StoreError::internal("Copy not supported by this store"))
         }
@@ -360,6 +371,16 @@ mod aws_store_tests {
 
     #[async_trait]
     impl ImmutableStore for CountingDurable {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.is_local()
         }
@@ -425,7 +446,7 @@ mod aws_store_tests {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.copies
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -436,7 +457,7 @@ mod aws_store_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
