@@ -2516,9 +2516,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
+ "futures",
  "lore-base",
  "lore-error-set",
+ "lore-revision",
  "lore-storage",
+ "rand 0.9.4",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -2527,6 +2530,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
 ]
 
@@ -2538,6 +2542,7 @@ dependencies = [
  "lore-aws",
  "lore-base",
  "lore-postgres",
+ "lore-revision",
  "lore-server",
  "lore-storage",
  "serde",

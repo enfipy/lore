@@ -2,21 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadpool_postgres::Manager;
-use deadpool_postgres::ManagerConfig;
 use deadpool_postgres::Pool;
-use deadpool_postgres::RecyclingMethod;
-use deadpool_postgres::Runtime;
 use lore_base::error::SlowDown;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_storage::StoreError;
 use lore_storage::fragment_catalog::BeginObliteration;
 use lore_storage::fragment_catalog::CatalogGeneration;
@@ -27,47 +21,27 @@ use lore_storage::fragment_catalog::FragmentCatalogGuard;
 use lore_storage::fragment_catalog::FragmentState;
 use lore_storage::fragment_catalog::unlock_fragment_catalog_guard;
 use serde::Deserialize;
-use sha2::Digest;
-use sha2::Sha256;
 use tokio_postgres::Row;
-use tokio_postgres::config::SslMode;
-use tokio_postgres::error::SqlState;
-use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::warn;
+
+use crate::connection::Migrations;
+use crate::connection::PoolSettings;
+use crate::connection::database_error;
 
 const DEFAULT_SCHEMA: &str = "lore";
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
 const DEFAULT_CONNECT_TIMEOUT_MILLIS: u64 = 5_000;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
-const MIGRATIONS: &[(i32, &str)] = &[
-    (1, include_str!("../migrations/0001_fragment_catalog.sql")),
-    (
-        2,
-        include_str!("../migrations/0002_fragment_generation.sql"),
-    ),
-];
-
-#[derive(Debug, thiserror::Error)]
-#[error("{details}")]
-struct NativeCertificateErrors {
-    details: String,
-    #[source]
-    first: Option<rustls_native_certs::Error>,
-}
-
-impl From<Vec<rustls_native_certs::Error>> for NativeCertificateErrors {
-    fn from(errors: Vec<rustls_native_certs::Error>) -> Self {
-        let details = errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        Self {
-            details: format!("{} native certificate error(s): {details}", errors.len()),
-            first: errors.into_iter().next(),
-        }
-    }
-}
+const MIGRATIONS: Migrations = Migrations {
+    ledger: "schema_migrations",
+    lock_name: "lore-fragment-catalog",
+    steps: &[
+        (1, include_str!("../migrations/0001_fragment_catalog.sql")),
+        (
+            2,
+            include_str!("../migrations/0002_fragment_generation.sql"),
+        ),
+    ],
+};
 
 /// Invalid PostgreSQL fragment-catalog configuration.
 #[derive(Debug, thiserror::Error)]
@@ -147,7 +121,9 @@ impl PostgresFragmentCatalogConfig {
 
     /// Validate settings without opening a database connection.
     pub fn validate(&self) -> Result<(), PostgresFragmentCatalogConfigError> {
-        validate_identifier(&self.schema)?;
+        if !crate::connection::is_identifier(&self.schema) {
+            return Err(PostgresFragmentCatalogConfigError::InvalidSchema);
+        }
         if self.max_connections == 0 {
             return Err(PostgresFragmentCatalogConfigError::ZeroConnections);
         }
@@ -525,61 +501,14 @@ impl PostgresFragmentCatalog {
             StoreError::internal_with_context(error, "Invalid PostgreSQL catalog configuration")
         })?;
 
-        let mut pg_config =
-            tokio_postgres::Config::from_str(&config.connection_string).map_err(|error| {
-                StoreError::internal_with_context(
-                    error,
-                    "Failed to parse PostgreSQL connection settings",
-                )
-            })?;
-        pg_config.connect_timeout(Duration::from_millis(config.connect_timeout_millis));
-        pg_config.application_name("lore-fragment-catalog");
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let tls = match pg_config.get_ssl_mode() {
-            SslMode::Disable => MakeRustlsConnect::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(rustls::RootCertStore::empty())
-                    .with_no_client_auth(),
-            ),
-            SslMode::Prefer | SslMode::Require => {
-                let (connector, certificate_errors) = MakeRustlsConnect::with_native_certs()
-                    .map_err(|errors| {
-                        StoreError::internal_with_context(
-                            NativeCertificateErrors::from(errors),
-                            "Failed to load PostgreSQL TLS trust roots",
-                        )
-                    })?;
-                if !certificate_errors.is_empty() {
-                    warn!(
-                        errors = ?certificate_errors,
-                        "Some PostgreSQL TLS trust roots could not be loaded"
-                    );
-                }
-                connector
-            }
-            _ => {
-                return Err(StoreError::internal(
-                    "Unsupported PostgreSQL sslmode; use disable, prefer, or require",
-                ));
-            }
-        };
-
-        let manager = Manager::from_config(
-            pg_config,
-            tls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Verified,
-            },
-        );
-        let pool = Pool::builder(manager)
-            .runtime(Runtime::Tokio1)
-            .max_size(config.max_connections)
-            .wait_timeout(Some(Duration::from_millis(config.connect_timeout_millis)))
-            .build()
-            .map_err(|error| {
-                StoreError::internal_with_context(error, "Failed to build PostgreSQL pool")
-            })?;
+        let pool = crate::connection::build_pool(PoolSettings {
+            connection_string: &config.connection_string,
+            application_name: "lore-fragment-catalog",
+            max_connections: config.max_connections,
+            connect_timeout: Duration::from_millis(config.connect_timeout_millis),
+            // Hash guards wait on advisory locks for as long as another holder needs them.
+            statement_timeout: None,
+        })?;
 
         let catalog = Self {
             pool,
@@ -594,25 +523,14 @@ impl PostgresFragmentCatalog {
     /// Create a uniquely namespaced catalog using `LORE_POSTGRES_TEST_URL`.
     #[doc(hidden)]
     pub async fn connect_for_test() -> Result<Self, StoreError> {
-        let connection_string = std::env::var("LORE_POSTGRES_TEST_URL").map_err(|error| {
-            StoreError::internal_with_context(
-                error,
-                "LORE_POSTGRES_TEST_URL is required for PostgreSQL integration tests",
-            )
-        })?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| {
-                StoreError::internal_with_context(error, "System clock precedes Unix epoch")
-            })?
-            .as_nanos();
-        let mut config = PostgresFragmentCatalogConfig::new(connection_string);
-        config.schema = format!("lore_test_{}_{nonce}", std::process::id());
+        let mut config =
+            PostgresFragmentCatalogConfig::new(crate::connection::test_connection_string()?);
+        config.schema = crate::connection::test_schema("lore_test")?;
         Self::connect(config).await
     }
 
     async fn connection(&self) -> Result<deadpool_postgres::Client, StoreError> {
-        self.pool.get().await.map_err(pool_error)
+        crate::connection::connection(&self.pool).await
     }
 
     fn state_table(&self) -> String {
@@ -624,79 +542,7 @@ impl PostgresFragmentCatalog {
     }
 
     async fn migrate(&self) -> Result<(), StoreError> {
-        let mut client = self.connection().await?;
-        let transaction = client.transaction().await.map_err(|error| {
-            database_error(error, "Failed to begin PostgreSQL catalog migration")
-        })?;
-        transaction
-            .query_one(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                &[&format!("lore-fragment-catalog:{}", self.schema)],
-            )
-            .await
-            .map_err(|error| database_error(error, "Failed to lock catalog migrations"))?;
-
-        transaction
-            .batch_execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS \"{schema}\";
-                 CREATE TABLE IF NOT EXISTS \"{schema}\".schema_migrations (
-                     version INTEGER PRIMARY KEY,
-                     checksum TEXT NOT NULL,
-                     applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                 );",
-                schema = self.schema,
-            ))
-            .await
-            .map_err(|error| database_error(error, "Failed to create migration catalog"))?;
-
-        transaction
-            .batch_execute(&format!("SET LOCAL search_path TO \"{}\"", self.schema))
-            .await
-            .map_err(|error| database_error(error, "Failed to select catalog schema"))?;
-        for &(version, sql) in MIGRATIONS {
-            let checksum = migration_checksum(sql);
-            let existing = transaction
-                .query_opt(
-                    &format!(
-                        "SELECT checksum FROM \"{}\".schema_migrations WHERE version = $1",
-                        self.schema
-                    ),
-                    &[&version],
-                )
-                .await
-                .map_err(|error| database_error(error, "Failed to inspect catalog migrations"))?;
-
-            if let Some(row) = existing {
-                let recorded: String = row.try_get(0).map_err(|error| {
-                    database_error(error, "Failed to read catalog migration checksum")
-                })?;
-                if recorded != checksum {
-                    return Err(StoreError::internal(format!(
-                        "PostgreSQL catalog migration {version} checksum mismatch"
-                    )));
-                }
-                continue;
-            }
-            transaction
-                .batch_execute(sql)
-                .await
-                .map_err(|error| database_error(error, "Failed to apply catalog migration"))?;
-            transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO \"{}\".schema_migrations (version, checksum) VALUES ($1, $2)",
-                        self.schema
-                    ),
-                    &[&version, &checksum],
-                )
-                .await
-                .map_err(|error| database_error(error, "Failed to record catalog migration"))?;
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database_error(error, "Failed to commit catalog migrations"))
+        crate::connection::migrate(&self.pool, &self.schema, &MIGRATIONS).await
     }
 
     async fn locked_state(
@@ -958,92 +804,14 @@ fn state_from_i16(state: i16) -> Result<FragmentState, StoreError> {
     }
 }
 
-fn validate_identifier(identifier: &str) -> Result<(), PostgresFragmentCatalogConfigError> {
-    let valid_length = !identifier.is_empty() && identifier.len() <= 63;
-    let mut characters = identifier.bytes();
-    let valid_first = characters
-        .next()
-        .is_some_and(|value| value == b'_' || value.is_ascii_alphabetic());
-    let valid_rest = characters.all(|value| value == b'_' || value.is_ascii_alphanumeric());
-    if valid_length && valid_first && valid_rest {
-        Ok(())
-    } else {
-        Err(PostgresFragmentCatalogConfigError::InvalidSchema)
-    }
-}
-
-fn database_error(error: tokio_postgres::Error, context: &'static str) -> StoreError {
-    let retryable = error.is_closed()
-        || error.as_db_error().is_some_and(|database_error| {
-            matches!(
-                database_error.code(),
-                &SqlState::T_R_SERIALIZATION_FAILURE
-                    | &SqlState::T_R_DEADLOCK_DETECTED
-                    | &SqlState::QUERY_CANCELED
-                    | &SqlState::CONNECTION_EXCEPTION
-                    | &SqlState::CONNECTION_FAILURE
-                    | &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
-            )
-        });
-    warn!(
-        ?error,
-        context, "PostgreSQL fragment catalog operation failed"
-    );
-    if retryable {
-        retryable_error(error, context)
-    } else {
-        StoreError::internal_with_context(error, context)
-    }
-}
-
-fn pool_error(error: deadpool_postgres::PoolError) -> StoreError {
-    const CONTEXT: &str = "Failed to acquire PostgreSQL catalog connection";
-    warn!(?error, "{CONTEXT}");
-    match error {
-        deadpool_postgres::PoolError::Backend(error) => database_error(error, CONTEXT),
-        error @ deadpool_postgres::PoolError::Timeout(_) => retryable_error(error, CONTEXT),
-        error => StoreError::internal_with_context(error, CONTEXT),
-    }
-}
-
-fn retryable_error(
-    error: impl std::error::Error + Send + Sync + 'static,
-    context: &'static str,
-) -> StoreError {
-    let source = StoreError::internal_with_context(error, context);
-    StoreError::SlowDown(SlowDown.chain_err_from(source, "retryable PostgreSQL failure"))
-}
-
-fn migration_checksum(sql: &str) -> String {
-    Sha256::digest(sql.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn migration_checksum_is_sha256() {
-        for &(_, sql) in MIGRATIONS {
-            assert_eq!(migration_checksum(sql).len(), 64);
+        for &(_, sql) in MIGRATIONS.steps {
+            assert_eq!(crate::connection::migration_checksum(sql).len(), 64);
         }
-    }
-
-    #[test]
-    fn pool_timeouts_preserve_their_trace_as_slow_down() {
-        let error = pool_error(deadpool_postgres::PoolError::Timeout(
-            deadpool_postgres::TimeoutType::Wait,
-        ));
-        assert!(matches!(error, StoreError::SlowDown(_)));
-        assert!(error.trace().len() >= 2);
-    }
-
-    #[test]
-    fn permanent_pool_configuration_errors_are_internal() {
-        let error = pool_error(deadpool_postgres::PoolError::NoRuntimeSpecified);
-        assert!(matches!(error, StoreError::Internal(_)));
     }
 }

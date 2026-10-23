@@ -13,6 +13,7 @@ anyhow = "1.0.103"
 lore-aws.workspace = true
 lore-base.workspace = true
 lore-postgres = { path = "../lore-postgres" }
+lore-revision.workspace = true
 lore-server.workspace = true
 lore-storage.workspace = true
 serde.workspace = true
