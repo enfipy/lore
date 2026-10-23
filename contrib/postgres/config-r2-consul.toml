@@ -48,9 +48,28 @@ service_name = "lore-server"
 ignore_address = ""
 poll_interval_secs = 30
 
-# These local stores are for a single primary. See README.md before scaling to multiple writers.
+# Branch heads, other mutable values, and resource locks live in the same PostgreSQL, so a
+# replacement server on another machine starts from every acknowledged write.
 [mutable_store]
-mode = "local"
+mode = "postgres_s3"
 
 [lock_store]
-mode = "local"
+mode = "postgres_s3"
+
+[plugins.postgres_s3.mutable_store.postgres]
+# Override this value with
+# LORE__PLUGINS__POSTGRES_S3__MUTABLE_STORE__POSTGRES__CONNECTION_STRING.
+connection_string = "host=127.0.0.1 dbname=lore user=lore sslmode=require target_session_attrs=read-write"
+schema = "lore_mutable_store"
+max_connections = 16
+connect_timeout_millis = 5_000
+statement_timeout_millis = 30_000
+
+[plugins.postgres_s3.lock_store.postgres]
+# Override this value with
+# LORE__PLUGINS__POSTGRES_S3__LOCK_STORE__POSTGRES__CONNECTION_STRING.
+connection_string = "host=127.0.0.1 dbname=lore user=lore sslmode=require target_session_attrs=read-write"
+schema = "lore_lock_store"
+max_connections = 8
+connect_timeout_millis = 5_000
+statement_timeout_millis = 30_000
